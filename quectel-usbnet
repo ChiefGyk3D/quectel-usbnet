@@ -151,6 +151,12 @@ at_cmd() {
   printf '%s' "$out"
 }
 
+# Prints the ttyUSB nodes of a USB device, one per line. The device directory in
+# /sys/bus/usb/devices is a symlink, so find has to be told to follow it.
+device_ttys() {
+  find -L "$1" -maxdepth 3 -name 'ttyUSB*' 2>/dev/null | sort
+}
+
 # Prints the first tty of a USB device that answers ATI with "Quectel". A port
 # that was only just released can need a second or two, so each is tried 3 times.
 find_at_port() {
@@ -166,7 +172,7 @@ find_at_port() {
       fi
       sleep 1
     done
-  done < <(find "$dev" -maxdepth 3 -name 'ttyUSB*' 2>/dev/null | sort)
+  done < <(device_ttys "$dev")
   return 1
 }
 

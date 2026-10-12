@@ -103,6 +103,13 @@ else
   ok "a missing port is an error"
 fi
 
+# --- finding the AT ports through a symlinked device directory --------------
+# /sys/bus/usb/devices/4-4 is a symlink; a plain `find` on it prints nothing.
+mkdir -p "$tmp/real/4-4/4-4:1.2/ttyUSB2/tty" "$tmp/real/4-4/4-4:1.3/ttyUSB3/tty" "$tmp/devices"
+ln -s "$tmp/real/4-4" "$tmp/devices/4-4"
+expect_eq "device_ttys follows the symlinked device directory" \
+  "$(device_ttys "$tmp/devices/4-4" | xargs -n1 basename | tr '\n' ' ')" "ttyUSB2 ttyUSB3 "
+
 # --- the command line -------------------------------------------------------
 out=$("$TOOL" set qmi --dry-run 2>&1)
 expect_contains "dry run names the AT command it would send" "$out" 'AT+QCFG="usbnet",0'
