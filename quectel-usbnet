@@ -24,7 +24,7 @@ MM_WAIT_TIMEOUT=90
 MM_TO_RESTORE=false
 
 usage() {
-    cat >&2 <<'EOF'
+  cat >&2 <<'EOF'
 usage:
   quectel-usbnet status
   quectel-usbnet set MODE [--port /dev/ttyUSBn] [--dry-run]
@@ -41,366 +41,366 @@ set      Changes state. Stops ModemManager, reads the current mode (printed so
          come back, and starts ModemManager again. Needs root; it re-runs itself
          with sudo.
 EOF
-    exit 2
+  exit 2
 }
 
 die() {
-    echo "error: $*" >&2
-    exit 1
+  echo "error: $*" >&2
+  exit 1
 }
 
 say() {
-    echo "$*"
+  echo "$*"
 }
 
 mode_to_value() {
-    case ${1,,} in
-        qmi | rmnet | 0) echo 0 ;;
-        ecm | 1) echo 1 ;;
-        mbim | 2) echo 2 ;;
-        rndis | 3) echo 3 ;;
-        *) return 1 ;;
-    esac
+  case ${1,,} in
+    qmi | rmnet | 0) echo 0 ;;
+    ecm | 1) echo 1 ;;
+    mbim | 2) echo 2 ;;
+    rndis | 3) echo 3 ;;
+    *) return 1 ;;
+  esac
 }
 
 value_to_name() {
-    case $1 in
-        0) echo qmi ;;
-        1) echo ecm ;;
-        2) echo mbim ;;
-        3) echo rndis ;;
-        *) echo "unknown($1)" ;;
-    esac
+  case $1 in
+    0) echo qmi ;;
+    1) echo ecm ;;
+    2) echo mbim ;;
+    3) echo rndis ;;
+    *) echo "unknown($1)" ;;
+  esac
 }
 
 expected_driver() {
-    case $1 in
-        0) echo qmi_wwan ;;
-        1) echo cdc_ether ;;
-        2) echo cdc_mbim ;;
-        3) echo rndis_host ;;
-        *) return 1 ;;
-    esac
+  case $1 in
+    0) echo qmi_wwan ;;
+    1) echo cdc_ether ;;
+    2) echo cdc_mbim ;;
+    3) echo rndis_host ;;
+    *) return 1 ;;
+  esac
 }
 
 # Reads an AT response on stdin, prints the usbnet value from a
 # `+QCFG: "usbnet",N` line, prints nothing if there is none.
 parse_usbnet() {
-    tr -d '\r' | sed -n 's/.*+QCFG: *"usbnet", *\([0-9][0-9]*\).*/\1/p' | head -n 1
+  tr -d '\r' | sed -n 's/.*+QCFG: *"usbnet", *\([0-9][0-9]*\).*/\1/p' | head -n 1
 }
 
 # Prints the sysfs directory of every Quectel USB device, one per line.
 quectel_devices() {
-    local f dir
-    for f in /sys/bus/usb/devices/*/idVendor; do
-        [ -e "$f" ] || continue
-        if [ "$(cat "$f")" = "$QUECTEL_VID" ]; then
-            dir=$(dirname "$f")
-            case $(basename "$dir") in
-                *:*) continue ;;
-            esac
-            echo "$dir"
-        fi
-    done
+  local f dir
+  for f in /sys/bus/usb/devices/*/idVendor; do
+    [ -e "$f" ] || continue
+    if [ "$(cat "$f")" = "$QUECTEL_VID" ]; then
+      dir=$(dirname "$f")
+      case $(basename "$dir") in
+        *:*) continue ;;
+      esac
+      echo "$dir"
+    fi
+  done
 }
 
 # The network driver bound to any interface of a USB device, or nothing.
 bound_net_driver() {
-    local dev=$1 iface drv
-    for iface in "$dev":*; do
-        [ -e "$iface/driver" ] || continue
-        drv=$(basename "$(readlink "$iface/driver")")
-        case $drv in
-            qmi_wwan | cdc_mbim | cdc_ether | rndis_host)
-                echo "$drv"
-                return 0
-                ;;
-        esac
-    done
-    return 1
+  local dev=$1 iface drv
+  for iface in "$dev":*; do
+    [ -e "$iface/driver" ] || continue
+    drv=$(basename "$(readlink "$iface/driver")")
+    case $drv in
+      qmi_wwan | cdc_mbim | cdc_ether | rndis_host)
+        echo "$drv"
+        return 0
+        ;;
+    esac
+  done
+  return 1
 }
 
 driver_to_mode() {
-    case $1 in
-        qmi_wwan) echo qmi ;;
-        cdc_mbim) echo mbim ;;
-        cdc_ether) echo ecm ;;
-        rndis_host) echo rndis ;;
-        *) echo unknown ;;
-    esac
+  case $1 in
+    qmi_wwan) echo qmi ;;
+    cdc_mbim) echo mbim ;;
+    cdc_ether) echo ecm ;;
+    rndis_host) echo rndis ;;
+    *) echo unknown ;;
+  esac
 }
 
 # Sends one AT command to a port and prints the response lines. Returns 1 if the
 # port cannot be opened.
 at_cmd() {
-    local port=$1 cmd=$2 line out="" deadline
-    stty -F "$port" 115200 raw -echo 2>/dev/null || true
-    exec 3<>"$port" || return 1
-    printf '%s\r' "$cmd" >&3
-    deadline=$((SECONDS + AT_TIMEOUT))
-    while ((SECONDS < deadline)); do
-        if read -r -t 1 -u 3 line; then
-            line=${line%$'\r'}
-            out+="$line"$'\n'
-            case $line in
-                OK | ERROR | "+CME ERROR"*) break ;;
-            esac
-        fi
-    done
-    exec 3>&-
-    printf '%s' "$out"
+  local port=$1 cmd=$2 line out="" deadline
+  stty -F "$port" 115200 raw -echo 2>/dev/null || true
+  exec 3<>"$port" || return 1
+  printf '%s\r' "$cmd" >&3
+  deadline=$((SECONDS + AT_TIMEOUT))
+  while ((SECONDS < deadline)); do
+    if read -r -t 1 -u 3 line; then
+      line=${line%$'\r'}
+      out+="$line"$'\n'
+      case $line in
+        OK | ERROR | "+CME ERROR"*) break ;;
+      esac
+    fi
+  done
+  exec 3>&-
+  printf '%s' "$out"
 }
 
 # Prints the first tty of a USB device that answers ATI with "Quectel". A port
 # that was only just released can need a second or two, so each is tried 3 times.
 find_at_port() {
-    local dev=$1 tty port reply
-    while read -r tty; do
-        port=/dev/$(basename "$tty")
-        [ -e "$port" ] || continue
-        for _ in 1 2 3; do
-            reply=$(at_cmd "$port" ATI 2>/dev/null || true)
-            if [[ $reply == *Quectel* ]]; then
-                echo "$port"
-                return 0
-            fi
-            sleep 1
-        done
-    done < <(find "$dev" -maxdepth 3 -name 'ttyUSB*' 2>/dev/null | sort)
-    return 1
+  local dev=$1 tty port reply
+  while read -r tty; do
+    port=/dev/$(basename "$tty")
+    [ -e "$port" ] || continue
+    for _ in 1 2 3; do
+      reply=$(at_cmd "$port" ATI 2>/dev/null || true)
+      if [[ $reply == *Quectel* ]]; then
+        echo "$port"
+        return 0
+      fi
+      sleep 1
+    done
+  done < <(find "$dev" -maxdepth 3 -name 'ttyUSB*' 2>/dev/null | sort)
+  return 1
 }
 
 mm_active() {
-    systemctl is-active --quiet ModemManager 2>/dev/null
+  systemctl is-active --quiet ModemManager 2>/dev/null
 }
 
 mm_modem_listed() {
-    local listing
-    command -v mmcli >/dev/null 2>&1 || return 1
-    listing=$(mmcli -L 2>/dev/null || true)
-    [[ $listing == */Modem/* ]]
+  local listing
+  command -v mmcli >/dev/null 2>&1 || return 1
+  listing=$(mmcli -L 2>/dev/null || true)
+  [[ $listing == */Modem/* ]]
 }
 
 restore_mm() {
-    if $MM_TO_RESTORE; then
-        systemctl start ModemManager || true
-    fi
+  if $MM_TO_RESTORE; then
+    systemctl start ModemManager || true
+  fi
 }
 
 # True when any Quectel device has the wanted network driver bound.
 quectel_has_driver() {
-    local want=$1 d
-    while read -r d; do
-        if [ "$(bound_net_driver "$d" 2>/dev/null || true)" = "$want" ]; then
-            return 0
-        fi
-    done < <(quectel_devices)
-    return 1
+  local want=$1 d
+  while read -r d; do
+    if [ "$(bound_net_driver "$d" 2>/dev/null || true)" = "$want" ]; then
+      return 0
+    fi
+  done < <(quectel_devices)
+  return 1
 }
 
 # Polls until the wanted driver is bound or the timeout passes.
 wait_for_driver() {
-    local want=$1 timeout=$2 end
-    end=$((SECONDS + timeout))
-    while ((SECONDS < end)); do
-        if quectel_has_driver "$want"; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
+  local want=$1 timeout=$2 end
+  end=$((SECONDS + timeout))
+  while ((SECONDS < end)); do
+    if quectel_has_driver "$want"; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 # Polls until a sysfs path is gone or the timeout passes.
 wait_for_gone() {
-    local path=$1 timeout=$2 end
-    end=$((SECONDS + timeout))
-    while ((SECONDS < end)); do
-        if [ ! -e "$path" ]; then
-            return 0
-        fi
-        sleep 1
-    done
-    return 1
+  local path=$1 timeout=$2 end
+  end=$((SECONDS + timeout))
+  while ((SECONDS < end)); do
+    if [ ! -e "$path" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
 }
 
 wait_for_modem() {
-    local timeout=$1 end
-    end=$((SECONDS + timeout))
-    while ((SECONDS < end)); do
-        if mm_modem_listed; then
-            return 0
-        fi
-        sleep 2
-    done
-    return 1
+  local timeout=$1 end
+  end=$((SECONDS + timeout))
+  while ((SECONDS < end)); do
+    if mm_modem_listed; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
 }
 
 cmd_status() {
-    local devs dev drv mode timeouts journal
-    mapfile -t devs < <(quectel_devices)
-    if [ "${#devs[@]}" -eq 0 ]; then
-        say "usb:           no Quectel device (vendor $QUECTEL_VID) on the bus"
-        say "               not enumerated: check the card, the slot and rfkill before anything else"
-        return 1
-    fi
-    for dev in "${devs[@]}"; do
-        say "usb:           $(basename "$dev") $(cat "$dev/idVendor"):$(cat "$dev/idProduct") $(cat "$dev/product" 2>/dev/null || true)"
-        say "               speed $(cat "$dev/speed" 2>/dev/null || echo '?') Mbps, authorized $(cat "$dev/authorized" 2>/dev/null || echo '?')"
-        if drv=$(bound_net_driver "$dev"); then
-            mode=$(driver_to_mode "$drv")
-            say "net driver:    $drv (mode: $mode)"
-        else
-            say "net driver:    none bound"
-        fi
-    done
-    if mm_active; then
-        say "ModemManager:  running"
+  local devs dev drv mode timeouts journal
+  mapfile -t devs < <(quectel_devices)
+  if [ "${#devs[@]}" -eq 0 ]; then
+    say "usb:           no Quectel device (vendor $QUECTEL_VID) on the bus"
+    say "               not enumerated: check the card, the slot and rfkill before anything else"
+    return 1
+  fi
+  for dev in "${devs[@]}"; do
+    say "usb:           $(basename "$dev") $(cat "$dev/idVendor"):$(cat "$dev/idProduct") $(cat "$dev/product" 2>/dev/null || true)"
+    say "               speed $(cat "$dev/speed" 2>/dev/null || echo '?') Mbps, authorized $(cat "$dev/authorized" 2>/dev/null || echo '?')"
+    if drv=$(bound_net_driver "$dev"); then
+      mode=$(driver_to_mode "$drv")
+      say "net driver:    $drv (mode: $mode)"
     else
-        say "ModemManager:  not running"
+      say "net driver:    none bound"
     fi
-    if command -v mmcli >/dev/null 2>&1; then
-        if mm_modem_listed; then
-            say "mmcli -L:      $(mmcli -L 2>/dev/null | grep '/Modem/' | sed 's/^ *//')"
-        else
-            say "mmcli -L:      no modems found"
-        fi
-    fi
-    journal=$(journalctl -b -u ModemManager --no-pager 2>&1 || true)
-    if [[ $journal == *"insufficient permissions"* || $journal == *"not seeing messages"* || -z $journal ]]; then
-        say "MM journal:    not readable here (try sudo, or join the systemd-journal group)"
+  done
+  if mm_active; then
+    say "ModemManager:  running"
+  else
+    say "ModemManager:  not running"
+  fi
+  if command -v mmcli >/dev/null 2>&1; then
+    if mm_modem_listed; then
+      say "mmcli -L:      $(mmcli -L 2>/dev/null | grep '/Modem/' | sed 's/^ *//')"
     else
-        timeouts=$(printf '%s\n' "$journal" | grep -c 'marking modem as invalid' || true)
-        say "MM journal:    'marking modem as invalid' seen $timeouts time(s) this boot"
-        if [ "$timeouts" -gt 0 ] && ! mm_modem_listed; then
-            say ""
-            say "This is the pattern quectel-usbnet fixes: the device is on the bus and"
-            say "ModemManager gave up on it. Try:  sudo quectel-usbnet set qmi"
-        fi
+      say "mmcli -L:      no modems found"
     fi
+  fi
+  journal=$(journalctl -b -u ModemManager --no-pager 2>&1 || true)
+  if [[ $journal == *"insufficient permissions"* || $journal == *"not seeing messages"* || -z $journal ]]; then
+    say "MM journal:    not readable here (try sudo, or join the systemd-journal group)"
+  else
+    timeouts=$(printf '%s\n' "$journal" | grep -c 'marking modem as invalid' || true)
+    say "MM journal:    'marking modem as invalid' seen $timeouts time(s) this boot"
+    if [ "$timeouts" -gt 0 ] && ! mm_modem_listed; then
+      say ""
+      say "This is the pattern quectel-usbnet fixes: the device is on the bus and"
+      say "ModemManager gave up on it. Try:  sudo quectel-usbnet set qmi"
+    fi
+  fi
 }
 
 cmd_set() {
-    local target="" port="" dry=false value current_raw current want_driver dev="" devs
-    while [ $# -gt 0 ]; do
-        case $1 in
-            --port)
-                [ $# -ge 2 ] || usage
-                port=$2
-                shift 2
-                ;;
-            --dry-run)
-                dry=true
-                shift
-                ;;
-            -*) usage ;;
-            *)
-                [ -z "$target" ] || usage
-                target=$1
-                shift
-                ;;
-        esac
-    done
-    [ -n "$target" ] || usage
-    value=$(mode_to_value "$target") || die "unknown mode '$target' (qmi, ecm, mbim, rndis)"
-    want_driver=$(expected_driver "$value")
+  local target="" port="" dry=false value current_raw current want_driver dev="" devs
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --port)
+        [ $# -ge 2 ] || usage
+        port=$2
+        shift 2
+        ;;
+      --dry-run)
+        dry=true
+        shift
+        ;;
+      -*) usage ;;
+      *)
+        [ -z "$target" ] || usage
+        target=$1
+        shift
+        ;;
+    esac
+  done
+  [ -n "$target" ] || usage
+  value=$(mode_to_value "$target") || die "unknown mode '$target' (qmi, ecm, mbim, rndis)"
+  want_driver=$(expected_driver "$value")
 
-    if $dry; then
-        say "dry run, nothing will be touched. With 'set $target' this would:"
-        say "  1. stop ModemManager if it is running"
-        say "  2. find the Quectel AT port${port:+ (using $port)} and read AT+QCFG=\"usbnet\""
-        say "  3. send AT+QCFG=\"usbnet\",$value and confirm it reads back"
-        say "  4. send AT+CFUN=1,1 (modem reset) and wait for $want_driver to bind"
-        say "  5. start ModemManager and wait for a modem to be listed"
-        return 0
+  if $dry; then
+    say "dry run, nothing will be touched. With 'set $target' this would:"
+    say "  1. stop ModemManager if it is running"
+    say "  2. find the Quectel AT port${port:+ (using $port)} and read AT+QCFG=\"usbnet\""
+    say "  3. send AT+QCFG=\"usbnet\",$value and confirm it reads back"
+    say "  4. send AT+CFUN=1,1 (modem reset) and wait for $want_driver to bind"
+    say "  5. start ModemManager and wait for a modem to be listed"
+    return 0
+  fi
+
+  if [ "$(id -u)" -ne 0 ]; then
+    say "set needs root (ModemManager control, tty access); re-running with sudo"
+    if [ -n "$port" ]; then
+      exec sudo -- "$(readlink -f "${BASH_SOURCE[0]}")" set "$target" --port "$port"
     fi
+    exec sudo -- "$(readlink -f "${BASH_SOURCE[0]}")" set "$target"
+  fi
 
-    if [ "$(id -u)" -ne 0 ]; then
-        say "set needs root (ModemManager control, tty access); re-running with sudo"
-        if [ -n "$port" ]; then
-            exec sudo -- "$(readlink -f "${BASH_SOURCE[0]}")" set "$target" --port "$port"
-        fi
-        exec sudo -- "$(readlink -f "${BASH_SOURCE[0]}")" set "$target"
-    fi
+  mapfile -t devs < <(quectel_devices)
+  if [ -z "$port" ]; then
+    [ "${#devs[@]}" -gt 0 ] || die "no Quectel USB device found; run 'quectel-usbnet status'"
+    [ "${#devs[@]}" -eq 1 ] || die "more than one Quectel device; pass --port /dev/ttyUSBn for the one you mean"
+    dev=${devs[0]}
+  fi
 
-    mapfile -t devs < <(quectel_devices)
-    if [ -z "$port" ]; then
-        [ "${#devs[@]}" -gt 0 ] || die "no Quectel USB device found; run 'quectel-usbnet status'"
-        [ "${#devs[@]}" -eq 1 ] || die "more than one Quectel device; pass --port /dev/ttyUSBn for the one you mean"
-        dev=${devs[0]}
-    fi
+  if mm_active; then
+    MM_TO_RESTORE=true
+    trap restore_mm EXIT
+    say "stopping ModemManager"
+    systemctl stop ModemManager
+  fi
 
-    if mm_active; then
-        MM_TO_RESTORE=true
-        trap restore_mm EXIT
-        say "stopping ModemManager"
-        systemctl stop ModemManager
-    fi
+  if [ -z "$port" ]; then
+    say "looking for the AT port"
+    port=$(find_at_port "$dev") || die "no tty of $(basename "$dev") answered ATI; pass --port"
+  fi
+  say "AT port: $port"
 
-    if [ -z "$port" ]; then
-        say "looking for the AT port"
-        port=$(find_at_port "$dev") || die "no tty of $(basename "$dev") answered ATI; pass --port"
-    fi
-    say "AT port: $port"
+  current_raw=$(at_cmd "$port" 'AT+QCFG="usbnet"') || die "cannot talk to $port"
+  current=$(printf '%s' "$current_raw" | parse_usbnet)
+  [ -n "$current" ] || die "could not read the usbnet mode (got: $(printf '%s' "$current_raw" | tr '\r\n' '  '))"
+  say "current mode: $(value_to_name "$current") (usbnet $current)"
+  say "rollback:     quectel-usbnet set $(value_to_name "$current")"
+  if [ "$current" = "$value" ]; then
+    say "already in $target mode, nothing to change"
+    return 0
+  fi
 
-    current_raw=$(at_cmd "$port" 'AT+QCFG="usbnet"') || die "cannot talk to $port"
-    current=$(printf '%s' "$current_raw" | parse_usbnet)
-    [ -n "$current" ] || die "could not read the usbnet mode (got: $(printf '%s' "$current_raw" | tr '\r\n' '  '))"
-    say "current mode: $(value_to_name "$current") (usbnet $current)"
-    say "rollback:     quectel-usbnet set $(value_to_name "$current")"
-    if [ "$current" = "$value" ]; then
-        say "already in $target mode, nothing to change"
-        return 0
-    fi
+  say "setting usbnet $value ($target)"
+  local reply readback
+  reply=$(at_cmd "$port" "AT+QCFG=\"usbnet\",$value") || die "cannot talk to $port"
+  [[ $reply == *OK* ]] || die "the modem refused AT+QCFG=\"usbnet\",$value"
+  reply=$(at_cmd "$port" 'AT+QCFG="usbnet"') || die "cannot talk to $port"
+  readback=$(printf '%s' "$reply" | parse_usbnet)
+  [ "$readback" = "$value" ] || die "mode did not stick (reads back as '$readback')"
 
-    say "setting usbnet $value ($target)"
-    local reply readback
-    reply=$(at_cmd "$port" "AT+QCFG=\"usbnet\",$value") || die "cannot talk to $port"
-    [[ $reply == *OK* ]] || die "the modem refused AT+QCFG=\"usbnet\",$value"
-    reply=$(at_cmd "$port" 'AT+QCFG="usbnet"') || die "cannot talk to $port"
-    readback=$(printf '%s' "$reply" | parse_usbnet)
-    [ "$readback" = "$value" ] || die "mode did not stick (reads back as '$readback')"
+  say "resetting the modem (AT+CFUN=1,1)"
+  at_cmd "$port" 'AT+CFUN=1,1' >/dev/null || true
 
-    say "resetting the modem (AT+CFUN=1,1)"
-    at_cmd "$port" 'AT+CFUN=1,1' >/dev/null || true
+  # The USB device does not drop the instant the reset is accepted; wait for
+  # it to go, then for it to come back with the right driver bound.
+  if [ -n "$dev" ]; then
+    wait_for_gone "$dev/idVendor" "$REENUM_GONE_TIMEOUT" || say "(device did not visibly drop; continuing)"
+  else
+    sleep 5
+  fi
+  say "waiting for $want_driver to bind"
+  wait_for_driver "$want_driver" "$REENUM_BACK_TIMEOUT" ||
+    die "the modem did not come back with $want_driver; check 'quectel-usbnet status' (rollback: set $(value_to_name "$current"))"
 
-    # The USB device does not drop the instant the reset is accepted; wait for
-    # it to go, then for it to come back with the right driver bound.
-    if [ -n "$dev" ]; then
-        wait_for_gone "$dev/idVendor" "$REENUM_GONE_TIMEOUT" || say "(device did not visibly drop; continuing)"
+  if $MM_TO_RESTORE; then
+    say "starting ModemManager"
+    systemctl start ModemManager
+    MM_TO_RESTORE=false
+    if wait_for_modem "$MM_WAIT_TIMEOUT"; then
+      say "ModemManager lists the modem:"
+      mmcli -L | sed 's/^ */  /'
     else
-        sleep 5
+      die "ModemManager did not list a modem within ${MM_WAIT_TIMEOUT}s; check 'quectel-usbnet status'"
     fi
-    say "waiting for $want_driver to bind"
-    wait_for_driver "$want_driver" "$REENUM_BACK_TIMEOUT" ||
-        die "the modem did not come back with $want_driver; check 'quectel-usbnet status' (rollback: set $(value_to_name "$current"))"
-
-    if $MM_TO_RESTORE; then
-        say "starting ModemManager"
-        systemctl start ModemManager
-        MM_TO_RESTORE=false
-        if wait_for_modem "$MM_WAIT_TIMEOUT"; then
-            say "ModemManager lists the modem:"
-            mmcli -L | sed 's/^ */  /'
-        else
-            die "ModemManager did not list a modem within ${MM_WAIT_TIMEOUT}s; check 'quectel-usbnet status'"
-        fi
-    fi
+  fi
 }
 
 main() {
-    [ $# -ge 1 ] || usage
-    case $1 in
-        status) cmd_status ;;
-        set)
-            shift
-            cmd_set "$@"
-            ;;
-        --version) echo "quectel-usbnet $VERSION" ;;
-        *) usage ;;
-    esac
+  [ $# -ge 1 ] || usage
+  case $1 in
+    status) cmd_status ;;
+    set)
+      shift
+      cmd_set "$@"
+      ;;
+    --version) echo "quectel-usbnet $VERSION" ;;
+    *) usage ;;
+  esac
 }
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-    main "$@"
+  main "$@"
 fi

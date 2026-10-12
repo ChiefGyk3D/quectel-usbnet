@@ -10,31 +10,31 @@ failures=0
 checks=0
 
 ok() {
-    checks=$((checks + 1))
-    echo "ok   $1"
+  checks=$((checks + 1))
+  echo "ok   $1"
 }
 
 fail() {
-    checks=$((checks + 1))
-    failures=$((failures + 1))
-    echo "FAIL $1" >&2
-    [ $# -lt 2 ] || echo "     $2" >&2
+  checks=$((checks + 1))
+  failures=$((failures + 1))
+  echo "FAIL $1" >&2
+  [ $# -lt 2 ] || echo "     $2" >&2
 }
 
 expect_eq() {
-    if [ "$2" = "$3" ]; then
-        ok "$1"
-    else
-        fail "$1" "wanted '$3', got '$2'"
-    fi
+  if [ "$2" = "$3" ]; then
+    ok "$1"
+  else
+    fail "$1" "wanted '$3', got '$2'"
+  fi
 }
 
 expect_contains() {
-    if [[ $2 == *"$3"* ]]; then
-        ok "$1"
-    else
-        fail "$1" "'$3' not found in: $2"
-    fi
+  if [[ $2 == *"$3"* ]]; then
+    ok "$1"
+  else
+    fail "$1" "'$3' not found in: $2"
+  fi
 }
 
 # shellcheck source-path=SCRIPTDIR/..
@@ -48,9 +48,9 @@ expect_eq "ecm maps to 1" "$(mode_to_value ecm)" 1
 expect_eq "mbim maps to 2" "$(mode_to_value mbim)" 2
 expect_eq "a bare number passes through" "$(mode_to_value 3)" 3
 if mode_to_value nonsense >/dev/null; then
-    fail "an unknown mode is refused"
+  fail "an unknown mode is refused"
 else
-    ok "an unknown mode is refused"
+  ok "an unknown mode is refused"
 fi
 expect_eq "0 names qmi" "$(value_to_name 0)" qmi
 expect_eq "2 names mbim" "$(value_to_name 2)" mbim
@@ -60,11 +60,11 @@ expect_eq "qmi_wwan reads as qmi" "$(driver_to_mode qmi_wwan)" qmi
 
 # --- response parsing -------------------------------------------------------
 expect_eq "parse_usbnet reads a CRLF response" \
-    "$(printf '+QCFG: "usbnet",2\r\n\r\nOK\r\n' | parse_usbnet)" 2
+  "$(printf '+QCFG: "usbnet",2\r\n\r\nOK\r\n' | parse_usbnet)" 2
 expect_eq "parse_usbnet reads a spaced response" \
-    "$(printf '+QCFG: "usbnet", 0\r\nOK\r\n' | parse_usbnet)" 0
+  "$(printf '+QCFG: "usbnet", 0\r\nOK\r\n' | parse_usbnet)" 0
 expect_eq "parse_usbnet prints nothing on ERROR" \
-    "$(printf 'ERROR\r\n' | parse_usbnet)" ""
+  "$(printf 'ERROR\r\n' | parse_usbnet)" ""
 
 # --- the AT conversation, against the fake modem ----------------------------
 tmp=$(mktemp -d)
@@ -72,35 +72,35 @@ pty_file="$tmp/pty"
 python3 -I "$HERE/fake_modem.py" >"$pty_file" &
 fake_pid=$!
 cleanup() {
-    kill "$fake_pid" 2>/dev/null || true
-    rm -rf "$tmp"
+  kill "$fake_pid" 2>/dev/null || true
+  rm -rf "$tmp"
 }
 trap cleanup EXIT
 for _ in $(seq 1 50); do
-    [ -s "$pty_file" ] && break
-    sleep 0.1
+  [ -s "$pty_file" ] && break
+  sleep 0.1
 done
 port=$(head -n 1 "$pty_file")
 [ -n "$port" ] || {
-    echo "fake modem did not start" >&2
-    exit 1
+  echo "fake modem did not start" >&2
+  exit 1
 }
 
 reply=$(at_cmd "$port" ATI)
 expect_contains "ATI is answered by something that says Quectel" "$reply" Quectel
 expect_contains "ATI reports the revision" "$reply" "Revision: EM160RGLAUR02A07M4G"
 expect_eq "the fake modem starts in MBIM" \
-    "$(at_cmd "$port" 'AT+QCFG="usbnet"' | parse_usbnet)" 2
+  "$(at_cmd "$port" 'AT+QCFG="usbnet"' | parse_usbnet)" 2
 reply=$(at_cmd "$port" 'AT+QCFG="usbnet",0')
 expect_contains "setting the mode is acknowledged" "$reply" OK
 expect_eq "the new mode reads back" \
-    "$(at_cmd "$port" 'AT+QCFG="usbnet"' | parse_usbnet)" 0
+  "$(at_cmd "$port" 'AT+QCFG="usbnet"' | parse_usbnet)" 0
 reply=$(at_cmd "$port" 'AT+NOPE')
 expect_contains "an unknown command is an ERROR, not a hang" "$reply" ERROR
 if at_cmd /nonexistent/tty ATI >/dev/null 2>&1; then
-    fail "a missing port is an error"
+  fail "a missing port is an error"
 else
-    ok "a missing port is an error"
+  ok "a missing port is an error"
 fi
 
 # --- the command line -------------------------------------------------------

@@ -21,6 +21,6 @@ jobs:
     permissions:
       contents: read
     with:
-      shfmt-args: -i 4 -ci
+      shfmt-args: -i 2 -ci
       test-command: ./tests/run.sh   # AT conversation against a fake modem on a pty; python3 is on the runner
       egress-policy: block
