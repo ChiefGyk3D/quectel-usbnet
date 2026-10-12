@@ -22,6 +22,5 @@ jobs:
       contents: read
     with:
       shfmt-args: -i 4 -ci
-      # Shell tests seen: tests/run.sh. Name the runner:
-      # test-command: ./tests/run.sh
+      test-command: ./tests/run.sh   # AT conversation against a fake modem on a pty; python3 is on the runner
       egress-policy: block
