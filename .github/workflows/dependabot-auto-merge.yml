@@ -1,0 +1,15 @@
+# Dependabot's own pull requests, merged once the gate is green. The job
+# lives in ChiefGyk3D/git-your-ship-together; a major bump is still left for a person.
+name: Dependabot auto-merge
+
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  auto-merge:
+    uses: ChiefGyk3D/git-your-ship-together/.github/workflows/dependabot-auto-merge.yml@e5c6ec3251cf3a6eea100a1c21736f1818d5efc7 # v1.23.0
+    permissions:
+      contents: write  # enable auto-merge on the pull request
+      pull-requests: write  # read its Dependabot metadata
