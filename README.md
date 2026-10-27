@@ -68,7 +68,7 @@ sim-recover: recovered   power cycled, now ready (exit 0)
 sim-recover: failed      never became ready, or an error (exit 1)
 ```
 
-`--device /dev/cdc-wdmN` picks the node when there is more than one. `status` reads the SIM through `qmicli` without ModemManager's proxy; I have not checked how that behaves while ModemManager is using the modem, so if it looks odd, stop ModemManager first.
+`--device /dev/cdc-wdmN` picks the node when there is more than one. The state reads (`status`, and the checks in `sim-recover`) use `qmicli -p`, which goes through `qmi-proxy`, so they are safe while ModemManager has the modem open. I have not run that on hardware. The power-off and power-on calls run with ModemManager stopped and do not use the proxy.
 
 ## What was going wrong
 

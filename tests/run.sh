@@ -149,6 +149,7 @@ expect_eq "parse_app_state prints nothing for garbage" \
 
 new_scenario illegal-fixed
 out=$(sim_status_lines /dev/fake-wdm)
+expect_contains "status reads the SIM through the qmi proxy" "$(calls)" "qmicli -p -d /dev/fake-wdm --uim-get-card-status"
 expect_contains "status names the USIM state" "$out" "USIM state:    illegal"
 expect_contains "status flags an illegal USIM as wedged" "$out" "WEDGED"
 expect_contains "status points at sim-recover" "$out" "sim-recover"
@@ -182,7 +183,7 @@ set -e
 expect_eq "sim-recover on a wedged SIM exits 0" "$code" 0
 expect_eq "sim-recover reports recovered" "$out" "sim-recover: recovered"
 expect_eq "sim-recover stops MM, cycles the SIM, polls, starts MM" \
-  "$(calls | sed 's/ -d \/dev\/fake-wdm//g; s/systemctl is-active --quiet ModemManager|//')" \
+  "$(calls | sed 's/ -p -d \/dev\/fake-wdm//g; s/ -d \/dev\/fake-wdm//g; s/systemctl is-active --quiet ModemManager|//')" \
   "qmicli --uim-get-card-status|systemctl stop ModemManager|qmicli --uim-sim-power-off=1|qmicli --uim-sim-power-on=1|qmicli --uim-get-card-status|systemctl start ModemManager|"
 
 # Wedged and a power cycle does not help: fail loudly, still hand MM back.

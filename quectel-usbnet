@@ -187,9 +187,10 @@ parse_app_state() {
 }
 
 # Prints the USIM application state of a cdc-wdm node, or nothing if qmicli
-# cannot read it.
+# cannot read it. -p goes through qmi-proxy, so the read is safe while
+# ModemManager has the modem open.
 sim_app_state() {
-  qmicli -d "$1" --uim-get-card-status 2>/dev/null | parse_app_state || true
+  qmicli -p -d "$1" --uim-get-card-status 2>/dev/null | parse_app_state || true
 }
 
 # The status lines for the SIM, flagging the wedged state.
