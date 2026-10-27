@@ -139,9 +139,15 @@ new_scenario() {
 calls() { tr '\n' '|' <"$qdir/calls.log"; }
 
 expect_eq "parse_app_state reads a ready card" \
-  "$(rm -f "$qdir/state"; FAKE_QMI_SCENARIO=ready qmicli --uim-get-card-status | parse_app_state)" ready
+  "$(
+    rm -f "$qdir/state"
+    FAKE_QMI_SCENARIO=ready qmicli --uim-get-card-status | parse_app_state
+  )" ready
 expect_eq "parse_app_state reads an illegal card" \
-  "$(rm -f "$qdir/state"; FAKE_QMI_SCENARIO=illegal-fixed qmicli --uim-get-card-status | parse_app_state)" illegal
+  "$(
+    rm -f "$qdir/state"
+    FAKE_QMI_SCENARIO=illegal-fixed qmicli --uim-get-card-status | parse_app_state
+  )" illegal
 expect_eq "parse_app_state ignores a state that is not slot 1 application 1" \
   "$(printf "Slot [2]:\n\tApplication [1]:\n\t\tApplication state: 'ready'\n" | parse_app_state)" ""
 expect_eq "parse_app_state prints nothing for garbage" \
