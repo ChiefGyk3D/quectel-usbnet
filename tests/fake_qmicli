@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# A stand-in for qmicli, for tests/run.sh. It only knows the three UIM calls
+# quectel-usbnet makes. State lives in $FAKE_QMI_DIR so a power cycle changes
+# what the next --uim-get-card-status prints.
+#
+#   FAKE_QMI_SCENARIO  ready          the USIM is ready from the start
+#                      illegal-fixed  illegal until a power cycle, then ready
+#                      never          illegal, and a power cycle does not help
+#   FAKE_QMI_FAIL_OFF  1 makes --uim-sim-power-off fail
+set -euo pipefail
+
+dir=${FAKE_QMI_DIR:?}
+echo "qmicli $*" >>"$dir/calls.log"
+state_file="$dir/state"
+if [ ! -e "$state_file" ]; then
+  case ${FAKE_QMI_SCENARIO:-ready} in
+    ready) echo ready >"$state_file" ;;
+    *) echo illegal >"$state_file" ;;
+  esac
+fi
+
+for arg in "$@"; do
+  case $arg in
+    --uim-get-card-status)
+      state=$(cat "$state_file")
+      cat <<OUT
+[/dev/fake-wdm] Successfully got card status
+Provisioning applications:
+	Primary GW:   slot '1', application '1'
+	Primary 1X:   session doesn't exist
+Slot [1]:
+	Card state: 'present'
+	UPIN state: 'not-initialized'
+	Application [1]:
+		Application type:  'usim (2)'
+		Application state: '$state'
+		Application ID:
+			A0:00:00:00:87:10:02:FF:FF:FF:FF:89:06:19:00:00
+		UPIN replaces PIN1: 'no'
+Slot [2]:
+	Card state: 'absent'
+OUT
+      exit 0
+      ;;
+    --uim-sim-power-off=*)
+      [ "${FAKE_QMI_FAIL_OFF:-0}" != 1 ] || {
+        echo "error: couldn't power off the SIM" >&2
+        exit 1
+      }
+      echo off >"$state_file"
+      exit 0
+      ;;
+    --uim-sim-power-on=*)
+      case ${FAKE_QMI_SCENARIO:-ready} in
+        never) echo illegal >"$state_file" ;;
+        *) echo ready >"$state_file" ;;
+      esac
+      exit 0
+      ;;
+  esac
+done
+echo "fake qmicli: unsupported arguments: $*" >&2
+exit 2

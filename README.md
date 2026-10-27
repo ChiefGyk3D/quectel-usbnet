@@ -44,6 +44,32 @@ AT+CFUN=1,1             -> OK                    (reset, it re-enumerates)
 
 Start ModemManager again and the modem shows up on `cdc-wdm0` with `qmi_wwan`. The mode lives in the modem's own storage, so it should survive a reboot, but I have only watched it survive a ModemManager restart and a modem reset so far.
 
+## The SIM is "missing" but the card is in the slot
+
+A second, different failure, seen in QMI mode. ModemManager marks the modem `failed: sim-missing` (`mmcli -m 0` shows the failed state), and its journal says `Illegal SIM/USIM application state`. Meanwhile `AT+CPIN?` on the AT port answers `READY`. The modem is fine and so is the SIM; the USIM application inside the modem is stuck in the QMI state `illegal`, and ModemManager does not retry.
+
+It showed up after a suspend/resume and after a reboot, on the EM160R-GL with firmware `EM160RGLAUR02A07M4G`. I have seen it on that one card only.
+
+`quectel-usbnet status` now prints the USIM application state (read with `qmicli -d /dev/cdc-wdmN --uim-get-card-status`, slot 1, application 1) and flags `illegal` as a wedged SIM.
+
+The recovery is a power cycle of the SIM, with ModemManager out of the way:
+
+```
+sudo quectel-usbnet sim-recover
+```
+
+It stops ModemManager, runs `--uim-sim-power-off=1`, waits a couple of seconds, runs `--uim-sim-power-on=1`, polls up to 15 seconds for the application state `ready`, and starts ModemManager again. ModemManager is started again on any error too. If the SIM is already `ready` it says so and touches nothing. By hand, it is the same three `qmicli` calls with `systemctl stop ModemManager` before and `systemctl start ModemManager` after. After it, the modem registered and the data connection passed traffic.
+
+For scripts, stdout carries exactly one line and progress goes to stderr:
+
+```
+sim-recover: ready       already fine, nothing done (exit 0)
+sim-recover: recovered   power cycled, now ready (exit 0)
+sim-recover: failed      never became ready, or an error (exit 1)
+```
+
+`--device /dev/cdc-wdmN` picks the node when there is more than one. The state reads (`status`, and the checks in `sim-recover`) use `qmicli -p`, which goes through `qmi-proxy`, so they are safe while ModemManager has the modem open. I have not run that on hardware. The power-off and power-on calls run with ModemManager stopped and do not use the proxy.
+
 ## What was going wrong
 
 I turned ModemManager's logging up to debug (`mmcli -G DEBUG`) and read what it sent. It gets through MBIM setup normally for twenty transactions (device caps, SIM slots, UICC access), then sends a request on the `qdu` service, and the modem never answers it. Every retry gets silence, ten timeouts at about twenty seconds each, and ModemManager marks the modem invalid and does not try again.
@@ -62,7 +88,7 @@ One more thing I got wrong along the way, so you do not: do not point `mbimcli` 
 
 I have not tried it on any other Quectel module. As far as I know the `usbnet` setting is documented for other Quectel families too, so the script is not specific to this card, but I have not checked that the mode numbers mean the same thing everywhere, and that is an assumption. Only `qmi` and `mbim` have run on hardware. `ecm` and `rndis` are in the table because the numbers are documented, and they are untested.
 
-The tests (`tests/run.sh`) run the AT conversation against a fake modem on a pty, so they cover the parsing and the command line but not the sysfs, ModemManager or reset path. That part has only run on the one card.
+The tests (`tests/run.sh`) run the AT conversation against a fake modem on a pty, so they cover the parsing and the command line but not the sysfs, ModemManager or reset path. `sim-recover` is tested against a fake `qmicli` and `systemctl` (ready, wedged then fixed, never ready, power-off error), not against a real SIM. That part has only run on the one card.
 
 ## Firmware
 

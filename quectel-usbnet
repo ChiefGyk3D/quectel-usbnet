@@ -8,9 +8,12 @@
 #
 #   quectel-usbnet status
 #   quectel-usbnet set qmi|mbim|ecm|rndis [--port /dev/ttyUSBn] [--dry-run]
+#   quectel-usbnet sim-recover [--device /dev/cdc-wdmN]
 #
-# `status` only reads sysfs, ModemManager and the journal. `set` stops
-# ModemManager, talks AT to the modem, resets it, and starts ModemManager again.
+# `status` only reads sysfs, ModemManager, the journal and the SIM state.
+# `set` stops ModemManager, talks AT to the modem, resets it, and starts
+# ModemManager again. `sim-recover` power cycles a USIM that is stuck in the
+# QMI application state "illegal".
 set -euo pipefail
 
 VERSION="0.1.0"
@@ -19,6 +22,9 @@ AT_TIMEOUT=3
 REENUM_GONE_TIMEOUT=20
 REENUM_BACK_TIMEOUT=90
 MM_WAIT_TIMEOUT=90
+SIM_OFF_WAIT=${QUECTEL_SIM_OFF_WAIT:-2}
+SIM_READY_TIMEOUT=${QUECTEL_SIM_READY_TIMEOUT:-15}
+SIM_POLL_INTERVAL=${QUECTEL_SIM_POLL_INTERVAL:-1}
 
 # Set by cmd_set so the EXIT trap can hand ModemManager back the way it was found.
 MM_TO_RESTORE=false
@@ -28,6 +34,7 @@ usage() {
 usage:
   quectel-usbnet status
   quectel-usbnet set MODE [--port /dev/ttyUSBn] [--dry-run]
+  quectel-usbnet sim-recover [--device /dev/cdc-wdmN]
   quectel-usbnet --version
 
 MODE is one of: qmi (usbnet 0), ecm (1), mbim (2), rndis (3).
@@ -157,6 +164,50 @@ device_ttys() {
   find -L "$1" -maxdepth 3 -name 'ttyUSB*' 2>/dev/null | sort
 }
 
+# Prints the /dev/cdc-wdmN nodes of a USB device, one per line. Same symlink
+# trap as device_ttys: without -L, find prints nothing.
+device_wdm() {
+  find -L "$1" -maxdepth 3 -name 'cdc-wdm*' 2>/dev/null | sort | while read -r n; do
+    echo "/dev/$(basename "$n")"
+  done
+}
+
+# Reads `qmicli --uim-get-card-status` on stdin and prints the application
+# state of slot 1, application 1 ("ready", "illegal", ...), or nothing.
+parse_app_state() {
+  awk '
+    /^[ \t]*Slot \[/ { slot = ($0 ~ /\[1\]/); app = 0; next }
+    /^[ \t]*Application \[/ { app = (slot && $0 ~ /\[1\]/); next }
+    app && /Application state:/ {
+      sub(/.*Application state: *\x27/, "")
+      sub(/[ \x27(].*/, "")
+      print
+      exit
+    }'
+}
+
+# Prints the USIM application state of a cdc-wdm node, or nothing if qmicli
+# cannot read it. -p goes through qmi-proxy, so the read is safe while
+# ModemManager has the modem open.
+sim_app_state() {
+  qmicli -p -d "$1" --uim-get-card-status 2>/dev/null | parse_app_state || true
+}
+
+# The status lines for the SIM, flagging the wedged state.
+sim_status_lines() {
+  local wdm=$1 state
+  state=$(sim_app_state "$wdm")
+  if [ -z "$state" ]; then
+    say "USIM state:    unknown ($wdm not readable by qmicli; try sudo)"
+    return 0
+  fi
+  say "USIM state:    $state ($wdm)"
+  if [ "$state" = illegal ]; then
+    say "               WEDGED: the USIM application is stuck in 'illegal', so ModemManager"
+    say "               reports sim-missing even if AT+CPIN? says READY. Try:  sudo quectel-usbnet sim-recover"
+  fi
+}
+
 # Prints the first tty of a USB device that answers ATI with "Quectel". A port
 # that was only just released can need a second or two, so each is tried 3 times.
 find_at_port() {
@@ -243,7 +294,7 @@ wait_for_modem() {
 }
 
 cmd_status() {
-  local devs dev drv mode timeouts journal
+  local devs dev drv mode timeouts journal wdm
   mapfile -t devs < <(quectel_devices)
   if [ "${#devs[@]}" -eq 0 ]; then
     say "usb:           no Quectel device (vendor $QUECTEL_VID) on the bus"
@@ -258,6 +309,11 @@ cmd_status() {
       say "net driver:    $drv (mode: $mode)"
     else
       say "net driver:    none bound"
+    fi
+    if command -v qmicli >/dev/null 2>&1; then
+      while read -r wdm; do
+        sim_status_lines "$wdm"
+      done < <(device_wdm "$dev")
     fi
   done
   if mm_active; then
@@ -394,6 +450,85 @@ cmd_set() {
   fi
 }
 
+# Result line for scripts (Hammunition calls this): the only thing on stdout.
+sim_result() {
+  echo "sim-recover: $1"
+}
+
+sim_fail() {
+  echo "error: $*" >&2
+  sim_result failed
+  exit 1
+}
+
+cmd_sim_recover() {
+  local wdm="" devs state waited
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --device)
+        [ $# -ge 2 ] || usage
+        wdm=$2
+        shift 2
+        ;;
+      *) usage ;;
+    esac
+  done
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "sim-recover needs root (ModemManager control, cdc-wdm access); re-running with sudo" >&2
+    if [ -n "$wdm" ]; then
+      exec sudo -- "$(readlink -f "${BASH_SOURCE[0]}")" sim-recover --device "$wdm"
+    fi
+    exec sudo -- "$(readlink -f "${BASH_SOURCE[0]}")" sim-recover
+  fi
+
+  command -v qmicli >/dev/null 2>&1 || sim_fail "qmicli not found (package libqmi-utils)"
+  if [ -z "$wdm" ]; then
+    mapfile -t devs < <(
+      while read -r d; do device_wdm "$d"; done < <(quectel_devices)
+    )
+    [ "${#devs[@]}" -gt 0 ] || sim_fail "no cdc-wdm node on a Quectel device; run 'quectel-usbnet status'"
+    [ "${#devs[@]}" -eq 1 ] || sim_fail "more than one cdc-wdm node; pass --device /dev/cdc-wdmN"
+    wdm=${devs[0]}
+  fi
+
+  state=$(sim_app_state "$wdm")
+  [ -n "$state" ] || sim_fail "could not read the USIM state from $wdm"
+  if [ "$state" = ready ]; then
+    echo "USIM application is already ready; nothing to do" >&2
+    sim_result ready
+    return 0
+  fi
+  echo "USIM application state is '$state'; power cycling the SIM" >&2
+
+  if mm_active; then
+    MM_TO_RESTORE=true
+    trap restore_mm EXIT
+    echo "stopping ModemManager" >&2
+    systemctl stop ModemManager >&2 || sim_fail "could not stop ModemManager"
+  fi
+
+  qmicli -d "$wdm" --uim-sim-power-off=1 >&2 || sim_fail "--uim-sim-power-off=1 failed on $wdm"
+  sleep "$SIM_OFF_WAIT"
+  qmicli -d "$wdm" --uim-sim-power-on=1 >&2 || sim_fail "--uim-sim-power-on=1 failed on $wdm"
+
+  state=""
+  waited=$((SECONDS + SIM_READY_TIMEOUT))
+  while ((SECONDS < waited)); do
+    state=$(sim_app_state "$wdm")
+    [ "$state" != ready ] || break
+    sleep "$SIM_POLL_INTERVAL"
+  done
+  [ "$state" = ready ] || sim_fail "USIM application did not become ready within ${SIM_READY_TIMEOUT}s (last state: ${state:-unreadable})"
+
+  if $MM_TO_RESTORE; then
+    echo "starting ModemManager" >&2
+    systemctl start ModemManager >&2 || sim_fail "recovered the SIM but could not start ModemManager"
+    MM_TO_RESTORE=false
+  fi
+  sim_result recovered
+}
+
 main() {
   [ $# -ge 1 ] || usage
   case $1 in
@@ -401,6 +536,10 @@ main() {
     set)
       shift
       cmd_set "$@"
+      ;;
+    sim-recover)
+      shift
+      cmd_sim_recover "$@"
       ;;
     --version) echo "quectel-usbnet $VERSION" ;;
     *) usage ;;
