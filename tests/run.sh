@@ -110,6 +110,112 @@ ln -s "$tmp/real/4-4" "$tmp/devices/4-4"
 expect_eq "device_ttys follows the symlinked device directory" \
   "$(device_ttys "$tmp/devices/4-4" | xargs -n1 basename | tr '\n' ' ')" "ttyUSB2 ttyUSB3 "
 
+# --- the SIM application state, against a fake qmicli ------------------------
+# A fake qmicli, systemctl and id go first on PATH. systemctl always reports
+# ModemManager as running and logs what it was asked, so the tests can check
+# that it was stopped before the power cycle and started again after.
+bin="$tmp/bin"
+qdir="$tmp/qmi"
+mkdir -p "$bin" "$qdir"
+cp "$HERE/fake_qmicli" "$bin/qmicli"
+cat >"$bin/systemctl" <<SH
+#!/usr/bin/env bash
+echo "systemctl \$*" >>"$qdir/calls.log"
+[ "\$1" != is-active ] || exit 0
+SH
+printf '#!/usr/bin/env bash\necho 0\n' >"$bin/id"
+chmod +x "$bin/systemctl" "$bin/id"
+export FAKE_QMI_DIR="$qdir"
+export QUECTEL_SIM_OFF_WAIT=0 QUECTEL_SIM_READY_TIMEOUT=2 QUECTEL_SIM_POLL_INTERVAL=0.2
+OLD_PATH=$PATH
+PATH="$bin:$PATH"
+
+new_scenario() {
+  rm -f "$qdir/state" "$qdir/calls.log"
+  touch "$qdir/calls.log"
+  export FAKE_QMI_SCENARIO=$1
+  unset FAKE_QMI_FAIL_OFF
+}
+calls() { tr '\n' '|' <"$qdir/calls.log"; }
+
+expect_eq "parse_app_state reads a ready card" \
+  "$(rm -f "$qdir/state"; FAKE_QMI_SCENARIO=ready qmicli --uim-get-card-status | parse_app_state)" ready
+expect_eq "parse_app_state reads an illegal card" \
+  "$(rm -f "$qdir/state"; FAKE_QMI_SCENARIO=illegal-fixed qmicli --uim-get-card-status | parse_app_state)" illegal
+expect_eq "parse_app_state ignores a state that is not slot 1 application 1" \
+  "$(printf "Slot [2]:\n\tApplication [1]:\n\t\tApplication state: 'ready'\n" | parse_app_state)" ""
+expect_eq "parse_app_state prints nothing for garbage" \
+  "$(printf 'error: no\n' | parse_app_state)" ""
+
+new_scenario illegal-fixed
+out=$(sim_status_lines /dev/fake-wdm)
+expect_contains "status names the USIM state" "$out" "USIM state:    illegal"
+expect_contains "status flags an illegal USIM as wedged" "$out" "WEDGED"
+expect_contains "status points at sim-recover" "$out" "sim-recover"
+new_scenario ready
+out=$(sim_status_lines /dev/fake-wdm)
+expect_contains "status shows a ready USIM" "$out" "USIM state:    ready"
+case $out in
+  *WEDGED*) fail "a ready USIM is not flagged" ;;
+  *) ok "a ready USIM is not flagged" ;;
+esac
+
+# Already ready: say so, change nothing, leave ModemManager alone.
+new_scenario ready
+set +e
+out=$("$TOOL" sim-recover --device /dev/fake-wdm 2>"$tmp/err")
+code=$?
+set -e
+expect_eq "sim-recover on a ready SIM exits 0" "$code" 0
+expect_eq "sim-recover on a ready SIM prints one result line" "$out" "sim-recover: ready"
+case $(calls) in
+  *power-off* | *stop*) fail "a ready SIM is not power cycled" "$(calls)" ;;
+  *) ok "a ready SIM is not power cycled" ;;
+esac
+
+# Wedged, fixed by a power cycle.
+new_scenario illegal-fixed
+set +e
+out=$("$TOOL" sim-recover --device /dev/fake-wdm 2>"$tmp/err")
+code=$?
+set -e
+expect_eq "sim-recover on a wedged SIM exits 0" "$code" 0
+expect_eq "sim-recover reports recovered" "$out" "sim-recover: recovered"
+expect_eq "sim-recover stops MM, cycles the SIM, polls, starts MM" \
+  "$(calls | sed 's/ -d \/dev\/fake-wdm//g; s/systemctl is-active --quiet ModemManager|//')" \
+  "qmicli --uim-get-card-status|systemctl stop ModemManager|qmicli --uim-sim-power-off=1|qmicli --uim-sim-power-on=1|qmicli --uim-get-card-status|systemctl start ModemManager|"
+
+# Wedged and a power cycle does not help: fail loudly, still hand MM back.
+new_scenario never
+set +e
+out=$("$TOOL" sim-recover --device /dev/fake-wdm 2>"$tmp/err")
+code=$?
+set -e
+expect_eq "sim-recover exits 1 when the SIM never becomes ready" "$code" 1
+expect_eq "sim-recover reports failed" "$out" "sim-recover: failed"
+expect_contains "sim-recover says why on stderr" "$(cat "$tmp/err")" "did not become ready"
+expect_contains "ModemManager is started again after a failure" "$(calls)" "systemctl start ModemManager"
+
+# An error half way through: the EXIT trap still starts ModemManager.
+new_scenario illegal-fixed
+export FAKE_QMI_FAIL_OFF=1
+set +e
+out=$("$TOOL" sim-recover --device /dev/fake-wdm 2>"$tmp/err")
+code=$?
+set -e
+expect_eq "sim-recover exits 1 when power-off fails" "$code" 1
+expect_eq "sim-recover reports failed when power-off fails" "$out" "sim-recover: failed"
+expect_contains "ModemManager is started again after a power-off error" "$(calls)" "systemctl start ModemManager"
+
+# The cdc-wdm node is found through the symlinked device directory.
+mkdir -p "$tmp/real/4-4/4-4:1.4/usbmisc/cdc-wdm0" "$tmp/devices2"
+ln -s "$tmp/real/4-4" "$tmp/devices2/4-4"
+expect_eq "device_wdm follows the symlinked device directory" \
+  "$(device_wdm "$tmp/devices2/4-4")" "/dev/cdc-wdm0"
+
+PATH=$OLD_PATH
+unset FAKE_QMI_SCENARIO FAKE_QMI_FAIL_OFF
+
 # --- the command line -------------------------------------------------------
 out=$("$TOOL" set qmi --dry-run 2>&1)
 expect_contains "dry run names the AT command it would send" "$out" 'AT+QCFG="usbnet",0'
