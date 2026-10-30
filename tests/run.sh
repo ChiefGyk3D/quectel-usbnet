@@ -110,6 +110,45 @@ ln -s "$tmp/real/4-4" "$tmp/devices/4-4"
 expect_eq "device_ttys follows the symlinked device directory" \
   "$(device_ttys "$tmp/devices/4-4" | xargs -n1 basename | tr '\n' ' ')" "ttyUSB2 ttyUSB3 "
 
+# --- the route-metric hint, against a stub nmcli ------------------------------
+# NMCLI points the script at a stub, so no real NetworkManager config is read.
+stub="$tmp/nmcli-stub"
+cat >"$stub" <<'STUB'
+#!/usr/bin/env bash
+# Fake nmcli. STUB_PROFILES is the "TYPE:NAME" list, STUB_METRIC the route metric.
+case "$*" in
+  "-t -f TYPE,NAME connection show") printf '%s\n' "${STUB_PROFILES:-}" ;;
+  "-g ipv4.route-metric connection show "*) echo "${STUB_METRIC:--1}" ;;
+  "-g ipv6.route-metric connection show "*) echo "${STUB_METRIC6:-${STUB_METRIC:--1}}" ;;
+  *) exit 1 ;;
+esac
+STUB
+chmod +x "$stub"
+export NMCLI="$stub"
+export STUB_PROFILES=$'802-3-ethernet:wired\ngsm:example-gsm'
+expect_eq "an automatic gsm route metric is reported" \
+  "$(STUB_METRIC=-1 nm_auto_metric_profiles)" "example-gsm"
+expect_eq "an explicit gsm route metric is not reported" \
+  "$(STUB_METRIC=1100 nm_auto_metric_profiles)" ""
+expect_eq "an automatic IPv6 metric alone is reported" \
+  "$(STUB_METRIC=1100 STUB_METRIC6=-1 nm_auto_metric_profiles)" "example-gsm"
+expect_eq "non-gsm profiles are ignored" \
+  "$(STUB_PROFILES='802-3-ethernet:wired' nm_auto_metric_profiles)" ""
+expect_eq "no profiles at all prints nothing" \
+  "$(STUB_PROFILES='' nm_auto_metric_profiles)" ""
+expect_eq "a colon in a profile name survives" \
+  "$(STUB_PROFILES='gsm:a\:b' nm_auto_metric_profiles)" "a:b"
+out=$(STUB_METRIC=-1 nm_metric_hint)
+expect_contains "the hint names the README section" "$out" "README"
+expect_eq "no hint when the metric is set" "$(STUB_METRIC=1100 nm_metric_hint)" ""
+NMCLI=/nonexistent/nmcli
+if out=$(nm_metric_hint 2>&1); then
+  expect_eq "a missing nmcli prints nothing and succeeds" "$out" ""
+else
+  fail "a missing nmcli must not fail"
+fi
+unset NMCLI STUB_PROFILES
+
 # --- the command line -------------------------------------------------------
 out=$("$TOOL" set qmi --dry-run 2>&1)
 expect_contains "dry run names the AT command it would send" "$out" 'AT+QCFG="usbnet",0'

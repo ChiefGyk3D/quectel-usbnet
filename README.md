@@ -44,6 +44,19 @@ AT+CFUN=1,1             -> OK                    (reset, it re-enumerates)
 
 Start ModemManager again and the modem shows up on `cdc-wdm0` with `qmi_wwan`. The mode lives in the modem's own storage, so it should survive a reboot, but I have only watched it survive a ModemManager restart and a modem reset so far.
 
+## Keeping cellular as the fallback
+
+Once the modem works in QMI mode, NetworkManager's gsm profile keeps `ipv4.route-metric` at -1, which means automatic, and the modem's default route can beat Wi-Fi (metric 600). I did not want my laptop quietly running on cellular with Wi-Fi sitting right there. Give the profile a higher metric:
+
+```
+nmcli connection modify "<gsm profile>" ipv4.route-metric 1100 ipv6.route-metric 1100
+ip route show default
+```
+
+`nmcli connection show` lists the profile names. It takes effect the next time the modem connects, or when you run `nmcli connection up "<gsm profile>"`. The check is `ip route show default`: the Wi-Fi route should now come first and the cellular one should show metric 1100. Cellular stays up as a fallback.
+
+If you would rather it never connect on its own, `nmcli connection modify "<gsm profile>" connection.autoconnect no` does that instead. `quectel-usbnet status` prints a one-line hint when it finds a gsm profile still on the automatic metric.
+
 ## What was going wrong
 
 I turned ModemManager's logging up to debug (`mmcli -G DEBUG`) and read what it sent. It gets through MBIM setup normally for twenty transactions (device caps, SIM slots, UICC access), then sends a request on the `qdu` service, and the modem never answers it. Every retry gets silence, ten timeouts at about twenty seconds each, and ModemManager marks the modem invalid and does not try again.
