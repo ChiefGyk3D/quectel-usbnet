@@ -44,6 +44,38 @@ AT+CFUN=1,1             -> OK                    (reset, it re-enumerates)
 
 Start ModemManager again and the modem shows up on `cdc-wdm0` with `qmi_wwan`. The mode lives in the modem's own storage, so it should survive a reboot, but I have only watched it survive a ModemManager restart and a modem reset so far.
 
+## After suspend/resume: `recover`
+
+On the same laptop, after a resume the tray showed no modem while `lsusb` still listed `2c7c:0620`. A reboot fixed it. `recover` is the no-reboot version, and it needs no internet:
+
+```
+quectel-usbnet recover --dry-run     # print the ladder, touch nothing
+quectel-usbnet recover
+```
+
+It climbs a ladder and stops at the first rung after which `mmcli -L` lists a modem and `nmcli device` shows the `cdc-wdm` device as anything but `unavailable`. Each rung prints what it did and what it then observed.
+
+1. `nmcli radio wwan on`. A resume can leave the WWAN radio software-disabled.
+2. `mmcli -m <n> --enable`, for a listed modem whose state is `disabled`.
+3. Restart ModemManager, then wait for the modem. The wait has an iteration cap, so it cannot hang.
+4. Toggle `authorized` to 0 then 1 on the USB device with ID `2c7c:0620`. It is found through sysfs by vendor and product ID, never by bus path.
+5. `AT+CFUN=1,1` on the AT port. This resets the modem and drops its connections, so it only runs if you answer `y` at the prompt or pass `--yes`. Without a terminal and without `--yes` it is printed, not sent.
+
+Rungs 1 and 2 run as you. Rungs 3 to 5 need root, so `recover` re-runs itself with `sudo` (or `pkexec` if there is no `sudo`) and picks up at rung 3. If nothing works, it says so and exits 1. If `lsusb` no longer lists the card, only a full power cycle is left.
+
+### Run it automatically after resume (opt-in)
+
+Nothing installs this unless you ask:
+
+```
+quectel-usbnet install-resume-hook --dry-run   # show the hook
+sudo quectel-usbnet install-resume-hook
+```
+
+That writes `/usr/lib/systemd/system-sleep/quectel-usbnet-recover`. After resume it waits 5 seconds and runs `recover` in the background under `timeout 300`, with the output going to the journal (`journalctl -t quectel-usbnet`). It never delays the resume, and because it has no terminal it never sends the rung 5 reset. It will not overwrite a file of that name it did not write. To remove it: `sudo rm /usr/lib/systemd/system-sleep/quectel-usbnet-recover`.
+
+The cause is not proven. See [docs/evidence.md](docs/evidence.md) for what was observed and what is inferred.
+
 ## What was going wrong
 
 I turned ModemManager's logging up to debug (`mmcli -G DEBUG`) and read what it sent. It gets through MBIM setup normally for twenty transactions (device caps, SIM slots, UICC access), then sends a request on the `qdu` service, and the modem never answers it. Every retry gets silence, ten timeouts at about twenty seconds each, and ModemManager marks the modem invalid and does not try again.
@@ -62,7 +94,7 @@ One more thing I got wrong along the way, so you do not: do not point `mbimcli` 
 
 I have not tried it on any other Quectel module. As far as I know the `usbnet` setting is documented for other Quectel families too, so the script is not specific to this card, but I have not checked that the mode numbers mean the same thing everywhere, and that is an assumption. Only `qmi` and `mbim` have run on hardware. `ecm` and `rndis` are in the table because the numbers are documented, and they are untested.
 
-The tests (`tests/run.sh`) run the AT conversation against a fake modem on a pty, so they cover the parsing and the command line but not the sysfs, ModemManager or reset path. That part has only run on the one card.
+The tests (`tests/run.sh`) run the AT conversation against a fake modem on a pty, so they cover the parsing and the command line. The `recover` ladder and the resume hook are tested against stub `nmcli`, `mmcli` and `systemctl` and a fake sysfs tree, so no test touches a real modem or service. The `set` reset path and the real `recover` rungs have not been run on hardware beyond the one card. That part has only run on the one card.
 
 ## Firmware
 

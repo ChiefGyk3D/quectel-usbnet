@@ -93,3 +93,21 @@ sudo mmcli -G INFO                                           # put it back
 ```
 
 Do not run `mbimcli` against the same port while ModemManager is starting. It closes ModemManager's session.
+
+## Dropout after suspend/resume (issue 16)
+
+Same card, in QMI mode (`qmi_wwan`, `cdc-wdm0`). Identifiers removed.
+
+Observed, from the previous boot:
+
+- After a resume, ModemManager's probe raced the resume and logged `port context already being processed`.
+- About 18 seconds later ModemManager recreated the modem (a new index) in state `disabled`.
+- KDE's modem monitor logged `QObject::connect(ModemManager::Modem, ...): invalid nullptr parameter`.
+- The tray showed no device while `lsusb` still listed `2c7c:0620`.
+- In the same minute the tray user session set NetworkManager `wwan-enabled` to `off` (and toggled Wi-Fi off and on). `wwan-enabled: on` never appears afterward.
+- A reboot was the only fix tried.
+
+Inferred, not proven:
+
+- The resume race left ModemManager with a modem object that the desktop could not use, and the WWAN radio was left software-disabled by the session. Either alone could produce an empty tray; I have not separated them.
+- That is why `recover` goes from the cheapest rung (radio on, enable) to the most disruptive (reset), and stops at the first that works. Which rung actually fixes a real dropout has not been measured yet; the tests use stubs and prove the ladder's logic, not the hardware outcome.
