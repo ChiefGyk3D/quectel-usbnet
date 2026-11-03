@@ -68,11 +68,19 @@ Rungs 1 and 2 run as you. Rungs 3 to 5 need root, so `recover` re-runs itself wi
 Nothing installs this unless you ask:
 
 ```
-quectel-usbnet install-resume-hook --dry-run   # show the hook
+quectel-usbnet install-resume-hook --dry-run   # show the hook and the paths
 sudo quectel-usbnet install-resume-hook
 ```
 
-That writes `/usr/lib/systemd/system-sleep/quectel-usbnet-recover`. After resume it waits 5 seconds and runs `recover` in the background under `timeout 300`, with the output going to the journal (`journalctl -t quectel-usbnet`). It never delays the resume, and because it has no terminal it never sends the rung 5 reset. It will not overwrite a file of that name it did not write. To remove it: `sudo rm /usr/lib/systemd/system-sleep/quectel-usbnet-recover`.
+The hook runs as root after every resume, so it must never run a file you can edit. The install copies the script to `/usr/local/libexec/quectel-usbnet` (`install -m 0755 -o root -g root`) and writes `/usr/lib/systemd/system-sleep/quectel-usbnet-recover`, which runs only that copy. `--tool PATH` only chooses which script is copied. The install refuses to continue if either directory is not owned by root or is writable by group or others, and it will not overwrite a hook or a copy it did not write. Run it again after you update the script to refresh the copy.
+
+After resume the hook waits 5 seconds and runs `recover` in the background under `timeout 300`, with the output going to the journal (`journalctl -t quectel-usbnet`). It never delays the resume, and because it has no terminal it never sends the rung 5 reset. Before each run it checks that the copy is a regular file (not a symlink), owned by root, and not writable by group or others, in a directory that meets the same test. If not, it logs a refusal and does nothing.
+
+To remove both files, only if quectel-usbnet wrote them:
+
+```
+sudo quectel-usbnet uninstall-resume-hook
+```
 
 The cause is not proven. See [docs/evidence.md](docs/evidence.md) for what was observed and what is inferred.
 

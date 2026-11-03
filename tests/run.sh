@@ -300,21 +300,31 @@ scenario none
 RECOVER_MM_WAIT=2 run_recover
 expect_eq "bounded waits: a modem that never comes back ends in exit 1" "$code" 1
 
-# --- install-resume-hook: opt-in only ---------------------------------------
-export SLEEP_HOOK_DIR="$tmp/sleep"
-mkdir -p "$SLEEP_HOOK_DIR"
+# --- install-resume-hook: opt-in only, and never a user-writable path ---------
+# The hook runs as root after every resume. It must point at a root-owned copy
+# of the tool, never at the source tree or anything under $HOME. The tests stand
+# in for "root" with the current user by reassigning ROOT_UID/ROOT_GID, and for
+# /usr with directories under $tmp.
+export SLEEP_HOOK_DIR="$tmp/sleep" LIBEXEC_DIR="$tmp/libexec"
+ROOT_UID=$(id -u)
+ROOT_GID=$(id -g)
+mkdir -p "$SLEEP_HOOK_DIR" "$LIBEXEC_DIR"
+chmod 755 "$SLEEP_HOOK_DIR" "$LIBEXEC_DIR"
+installed_files() { find "$SLEEP_HOOK_DIR" "$LIBEXEC_DIR" -mindepth 1; }
 set +e
-out=$(cmd_install_resume_hook --dry-run --tool /usr/local/bin/quectel-usbnet 2>&1)
+out=$(cmd_install_resume_hook --dry-run --tool "$HOME/src/quectel-usbnet/quectel-usbnet" 2>&1)
 code=$?
 set -e
 expect_eq "install dry run exits 0" "$code" 0
 expect_contains "install dry run shows the hook" "$out" "timeout"
-expect_eq "install dry run writes nothing" "$(ls "$SLEEP_HOOK_DIR")" ""
-expect_eq "no other command installs a hook" \
+expect_contains "install dry run names the root-owned copy" "$out" "$LIBEXEC_DIR/quectel-usbnet"
+if [[ $out == *"$HOME"* ]]; then fail "the dry-run hook never mentions \$HOME"; else ok "the dry-run hook never mentions \$HOME"; fi
+expect_eq "install dry run writes nothing" "$(installed_files)" ""
+expect_eq "no other command installs a hook or a copy" \
   "$(
     cmd_status >/dev/null 2>&1 || true
     cmd_recover --dry-run >/dev/null 2>&1
-    ls "$SLEEP_HOOK_DIR"
+    installed_files
   )" ""
 
 hooktool="$tmp/hooktool"
@@ -327,9 +337,20 @@ export HOOK_LOG="$tmp/hook.log" QUECTEL_RESUME_DELAY=0 QUECTEL_RESUME_LOGGER=cat
 : >"$HOOK_LOG"
 cmd_install_resume_hook --tool "$hooktool" >/dev/null
 hook="$SLEEP_HOOK_DIR/quectel-usbnet-recover"
+copy="$LIBEXEC_DIR/quectel-usbnet"
 if [ -x "$hook" ]; then ok "install writes an executable hook"; else fail "install writes an executable hook"; fi
+if [ -x "$copy" ]; then ok "install writes an executable copy of the tool"; else fail "install writes an executable copy of the tool"; fi
+expect_eq "the copy is mode 0755" "$(stat -c %a "$copy")" 755
+expect_eq "the copy is the given source" "$(cat "$copy")" "$(cat "$hooktool")"
 hook_text=$(cat "$hook")
-expect_contains "the hook runs recover with the given tool" "$hook_text" "\"$hooktool\" recover"
+expect_contains "the hook runs only the root-owned copy" "$hook_text" "tool=\"$copy\""
+for bad in "$hooktool" "$HOME" "$HERE" "$TOOL"; do
+  if [[ $hook_text == *"$bad"* ]]; then
+    fail "the hook never names a source or user path" "found '$bad'"
+  else
+    ok "the hook never names a source or user path"
+  fi
+done
 expect_contains "the hook is time limited" "$hook_text" "timeout"
 expect_contains "the hook runs in the background" "$hook_text" "&"
 
@@ -343,20 +364,116 @@ for _ in $(seq 1 50); do
 done
 expect_contains "the hook runs recover after resume" "$(cat "$HOOK_LOG")" "hook ran: recover"
 
-echo "# someone else's script" >"$SLEEP_HOOK_DIR/quectel-usbnet-recover"
+# The hook refuses a copy that something else could have edited.
+: >"$HOOK_LOG"
+chmod 775 "$copy"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses a group-writable copy" "$(cat "$HOOK_LOG")" ""
+chmod 757 "$copy"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses an other-writable copy" "$(cat "$HOOK_LOG")" ""
+chmod 755 "$copy"
+chmod 777 "$LIBEXEC_DIR"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses a copy in a writable directory" "$(cat "$HOOK_LOG")" ""
+chmod 755 "$LIBEXEC_DIR"
+mv "$copy" "$copy.real"
+ln -s "$copy.real" "$copy"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses a symlinked copy" "$(cat "$HOOK_LOG")" ""
+rm -f "$copy"
+mv "$copy.real" "$copy"
+# the stand-in owner is the current user; a different owner is refused too
+sed -i "s/-user $ROOT_UID /-user 99999 /" "$hook"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses a copy with the wrong owner" "$(cat "$HOOK_LOG")" ""
+
+# Re-running the install updates the copy.
+cat >"$hooktool" <<'HT'
+#!/usr/bin/env bash
+echo "hook ran v2: $*" >>"$HOOK_LOG"
+HT
+cmd_install_resume_hook --tool "$hooktool" >/dev/null
+expect_contains "re-running install updates the copy" "$(cat "$copy")" "v2"
+"$hook" post suspend
+for _ in $(seq 1 50); do
+  [ -s "$HOOK_LOG" ] && break
+  sleep 0.1
+done
+expect_contains "the reinstalled hook works again" "$(cat "$HOOK_LOG")" "hook ran v2: recover"
+
+# Refusals: a destination directory others can write, or a foreign file.
+chmod 775 "$LIBEXEC_DIR"
 set +e
 out=$(cmd_install_resume_hook --tool "$hooktool" 2>&1)
 code=$?
 set -e
-expect_eq "install refuses to overwrite a file it did not write" "$code" 1
+expect_eq "install refuses a group-writable destination directory" "$code" 1
+expect_contains "the refusal names the directory" "$out" "not safe"
+chmod 757 "$LIBEXEC_DIR"
+set +e
+(cmd_install_resume_hook --tool "$hooktool") >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "install refuses an other-writable destination directory" "$code" 1
+chmod 755 "$LIBEXEC_DIR"
+set +e
+(
+  ROOT_UID=99999
+  cmd_install_resume_hook --tool "$hooktool"
+) >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "install refuses a destination directory that is not root-owned" "$code" 1
+
+rm -f "$hook" "$copy"
+echo "# someone else's script" >"$hook"
+set +e
+out=$(cmd_install_resume_hook --tool "$hooktool" 2>&1)
+code=$?
+set -e
+expect_eq "install refuses to overwrite a hook it did not write" "$code" 1
 expect_contains "the refusal says why" "$out" "not written by"
-rm -f "$SLEEP_HOOK_DIR/quectel-usbnet-recover"
+expect_eq "a refused install leaves no copy behind" "$(ls "$LIBEXEC_DIR")" ""
+rm -f "$hook"
+echo "# someone else's tool" >"$copy"
+set +e
+(cmd_install_resume_hook --tool "$hooktool") >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "install refuses to overwrite a copy it did not write" "$code" 1
+rm -f "$copy"
 
 out=$(TEST_ROOT=no cmd_install_resume_hook --tool "$hooktool" 2>&1)
 expect_contains "install without root re-executes through a privilege helper" "$out" "REEXEC"
-expect_eq "install without root wrote nothing yet" "$(ls "$SLEEP_HOOK_DIR")" ""
+expect_eq "install without root wrote nothing yet" "$(installed_files)" ""
 
-unset NMCLI MMCLI SYSTEMCTL USB_SYSFS RECOVER_SLEEP RECOVER_MM_WAIT RECOVER_NM_WAIT SLEEP_HOOK_DIR
+# --- uninstall-resume-hook: removes only what the installer wrote -------------
+# "Wrote" is recognised by the script's own header for the copy and a marker for
+# the hook, so a real copy of this script is installed for these checks.
+cmd_install_resume_hook --tool "$TOOL" >/dev/null
+if [ -e "$hook" ] && [ -e "$copy" ]; then ok "install with the real script writes both files"; else fail "install with the real script writes both files"; fi
+cmd_uninstall_resume_hook >/dev/null
+expect_eq "uninstall removes the hook and the copy" "$(installed_files)" ""
+set +e
+(cmd_uninstall_resume_hook) >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "uninstall with nothing installed succeeds" "$code" 0
+echo "# someone else's script" >"$hook"
+echo "# someone else's tool" >"$copy"
+cmd_uninstall_resume_hook >/dev/null 2>&1 || true
+if [ -e "$hook" ] && [ -e "$copy" ]; then ok "uninstall leaves files it did not write"; else fail "uninstall leaves files it did not write"; fi
+rm -f "$hook" "$copy"
+out=$(TEST_ROOT=no cmd_uninstall_resume_hook 2>&1)
+expect_contains "uninstall without root re-executes through a privilege helper" "$out" "REEXEC"
+
+unset NMCLI MMCLI SYSTEMCTL USB_SYSFS RECOVER_SLEEP RECOVER_MM_WAIT RECOVER_NM_WAIT SLEEP_HOOK_DIR LIBEXEC_DIR
 unset -f is_root reexec_root sysfs_write at_cmd find_at_port
 # Put the real implementations back for the command-line checks below.
 # shellcheck source=quectel-usbnet

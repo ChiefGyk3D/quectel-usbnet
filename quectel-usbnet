@@ -10,6 +10,7 @@
 #   quectel-usbnet set qmi|mbim|ecm|rndis [--port /dev/ttyUSBn] [--dry-run]
 #   quectel-usbnet recover [--dry-run] [--yes]
 #   quectel-usbnet install-resume-hook [--dry-run] [--tool PATH]
+#   quectel-usbnet uninstall-resume-hook
 #
 # `status` only reads sysfs, ModemManager and the journal. `set` stops
 # ModemManager, talks AT to the modem, resets it, and starts ModemManager again.
@@ -32,7 +33,14 @@ USB_SYSFS=${USB_SYSFS:-/sys/bus/usb/devices}
 MMCLI=${MMCLI:-mmcli}
 SYSTEMCTL=${SYSTEMCTL:-systemctl}
 SLEEP_HOOK_DIR=${SLEEP_HOOK_DIR:-/usr/lib/systemd/system-sleep}
+LIBEXEC_DIR=${LIBEXEC_DIR:-/usr/local/libexec}
 HOOK_NAME="quectel-usbnet-recover"
+COPY_NAME="quectel-usbnet"
+# The "root" that must own the installed copy. Constants, not environment: the
+# tests reassign them after sourcing this file to stand in for root.
+ROOT_UID=0
+ROOT_GID=0
+COPY_MARK="quectel-usbnet: read or change the USB network mode"
 HOOK_MARK="# written by quectel-usbnet install-resume-hook"
 
 # Set by cmd_set so the EXIT trap can hand ModemManager back the way it was found.
@@ -45,6 +53,7 @@ usage:
   quectel-usbnet set MODE [--port /dev/ttyUSBn] [--dry-run]
   quectel-usbnet recover [--dry-run] [--yes]
   quectel-usbnet install-resume-hook [--dry-run] [--tool PATH]
+  quectel-usbnet uninstall-resume-hook
   quectel-usbnet --version
 
 MODE is one of: qmi (usbnet 0), ecm (1), mbim (2), rndis (3).
@@ -66,7 +75,12 @@ recover  Restores the modem and networking after a suspend/resume dropout,
          re-runs itself with sudo or pkexec. --dry-run prints the ladder only.
 install-resume-hook
          Opt-in. Installs a systemd system-sleep hook that runs recover in the
-         background after resume. Nothing else installs it. Needs root.
+         background after resume. It copies this script to a root-owned
+         /usr/local/libexec/quectel-usbnet and the hook runs only that copy
+         (--tool PATH only picks the script to copy). Nothing else installs
+         it. Needs root.
+uninstall-resume-hook
+         Removes the hook and the copy, only if quectel-usbnet wrote them.
 EOF
   exit 2
 }
@@ -589,6 +603,10 @@ cmd_recover() {
 
 # --- the opt-in resume hook ---------------------------------------------------
 
+# The hook runs as root after every resume, so it must run only a root-owned
+# copy of this tool and refuse to run it if anything could have edited it.
+# The owner is baked in at install time; the hook reads nothing from its environment
+# except the optional logger and delay used by the tests.
 hook_text() {
   local tool=$1
   cat <<EOF
@@ -597,17 +615,38 @@ $HOOK_MARK
 # systemd runs this with "pre|post" and "suspend|hibernate|..." on every sleep.
 # After resume it runs recover in the background (so it never delays the resume)
 # with a 300 second limit, output to the journal. Remove the file to turn it off.
+tool="$tool"
+log() { \${QUECTEL_RESUME_LOGGER:-logger -t quectel-usbnet}; }
+safe() { [ -n "\$(find "\$1" -maxdepth 0 -type "\$2" -user $ROOT_UID ! -perm /022 2>/dev/null)" ]; }
 case "\$1" in
   post)
-    ( sleep "\${QUECTEL_RESUME_DELAY:-5}"; timeout 300 "$tool" recover 2>&1 | \${QUECTEL_RESUME_LOGGER:-logger -t quectel-usbnet} ) >/dev/null 2>&1 &
+    if ! { safe "\$tool" f && safe "\${tool%/*}" d; }; then
+      echo "refusing to run \$tool: it is not a root-owned regular file in a root-owned directory that only root can write" | log
+      exit 0
+    fi
+    ( sleep "\${QUECTEL_RESUME_DELAY:-5}"; timeout 300 "\$tool" recover 2>&1 | log ) >/dev/null 2>&1 &
     ;;
 esac
 exit 0
 EOF
 }
 
+# True when $1 (of type $2: f or d) is owned by root, not a symlink, and not
+# writable by group or others.
+root_safe() {
+  [ -n "$(find "$1" -maxdepth 0 -type "$2" -user "$ROOT_UID" ! -perm /022 2>/dev/null)" ]
+}
+
+hook_is_ours() {
+  [ -f "$1" ] && [ ! -L "$1" ] && grep -qF "$HOOK_MARK" "$1"
+}
+
+copy_has_header() {
+  [ -f "$1" ] && [ ! -L "$1" ] && grep -qF "$COPY_MARK" "$1"
+}
+
 cmd_install_resume_hook() {
-  local dry=false tool="" target
+  local dry=false src="" target copy
   while [ $# -gt 0 ]; do
     case $1 in
       --dry-run)
@@ -616,32 +655,75 @@ cmd_install_resume_hook() {
         ;;
       --tool)
         [ $# -ge 2 ] || usage
-        tool=$2
+        src=$2
         shift 2
         ;;
       *) usage ;;
     esac
   done
-  [ -n "$tool" ] || tool=$(readlink -f "${BASH_SOURCE[0]}")
+  [ -n "$src" ] || src=${BASH_SOURCE[0]}
+  src=$(readlink -f "$src")
   target="$SLEEP_HOOK_DIR/$HOOK_NAME"
+  copy="$LIBEXEC_DIR/$COPY_NAME"
   if $dry; then
-    say "dry run, nothing will be touched. install-resume-hook would write $target:"
-    hook_text "$tool"
+    say "dry run, nothing will be touched. install-resume-hook would copy the tool to"
+    say "$copy (root-owned, mode 0755) and write $target, which runs only that copy:"
+    hook_text "$copy"
     return 0
   fi
   if ! is_root; then
-    say "install-resume-hook needs root (it writes to $SLEEP_HOOK_DIR); re-running with sudo or pkexec"
-    reexec_root install-resume-hook --tool "$tool"
+    say "install-resume-hook needs root (it writes to $LIBEXEC_DIR and $SLEEP_HOOK_DIR); re-running with sudo or pkexec"
+    reexec_root install-resume-hook --tool "$src"
     return $?
   fi
-  if [ -e "$target" ] && ! grep -qF "$HOOK_MARK" "$target"; then
-    die "$target exists and was not written by quectel-usbnet; not overwriting it"
+  [ -f "$src" ] || die "$src is not a file; pass --tool PATH to the script to copy"
+  # Everything is checked before anything is written.
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    hook_is_ours "$target" || die "$target exists and was not written by quectel-usbnet; not overwriting it"
   fi
+  if { [ -e "$copy" ] || [ -L "$copy" ]; } && ! hook_is_ours "$target" && ! copy_has_header "$copy"; then
+    die "$copy exists and was not written by quectel-usbnet; not overwriting it"
+  fi
+  [ -d "$LIBEXEC_DIR" ] || install -d -m 0755 -o "$ROOT_UID" -g "$ROOT_GID" "$LIBEXEC_DIR"
   mkdir -p "$SLEEP_HOOK_DIR"
-  hook_text "$tool" >"$target"
-  chmod 0755 "$target"
-  say "installed $target (runs 'recover' in the background after resume)"
-  say "remove it to undo:  sudo rm $target"
+  root_safe "$LIBEXEC_DIR" d || die "$LIBEXEC_DIR is not safe: it must be a directory owned by root that group and others cannot write"
+  root_safe "$SLEEP_HOOK_DIR" d || die "$SLEEP_HOOK_DIR is not safe: it must be a directory owned by root that group and others cannot write"
+  install -m 0755 -o "$ROOT_UID" -g "$ROOT_GID" "$src" "$copy"
+  hook_text "$copy" >"$target.new"
+  chmod 0755 "$target.new"
+  mv -f "$target.new" "$target"
+  say "installed $copy (a root-owned copy of $src)"
+  say "installed $target (runs that copy's 'recover' in the background after resume)"
+  say "re-run install-resume-hook after updating the tool to refresh the copy"
+  say "remove both:  sudo quectel-usbnet uninstall-resume-hook"
+}
+
+cmd_uninstall_resume_hook() {
+  local target copy ours=false
+  [ $# -eq 0 ] || usage
+  target="$SLEEP_HOOK_DIR/$HOOK_NAME"
+  copy="$LIBEXEC_DIR/$COPY_NAME"
+  if ! is_root; then
+    say "uninstall-resume-hook needs root; re-running with sudo or pkexec"
+    reexec_root uninstall-resume-hook
+    return $?
+  fi
+  if hook_is_ours "$target"; then
+    ours=true
+    rm -f "$target"
+    say "removed $target"
+  elif [ -e "$target" ] || [ -L "$target" ]; then
+    say "left $target: not written by quectel-usbnet"
+  fi
+  if $ours || copy_has_header "$copy"; then
+    if [ -e "$copy" ] || [ -L "$copy" ]; then
+      rm -f "$copy"
+      say "removed $copy"
+    fi
+  elif [ -e "$copy" ] || [ -L "$copy" ]; then
+    say "left $copy: not written by quectel-usbnet"
+  fi
+  return 0
 }
 
 cmd_set() {
@@ -767,6 +849,10 @@ main() {
     install-resume-hook)
       shift
       cmd_install_resume_hook "$@"
+      ;;
+    uninstall-resume-hook)
+      shift
+      cmd_uninstall_resume_hook "$@"
       ;;
     --version) echo "quectel-usbnet $VERSION" ;;
     *) usage ;;
