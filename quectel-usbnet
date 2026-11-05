@@ -8,12 +8,17 @@
 #
 #   quectel-usbnet status
 #   quectel-usbnet set qmi|mbim|ecm|rndis [--port /dev/ttyUSBn] [--dry-run]
+#   quectel-usbnet recover [--dry-run] [--yes]
+#   quectel-usbnet install-resume-hook [--dry-run] [--tool PATH]
+#   quectel-usbnet uninstall-resume-hook
 #   quectel-usbnet sim-recover [--device /dev/cdc-wdmN]
 #
 # `status` only reads sysfs, ModemManager, the journal and the SIM state.
 # `set` stops ModemManager, talks AT to the modem, resets it, and starts
 # ModemManager again. `sim-recover` power cycles a USIM that is stuck in the
-# QMI application state "illegal".
+# QMI application state "illegal". `recover` brings a modem back after a
+# suspend/resume dropout without a reboot and without internet, one escalating
+# rung at a time.
 set -euo pipefail
 
 VERSION="0.1.0"
@@ -22,6 +27,24 @@ AT_TIMEOUT=3
 REENUM_GONE_TIMEOUT=20
 REENUM_BACK_TIMEOUT=90
 MM_WAIT_TIMEOUT=90
+RECOVER_PID="0620"
+
+# Seams for the tests: every external command and the sysfs root can be swapped.
+# RECOVER_SLEEP is the sleep used by recover's bounded waits; RECOVER_MM_WAIT and
+# RECOVER_NM_WAIT are their iteration caps.
+USB_SYSFS=${USB_SYSFS:-/sys/bus/usb/devices}
+MMCLI=${MMCLI:-mmcli}
+SYSTEMCTL=${SYSTEMCTL:-systemctl}
+SLEEP_HOOK_DIR=${SLEEP_HOOK_DIR:-/usr/lib/systemd/system-sleep}
+LIBEXEC_DIR=${LIBEXEC_DIR:-/usr/local/libexec}
+HOOK_NAME="quectel-usbnet-recover"
+COPY_NAME="quectel-usbnet"
+# The "root" that must own the installed copy. Constants, not environment: the
+# tests reassign them after sourcing this file to stand in for root.
+ROOT_UID=0
+ROOT_GID=0
+COPY_MARK="quectel-usbnet: read or change the USB network mode"
+HOOK_MARK="# written by quectel-usbnet install-resume-hook"
 SIM_OFF_WAIT=${QUECTEL_SIM_OFF_WAIT:-2}
 SIM_READY_TIMEOUT=${QUECTEL_SIM_READY_TIMEOUT:-15}
 SIM_POLL_INTERVAL=${QUECTEL_SIM_POLL_INTERVAL:-1}
@@ -34,6 +57,10 @@ usage() {
 usage:
   quectel-usbnet status
   quectel-usbnet set MODE [--port /dev/ttyUSBn] [--dry-run]
+  quectel-usbnet recover [--dry-run] [--yes]
+  quectel-usbnet install-resume-hook [--dry-run] [--tool PATH]
+  quectel-usbnet uninstall-resume-hook
+      ;;
   quectel-usbnet sim-recover [--device /dev/cdc-wdmN]
   quectel-usbnet --version
 
@@ -47,6 +74,21 @@ set      Changes state. Stops ModemManager, reads the current mode (printed so
          you can roll back), sets the new one, resets the modem, waits for it to
          come back, and starts ModemManager again. Needs root; it re-runs itself
          with sudo.
+recover  Restores the modem and networking after a suspend/resume dropout,
+         with no internet needed. Climbs a ladder and stops at the first rung
+         after which ModemManager lists a modem and NetworkManager shows the
+         cdc-wdm device as not unavailable: 1 nmcli radio wwan on, 2 mmcli
+         --enable, 3 restart ModemManager, 4 toggle USB authorized 0/1, 5
+         AT+CFUN=1,1 (asked first, or --yes). Rungs 3 and 4 need root; it
+         re-runs itself with sudo or pkexec. --dry-run prints the ladder only.
+install-resume-hook
+         Opt-in. Installs a systemd system-sleep hook that runs recover in the
+         background after resume. It copies this script to a root-owned
+         /usr/local/libexec/quectel-usbnet and the hook runs only that copy
+         (--tool PATH only picks the script to copy). Nothing else installs
+         it. Needs root.
+uninstall-resume-hook
+         Removes the hook and the copy, only if quectel-usbnet wrote them.
 EOF
   exit 2
 }
@@ -99,7 +141,7 @@ parse_usbnet() {
 # Prints the sysfs directory of every Quectel USB device, one per line.
 quectel_devices() {
   local f dir
-  for f in /sys/bus/usb/devices/*/idVendor; do
+  for f in "$USB_SYSFS"/*/idVendor; do
     [ -e "$f" ] || continue
     if [ "$(cat "$f")" = "$QUECTEL_VID" ]; then
       dir=$(dirname "$f")
@@ -228,19 +270,19 @@ find_at_port() {
 }
 
 mm_active() {
-  systemctl is-active --quiet ModemManager 2>/dev/null
+  "$SYSTEMCTL" is-active --quiet ModemManager 2>/dev/null
 }
 
 mm_modem_listed() {
   local listing
-  command -v mmcli >/dev/null 2>&1 || return 1
-  listing=$(mmcli -L 2>/dev/null || true)
+  command -v "$MMCLI" >/dev/null 2>&1 || return 1
+  listing=$("$MMCLI" -L 2>/dev/null || true)
   [[ $listing == */Modem/* ]]
 }
 
 restore_mm() {
   if $MM_TO_RESTORE; then
-    systemctl start ModemManager || true
+    "$SYSTEMCTL" start ModemManager || true
   fi
 }
 
@@ -321,9 +363,9 @@ cmd_status() {
   else
     say "ModemManager:  not running"
   fi
-  if command -v mmcli >/dev/null 2>&1; then
+  if command -v "$MMCLI" >/dev/null 2>&1; then
     if mm_modem_listed; then
-      say "mmcli -L:      $(mmcli -L 2>/dev/null | grep '/Modem/' | sed 's/^ *//')"
+      say "mmcli -L:      $("$MMCLI" -L 2>/dev/null | grep '/Modem/' | sed 's/^ *//')"
     else
       say "mmcli -L:      no modems found"
     fi
@@ -340,6 +382,405 @@ cmd_status() {
       say "ModemManager gave up on it. Try:  sudo quectel-usbnet set qmi"
     fi
   fi
+}
+
+# --- recover ----------------------------------------------------------------
+
+is_root() {
+  [ "$(id -u)" -eq 0 ]
+}
+
+# Re-runs this script as root through sudo, or pkexec when there is no sudo.
+# Replaces the process; returns 1 only when neither helper exists.
+reexec_root() {
+  local self
+  self=$(readlink -f "${BASH_SOURCE[0]}")
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo -- "$self" "$@"
+  elif command -v pkexec >/dev/null 2>&1; then
+    exec pkexec "$self" "$@"
+  fi
+  echo "error: need root and found neither sudo nor pkexec; run this as root" >&2
+  return 1
+}
+
+# The one place recover writes to sysfs, so the tests can see what would be written.
+sysfs_write() {
+  printf '%s\n' "$1" >"$2"
+}
+
+# Bounded sleep between polls. RECOVER_SLEEP is a seam for the tests.
+rc_pause() {
+  ${RECOVER_SLEEP:-sleep} "${1:-2}"
+}
+
+# The sysfs directories of the modem this tool recovers, found by VID:PID and
+# never by bus path (the bus number changes with the slot and the port).
+recover_devices() {
+  local d
+  while read -r d; do
+    if [ "$(cat "$d/idProduct" 2>/dev/null || true)" = "$RECOVER_PID" ]; then
+      echo "$d"
+    fi
+  done < <(quectel_devices)
+}
+
+# Prints "cdc-wdm0 state" for each cdc-wdm device NetworkManager knows.
+nm_wwan_states() {
+  local nmcli=${NMCLI:-nmcli} dev state
+  command -v "$nmcli" >/dev/null 2>&1 || return 0
+  while IFS=: read -r dev _ state; do
+    case $dev in cdc-wdm*) echo "$dev $state" ;; esac
+  done < <("$nmcli" -t -f DEVICE,TYPE,STATE device 2>/dev/null || true)
+}
+
+# True when NetworkManager shows a cdc-wdm device in any state but unavailable.
+nm_wwan_usable() {
+  local dev state
+  while read -r dev state; do
+    [ "$state" = unavailable ] || return 0
+  done < <(nm_wwan_states)
+  return 1
+}
+
+# Prints the index of each modem ModemManager lists, one per line.
+mm_modem_indexes() {
+  command -v "$MMCLI" >/dev/null 2>&1 || return 0
+  "$MMCLI" -L 2>/dev/null | sed -n 's|.*/Modem/\([0-9][0-9]*\).*|\1|p' || true
+}
+
+# The success test for every rung: a modem is listed AND NetworkManager has the
+# cdc-wdm device in a state other than unavailable.
+rc_healthy() {
+  mm_modem_listed && nm_wwan_usable
+}
+
+# Prints what is observed right now, then returns the health result.
+rc_observe() {
+  local listed states
+  if mm_modem_listed; then listed="mmcli -L lists a modem"; else listed="mmcli -L lists no modem"; fi
+  states=$(nm_wwan_states | tr '\n' ' ')
+  say "    observed: $listed; nmcli: ${states:-no cdc-wdm device}"
+  rc_healthy
+}
+
+# Polls rc_healthy up to $1 times, $2 seconds apart. The cap is the bound.
+rc_wait_healthy() {
+  local tries=$1 gap=$2 i
+  for ((i = 0; i < tries; i++)); do
+    rc_healthy && return 0
+    rc_pause "$gap"
+  done
+  rc_healthy
+}
+
+# Polls until a modem is listed, at most $1 times.
+rc_wait_modem() {
+  local tries=$1 i
+  for ((i = 0; i < tries; i++)); do
+    mm_modem_listed && return 0
+    rc_pause 2
+  done
+  mm_modem_listed
+}
+
+rc_done() {
+  say "recovered at rung $1: a modem is listed and the cdc-wdm device is not unavailable"
+}
+
+rc_rung1() {
+  say "rung 1: nmcli radio wwan on (a resume can leave the WWAN radio software-disabled)"
+  if ! "${NMCLI:-nmcli}" radio wwan on 2>/dev/null; then
+    say "    nmcli radio wwan on failed or nmcli is missing"
+  fi
+  rc_wait_healthy "${RECOVER_NM_WAIT:-5}" 2 >/dev/null || true
+  rc_observe
+}
+
+rc_rung2() {
+  local idx state any=false
+  say "rung 2: mmcli -m <n> --enable for a listed modem that is disabled"
+  while read -r idx; do
+    [ -n "$idx" ] || continue
+    any=true
+    state=$("$MMCLI" -m "$idx" -K 2>/dev/null | sed -n 's/^modem.generic.state *: *//p' || true)
+    if [ "$state" = disabled ]; then
+      say "    modem $idx is disabled; running mmcli -m $idx --enable"
+      "$MMCLI" -m "$idx" --enable 2>/dev/null || say "    mmcli -m $idx --enable failed"
+    else
+      say "    modem $idx is ${state:-in an unknown state}; leaving it"
+    fi
+  done < <(mm_modem_indexes)
+  $any || say "    no modem is listed, nothing to enable"
+  rc_wait_healthy "${RECOVER_NM_WAIT:-5}" 2 >/dev/null || true
+  rc_observe
+}
+
+rc_rung3() {
+  say "rung 3: restart ModemManager and wait up to $((${RECOVER_MM_WAIT:-30} * 2))s for the modem"
+  "$SYSTEMCTL" restart ModemManager || say "    systemctl restart ModemManager failed"
+  rc_wait_modem "${RECOVER_MM_WAIT:-30}" || true
+  rc_wait_healthy "${RECOVER_NM_WAIT:-5}" 2 >/dev/null || true
+  rc_observe
+}
+
+rc_rung4() {
+  local d any=false
+  say "rung 4: toggle USB authorized 0 then 1 on the $QUECTEL_VID:$RECOVER_PID device"
+  while read -r d; do
+    [ -n "$d" ] || continue
+    any=true
+    say "    $(basename "$d"): authorized 0, then 1"
+    sysfs_write 0 "$d/authorized" || say "    could not write $d/authorized"
+    rc_pause 2
+    sysfs_write 1 "$d/authorized" || say "    could not write $d/authorized"
+  done < <(recover_devices)
+  if $any; then
+    rc_wait_modem "${RECOVER_MM_WAIT:-30}" || true
+    rc_wait_healthy "${RECOVER_NM_WAIT:-5}" 2 >/dev/null || true
+  else
+    say "    no $QUECTEL_VID:$RECOVER_PID device on the bus; check the card and rfkill"
+  fi
+  rc_observe
+}
+
+# Rung 5 resets the modem, which drops every connection on it, so it is offered
+# and not assumed: it runs on --yes, or when a person answers y on a terminal.
+rc_rung5() {
+  local yes=$1 dev port answer=""
+  say "rung 5: AT+CFUN=1,1 on the AT port (modem reset, last resort)"
+  if ! $yes; then
+    if [ -t 0 ] && [ -t 1 ]; then
+      read -r -p "    reset the modem with AT+CFUN=1,1 now? [y/N] " answer || true
+    fi
+    if [[ ! $answer =~ ^[Yy] ]]; then
+      say "    not sent. To allow it run: quectel-usbnet recover --from 5 --yes (AT+CFUN=1,1)"
+      return 1
+    fi
+  fi
+  dev=$(recover_devices | head -n 1)
+  [ -n "$dev" ] || {
+    say "    no $QUECTEL_VID:$RECOVER_PID device on the bus"
+    return 1
+  }
+  "$SYSTEMCTL" stop ModemManager || true
+  if ! port=$(find_at_port "$dev"); then
+    say "    no tty of $(basename "$dev") answered ATI"
+    "$SYSTEMCTL" start ModemManager || true
+    return 1
+  fi
+  say "    AT port $port: sending AT+CFUN=1,1"
+  at_cmd "$port" 'AT+CFUN=1,1' >/dev/null || true
+  rc_pause 5
+  "$SYSTEMCTL" start ModemManager || true
+  rc_wait_modem "${RECOVER_MM_WAIT:-30}" || true
+  rc_wait_healthy "${RECOVER_NM_WAIT:-5}" 2 >/dev/null || true
+  rc_observe
+}
+
+recover_dry_run() {
+  say "dry run, nothing will be touched. recover would stop at the first rung that"
+  say "makes 'mmcli -L' list a modem and 'nmcli device' show cdc-wdm as not unavailable:"
+  say "  1. nmcli radio wwan on"
+  say "  2. mmcli -m <n> --enable for a listed modem that is disabled"
+  say "  3. restart ModemManager, then wait (bounded) for the modem   [root]"
+  say "  4. toggle authorized 0 then 1 on the $QUECTEL_VID:$RECOVER_PID USB device, found via sysfs   [root]"
+  say "  5. AT+CFUN=1,1 on the AT port, only if you answer y or pass --yes   [root]"
+}
+
+cmd_recover() {
+  local dry=false yes=false from=1 args=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dry-run)
+        dry=true
+        shift
+        ;;
+      --yes)
+        yes=true
+        shift
+        ;;
+      --from)
+        [ $# -ge 2 ] || usage
+        case $2 in [1-5]) from=$2 ;; *) usage ;; esac
+        shift 2
+        ;;
+      *) usage ;;
+    esac
+  done
+  if $dry; then
+    recover_dry_run
+    return 0
+  fi
+
+  if [ "$from" -le 1 ] && rc_healthy; then
+    say "already healthy: a modem is listed and the cdc-wdm device is not unavailable"
+    return 0
+  fi
+
+  if [ "$from" -le 1 ]; then
+    rc_rung1 && {
+      rc_done 1
+      return 0
+    }
+  fi
+  if [ "$from" -le 2 ]; then
+    rc_rung2 && {
+      rc_done 2
+      return 0
+    }
+  fi
+  if [ "$from" -le 4 ] && ! is_root; then
+    say "rungs 3 and 4 need root (restart ModemManager, write to sysfs); re-running with sudo or pkexec"
+    args=(recover --from 3)
+    $yes && args+=(--yes)
+    reexec_root "${args[@]}"
+    return $?
+  fi
+  if [ "$from" -le 3 ]; then
+    rc_rung3 && {
+      rc_done 3
+      return 0
+    }
+  fi
+  if [ "$from" -le 4 ]; then
+    rc_rung4 && {
+      rc_done 4
+      return 0
+    }
+  fi
+  if rc_rung5 "$yes"; then
+    rc_done 5
+    return 0
+  fi
+  say "not recovered. Run 'quectel-usbnet status' and see the journal (journalctl -b -u ModemManager)."
+  say "If lsusb no longer lists $QUECTEL_VID:$RECOVER_PID, only a power cycle (full shutdown) is left."
+  return 1
+}
+
+# --- the opt-in resume hook ---------------------------------------------------
+
+# The hook runs as root after every resume, so it must run only a root-owned
+# copy of this tool and refuse to run it if anything could have edited it.
+# The owner is baked in at install time; the hook reads nothing from its environment
+# except the optional logger and delay used by the tests.
+hook_text() {
+  local tool=$1
+  cat <<EOF
+#!/bin/sh
+$HOOK_MARK
+# systemd runs this with "pre|post" and "suspend|hibernate|..." on every sleep.
+# After resume it runs recover in the background (so it never delays the resume)
+# with a 300 second limit, output to the journal. Remove the file to turn it off.
+tool="$tool"
+log() { \${QUECTEL_RESUME_LOGGER:-logger -t quectel-usbnet}; }
+safe() { [ -n "\$(find "\$1" -maxdepth 0 -type "\$2" -user $ROOT_UID ! -perm /022 2>/dev/null)" ]; }
+case "\$1" in
+  post)
+    if ! { safe "\$tool" f && safe "\${tool%/*}" d; }; then
+      echo "refusing to run \$tool: it is not a root-owned regular file in a root-owned directory that only root can write" | log
+      exit 0
+    fi
+    ( sleep "\${QUECTEL_RESUME_DELAY:-5}"; timeout 300 "\$tool" recover 2>&1 | log ) >/dev/null 2>&1 &
+    ;;
+esac
+exit 0
+EOF
+}
+
+# True when $1 (of type $2: f or d) is owned by root, not a symlink, and not
+# writable by group or others.
+root_safe() {
+  [ -n "$(find "$1" -maxdepth 0 -type "$2" -user "$ROOT_UID" ! -perm /022 2>/dev/null)" ]
+}
+
+hook_is_ours() {
+  [ -f "$1" ] && [ ! -L "$1" ] && grep -qF "$HOOK_MARK" "$1"
+}
+
+copy_has_header() {
+  [ -f "$1" ] && [ ! -L "$1" ] && grep -qF "$COPY_MARK" "$1"
+}
+
+cmd_install_resume_hook() {
+  local dry=false src="" target copy
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dry-run)
+        dry=true
+        shift
+        ;;
+      --tool)
+        [ $# -ge 2 ] || usage
+        src=$2
+        shift 2
+        ;;
+      *) usage ;;
+    esac
+  done
+  [ -n "$src" ] || src=${BASH_SOURCE[0]}
+  src=$(readlink -f "$src")
+  target="$SLEEP_HOOK_DIR/$HOOK_NAME"
+  copy="$LIBEXEC_DIR/$COPY_NAME"
+  if $dry; then
+    say "dry run, nothing will be touched. install-resume-hook would copy the tool to"
+    say "$copy (root-owned, mode 0755) and write $target, which runs only that copy:"
+    hook_text "$copy"
+    return 0
+  fi
+  if ! is_root; then
+    say "install-resume-hook needs root (it writes to $LIBEXEC_DIR and $SLEEP_HOOK_DIR); re-running with sudo or pkexec"
+    reexec_root install-resume-hook --tool "$src"
+    return $?
+  fi
+  [ -f "$src" ] || die "$src is not a file; pass --tool PATH to the script to copy"
+  # Everything is checked before anything is written.
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    hook_is_ours "$target" || die "$target exists and was not written by quectel-usbnet; not overwriting it"
+  fi
+  if { [ -e "$copy" ] || [ -L "$copy" ]; } && ! hook_is_ours "$target" && ! copy_has_header "$copy"; then
+    die "$copy exists and was not written by quectel-usbnet; not overwriting it"
+  fi
+  [ -d "$LIBEXEC_DIR" ] || install -d -m 0755 -o "$ROOT_UID" -g "$ROOT_GID" "$LIBEXEC_DIR"
+  mkdir -p "$SLEEP_HOOK_DIR"
+  root_safe "$LIBEXEC_DIR" d || die "$LIBEXEC_DIR is not safe: it must be a directory owned by root that group and others cannot write"
+  root_safe "$SLEEP_HOOK_DIR" d || die "$SLEEP_HOOK_DIR is not safe: it must be a directory owned by root that group and others cannot write"
+  install -m 0755 -o "$ROOT_UID" -g "$ROOT_GID" "$src" "$copy"
+  hook_text "$copy" >"$target.new"
+  chmod 0755 "$target.new"
+  mv -f "$target.new" "$target"
+  say "installed $copy (a root-owned copy of $src)"
+  say "installed $target (runs that copy's 'recover' in the background after resume)"
+  say "re-run install-resume-hook after updating the tool to refresh the copy"
+  say "remove both:  sudo quectel-usbnet uninstall-resume-hook"
+}
+
+cmd_uninstall_resume_hook() {
+  local target copy ours=false
+  [ $# -eq 0 ] || usage
+  target="$SLEEP_HOOK_DIR/$HOOK_NAME"
+  copy="$LIBEXEC_DIR/$COPY_NAME"
+  if ! is_root; then
+    say "uninstall-resume-hook needs root; re-running with sudo or pkexec"
+    reexec_root uninstall-resume-hook
+    return $?
+  fi
+  if hook_is_ours "$target"; then
+    ours=true
+    rm -f "$target"
+    say "removed $target"
+  elif [ -e "$target" ] || [ -L "$target" ]; then
+    say "left $target: not written by quectel-usbnet"
+  fi
+  if $ours || copy_has_header "$copy"; then
+    if [ -e "$copy" ] || [ -L "$copy" ]; then
+      rm -f "$copy"
+      say "removed $copy"
+    fi
+  elif [ -e "$copy" ] || [ -L "$copy" ]; then
+    say "left $copy: not written by quectel-usbnet"
+  fi
+  return 0
 }
 
 cmd_set() {
@@ -396,7 +837,7 @@ cmd_set() {
     MM_TO_RESTORE=true
     trap restore_mm EXIT
     say "stopping ModemManager"
-    systemctl stop ModemManager
+    "$SYSTEMCTL" stop ModemManager
   fi
 
   if [ -z "$port" ]; then
@@ -439,11 +880,11 @@ cmd_set() {
 
   if $MM_TO_RESTORE; then
     say "starting ModemManager"
-    systemctl start ModemManager
+    "$SYSTEMCTL" start ModemManager
     MM_TO_RESTORE=false
     if wait_for_modem "$MM_WAIT_TIMEOUT"; then
       say "ModemManager lists the modem:"
-      mmcli -L | sed 's/^ */  /'
+      "$MMCLI" -L | sed 's/^ */  /'
     else
       die "ModemManager did not list a modem within ${MM_WAIT_TIMEOUT}s; check 'quectel-usbnet status'"
     fi
@@ -505,7 +946,7 @@ cmd_sim_recover() {
     MM_TO_RESTORE=true
     trap restore_mm EXIT
     echo "stopping ModemManager" >&2
-    systemctl stop ModemManager >&2 || sim_fail "could not stop ModemManager"
+    "$SYSTEMCTL" stop ModemManager >&2 || sim_fail "could not stop ModemManager"
   fi
 
   qmicli -d "$wdm" --uim-sim-power-off=1 >&2 || sim_fail "--uim-sim-power-off=1 failed on $wdm"
@@ -523,7 +964,7 @@ cmd_sim_recover() {
 
   if $MM_TO_RESTORE; then
     echo "starting ModemManager" >&2
-    systemctl start ModemManager >&2 || sim_fail "recovered the SIM but could not start ModemManager"
+    "$SYSTEMCTL" start ModemManager >&2 || sim_fail "recovered the SIM but could not start ModemManager"
     MM_TO_RESTORE=false
   fi
   sim_result recovered
@@ -536,6 +977,18 @@ main() {
     set)
       shift
       cmd_set "$@"
+      ;;
+    recover)
+      shift
+      cmd_recover "$@"
+      ;;
+    install-resume-hook)
+      shift
+      cmd_install_resume_hook "$@"
+      ;;
+    uninstall-resume-hook)
+      shift
+      cmd_uninstall_resume_hook "$@"
       ;;
     sim-recover)
       shift

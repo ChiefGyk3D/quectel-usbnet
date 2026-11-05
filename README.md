@@ -70,6 +70,51 @@ sim-recover: failed      never became ready, or an error (exit 1)
 
 `--device /dev/cdc-wdmN` picks the node when there is more than one. The state reads (`status`, and the checks in `sim-recover`) use `qmicli -p`, which goes through `qmi-proxy`, so they are safe while ModemManager has the modem open. I have not run that on hardware. The power-off and power-on calls run with ModemManager stopped and do not use the proxy.
 
+## After suspend/resume: `recover`
+
+On the same laptop, after a resume the tray showed no modem while `lsusb` still listed `2c7c:0620`. A reboot fixed it. `recover` is the no-reboot version, and it needs no internet:
+
+```
+quectel-usbnet recover --dry-run     # print the ladder, touch nothing
+quectel-usbnet recover
+```
+
+It climbs a ladder and stops at the first rung after which `mmcli -L` lists a modem and `nmcli device` shows the `cdc-wdm` device as anything but `unavailable`. Each rung prints what it did and what it then observed.
+
+1. `nmcli radio wwan on`. A resume can leave the WWAN radio software-disabled.
+2. `mmcli -m <n> --enable`, for a listed modem whose state is `disabled`.
+3. Restart ModemManager, then wait for the modem. The wait has an iteration cap, so it cannot hang.
+4. Toggle `authorized` to 0 then 1 on the USB device with ID `2c7c:0620`. It is found through sysfs by vendor and product ID, never by bus path.
+5. `AT+CFUN=1,1` on the AT port. This resets the modem and drops its connections, so it only runs if you answer `y` at the prompt or pass `--yes`. Without a terminal and without `--yes` it is printed, not sent.
+
+Rungs 1 and 2 run as you. Rungs 3 to 5 need root, so `recover` re-runs itself with `sudo` (or `pkexec` if there is no `sudo`) and picks up at rung 3. If nothing works, it says so and exits 1. If `lsusb` no longer lists the card, only a full power cycle is left.
+
+### Run it automatically after resume (opt-in)
+
+Nothing installs this unless you ask:
+
+```
+quectel-usbnet install-resume-hook --dry-run   # show the hook and the paths
+sudo quectel-usbnet install-resume-hook
+```
+
+The hook runs as root after every resume, so it must never run a file you can edit. The install copies the script to `/usr/local/libexec/quectel-usbnet` (`install -m 0755 -o root -g root`) and writes `/usr/lib/systemd/system-sleep/quectel-usbnet-recover`, which runs only that copy. `--tool PATH` only chooses which script is copied. The install refuses to continue if either directory is not owned by root or is writable by group or others, and it will not overwrite a hook or a copy it did not write. Run it again after you update the script to refresh the copy.
+
+After resume the hook waits 5 seconds and runs `recover` in the background under `timeout 300`, with the output going to the journal (`journalctl -t quectel-usbnet`). It never delays the resume, and because it has no terminal it never sends the rung 5 reset. Before each run it checks that the copy is a regular file (not a symlink), owned by root, and not writable by group or others, in a directory that meets the same test. If not, it logs a refusal and does nothing.
+
+To remove both files, only if quectel-usbnet wrote them:
+
+```
+sudo quectel-usbnet uninstall-resume-hook
+```
+
+The cause is not proven. See [docs/evidence.md](docs/evidence.md) for what was observed and what is inferred.
+
+### recover and sim-recover are separate
+
+They overlap in one respect: both can follow a suspend/resume, and both stop and start ModemManager. They fix different things and neither calls the other. `recover` is for a modem that is missing or unusable (no modem in `mmcli -L`, or the `cdc-wdm` device `unavailable` in NetworkManager). `sim-recover` is for a modem that is listed but failed with `sim-missing` because the USIM application is stuck in the QMI state `illegal`. If `recover` brings the modem back and `status` then shows an `illegal` SIM, run `sim-recover` next.
+
+
 ## What was going wrong
 
 I turned ModemManager's logging up to debug (`mmcli -G DEBUG`) and read what it sent. It gets through MBIM setup normally for twenty transactions (device caps, SIM slots, UICC access), then sends a request on the `qdu` service, and the modem never answers it. Every retry gets silence, ten timeouts at about twenty seconds each, and ModemManager marks the modem invalid and does not try again.
@@ -88,7 +133,7 @@ One more thing I got wrong along the way, so you do not: do not point `mbimcli` 
 
 I have not tried it on any other Quectel module. As far as I know the `usbnet` setting is documented for other Quectel families too, so the script is not specific to this card, but I have not checked that the mode numbers mean the same thing everywhere, and that is an assumption. Only `qmi` and `mbim` have run on hardware. `ecm` and `rndis` are in the table because the numbers are documented, and they are untested.
 
-The tests (`tests/run.sh`) run the AT conversation against a fake modem on a pty, so they cover the parsing and the command line but not the sysfs, ModemManager or reset path. `sim-recover` is tested against a fake `qmicli` and `systemctl` (ready, wedged then fixed, never ready, power-off error), not against a real SIM. That part has only run on the one card.
+The tests (`tests/run.sh`) run the AT conversation against a fake modem on a pty, so they cover the parsing and the command line. The `recover` ladder and the resume hook are tested against stub `nmcli`, `mmcli` and `systemctl` and a fake sysfs tree, and `sim-recover` against a fake `qmicli` and `systemctl` (ready, wedged then fixed, never ready, power-off error), so no test touches a real modem, SIM or service. The `set` reset path and the real `recover` rungs have not been run on hardware beyond the one card.
 
 ## Firmware
 

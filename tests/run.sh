@@ -110,6 +110,386 @@ ln -s "$tmp/real/4-4" "$tmp/devices/4-4"
 expect_eq "device_ttys follows the symlinked device directory" \
   "$(device_ttys "$tmp/devices/4-4" | xargs -n1 basename | tr '\n' ' ')" "ttyUSB2 ttyUSB3 "
 
+# --- recover: the escalating ladder, against stub nmcli/mmcli/systemctl -------
+# Every external command goes through a seam (NMCLI, MMCLI, SYSTEMCTL, USB_SYSFS,
+# RECOVER_SLEEP, SLEEP_HOOK_DIR) or an overridable function (is_root, reexec_root,
+# sysfs_write, at_cmd, find_at_port), so nothing here touches real hardware,
+# services or sysfs. The stub keeps its state in files under $STATE.
+STATE="$tmp/state"
+STUB_LOG="$tmp/stub.log"
+export STATE STUB_LOG
+stubdir="$tmp/stubs"
+mkdir -p "$stubdir"
+cat >"$stubdir/stub" <<'STUB'
+#!/usr/bin/env bash
+# One stub for nmcli, mmcli and systemctl. $STATE/fixed_by names the rung that
+# makes the system healthy; $STATE/listed says a (broken) modem is already listed.
+name=$(basename "$0")
+echo "$name $*" >>"$STUB_LOG"
+fixed_by=$(cat "$STATE/fixed_by" 2>/dev/null || true)
+fix() { [ "$fixed_by" = "$1" ] && touch "$STATE/healthy"; return 0; }
+case "$name $*" in
+  "nmcli radio wwan on")
+    fix radio
+    ;;
+  "nmcli -t -f DEVICE,TYPE,STATE device")
+    echo "wlan0:wifi:connected"
+    if [ -e "$STATE/healthy" ]; then echo "cdc-wdm0:gsm:connected"; else echo "cdc-wdm0:gsm:unavailable"; fi
+    ;;
+  "mmcli -L")
+    if [ -e "$STATE/healthy" ] || [ -e "$STATE/listed" ]; then
+      echo "    /org/freedesktop/ModemManager1/Modem/22 [Quectel] EM160R-GL"
+    else
+      echo "No modems were found" >&2
+    fi
+    ;;
+  "mmcli -m 22 -K")
+    if [ -e "$STATE/enabled" ] || [ -e "$STATE/healthy" ]; then
+      echo "modem.generic.state                      : enabled"
+    else
+      echo "modem.generic.state                      : disabled"
+    fi
+    ;;
+  "mmcli -m 22 --enable")
+    touch "$STATE/enabled"
+    fix enable
+    ;;
+  "systemctl restart ModemManager")
+    fix restart
+    ;;
+  "systemctl start ModemManager")
+    [ -e "$STATE/cfun_done" ] && fix cfun
+    ;;
+  "systemctl is-active --quiet ModemManager") ;;
+  "systemctl stop ModemManager") ;;
+  *) exit 1 ;;
+esac
+exit 0
+STUB
+chmod +x "$stubdir/stub"
+for n in nmcli mmcli systemctl; do ln -sf stub "$stubdir/$n"; done
+export NMCLI="$stubdir/nmcli" MMCLI="$stubdir/mmcli" SYSTEMCTL="$stubdir/systemctl"
+export RECOVER_SLEEP=true RECOVER_MM_WAIT=3 RECOVER_NM_WAIT=2
+
+# A fake sysfs: the modem under a bus path the code must not hardcode, another
+# Quectel product that must be left alone, and an unrelated vendor.
+export USB_SYSFS="$tmp/usb"
+mkdir -p "$USB_SYSFS/7-2" "$USB_SYSFS/3-1" "$USB_SYSFS/1-1" "$USB_SYSFS/7-2:1.4"
+echo 2c7c >"$USB_SYSFS/7-2/idVendor"
+echo 0620 >"$USB_SYSFS/7-2/idProduct"
+echo 1 >"$USB_SYSFS/7-2/authorized"
+echo 2c7c >"$USB_SYSFS/3-1/idVendor"
+echo 0125 >"$USB_SYSFS/3-1/idProduct"
+echo 8087 >"$USB_SYSFS/1-1/idVendor"
+echo 0a2b >"$USB_SYSFS/1-1/idProduct"
+
+is_root() { [ "${TEST_ROOT:-yes}" = yes ]; }
+reexec_root() { echo "REEXEC $*"; }
+sysfs_write() {
+  echo "sysfs_write $1 $2" >>"$STUB_LOG"
+  [ "$1" = 1 ] && [ "$(cat "$STATE/fixed_by" 2>/dev/null)" = authorized ] && touch "$STATE/healthy"
+  return 0
+}
+at_cmd() {
+  echo "at_cmd $2" >>"$STUB_LOG"
+  [ "$2" = "AT+CFUN=1,1" ] && touch "$STATE/cfun_done"
+  echo OK
+}
+find_at_port() { echo /dev/ttyFAKE; }
+
+# scenario FIXED_BY [listed]: reset the stub, name the rung that heals it.
+scenario() {
+  rm -rf "$STATE"
+  mkdir -p "$STATE"
+  : >"$STUB_LOG"
+  echo "$1" >"$STATE/fixed_by"
+  [ "${2:-}" = listed ] && touch "$STATE/listed"
+  return 0
+}
+run_recover() {
+  set +e
+  out=$(cmd_recover "$@" 2>&1)
+  code=$?
+  set -e
+}
+calls() { cat "$STUB_LOG"; }
+expect_called() { expect_contains "$1" "$(calls)" "$2"; }
+expect_not_called() {
+  if [[ $(calls) == *"$2"* ]]; then fail "$1" "'$2' was called: $(calls)"; else ok "$1"; fi
+}
+
+scenario none listed
+touch "$STATE/healthy"
+run_recover
+expect_eq "already healthy: exits 0" "$code" 0
+expect_not_called "already healthy: radio untouched" "radio wwan on"
+expect_not_called "already healthy: ModemManager not restarted" "restart"
+
+scenario radio listed
+run_recover
+expect_eq "rung 1 (wwan radio on) heals: exit 0" "$code" 0
+expect_called "rung 1 turns the wwan radio on" "nmcli radio wwan on"
+expect_not_called "rung 1 stops the ladder before enable" "--enable"
+expect_not_called "rung 1 stops the ladder before the restart" "restart"
+expect_contains "rung 1 prints what it did" "$out" "nmcli radio wwan on"
+expect_contains "rung 1 prints the observed result" "$out" "recovered"
+
+scenario enable listed
+run_recover
+expect_eq "rung 2 (mmcli --enable) heals: exit 0" "$code" 0
+expect_called "rung 2 enables the disabled modem by its index" "mmcli -m 22 --enable"
+expect_not_called "rung 2 stops the ladder before the restart" "restart"
+
+scenario enable listed
+touch "$STATE/enabled"
+run_recover
+expect_not_called "rung 2 does not enable a modem that is already enabled" "--enable"
+
+scenario restart
+run_recover
+expect_eq "rung 3 (restart ModemManager) heals: exit 0" "$code" 0
+expect_called "rung 3 restarts ModemManager" "systemctl restart ModemManager"
+expect_not_called "rung 3 stops the ladder before sysfs" "sysfs_write"
+expect_contains "rung 3 reports the modem appeared" "$out" "recovered"
+
+scenario authorized
+run_recover
+expect_eq "rung 4 (authorized 0/1) heals: exit 0" "$code" 0
+expect_eq "rung 4 toggles authorized 0 then 1 on the 2c7c:0620 device only" \
+  "$(grep '^sysfs_write' "$STUB_LOG" | tr '\n' ';')" \
+  "sysfs_write 0 $USB_SYSFS/7-2/authorized;sysfs_write 1 $USB_SYSFS/7-2/authorized;"
+expect_not_called "rung 4 stops the ladder before the AT reset" "at_cmd"
+
+scenario none
+run_recover
+expect_eq "nothing heals: exit 1" "$code" 1
+expect_contains "nothing heals: the AT reset is only offered, not sent" "$out" "AT+CFUN=1,1"
+expect_not_called "no --yes and no terminal: the modem is not reset" "at_cmd AT+CFUN"
+expect_contains "nothing heals: says what to do next" "$out" "not recovered"
+
+scenario cfun
+run_recover --yes
+expect_eq "rung 5 (AT+CFUN=1,1 with --yes) heals: exit 0" "$code" 0
+expect_called "rung 5 resets the modem on the AT port" "at_cmd AT+CFUN=1,1"
+expect_called "rung 5 stops ModemManager first" "systemctl stop ModemManager"
+expect_called "rung 5 starts ModemManager again" "systemctl start ModemManager"
+
+scenario none listed
+TEST_ROOT=no run_recover
+expect_contains "not root at rung 3: re-executes through a privilege helper" "$out" "REEXEC"
+expect_contains "the re-exec resumes at rung 3, not rung 1" "$out" "--from 3"
+expect_called "rungs 1 and 2 ran unprivileged first" "nmcli radio wwan on"
+expect_not_called "nothing privileged ran before the re-exec" "restart"
+expect_contains "the root message is clear" "$out" "need root"
+
+scenario restart
+run_recover --from 3
+expect_not_called "--from 3 skips the radio rung" "radio wwan on"
+expect_called "--from 3 still restarts ModemManager" "restart ModemManager"
+
+scenario none
+run_recover --dry-run
+expect_eq "dry run exits 0" "$code" 0
+expect_eq "dry run runs no external command" "$(calls)" ""
+for want in "nmcli radio wwan on" "mmcli" "restart ModemManager" "authorized" "AT+CFUN=1,1" "nothing will be touched"; do
+  expect_contains "dry run lists: $want" "$out" "$want"
+done
+
+# A device that never reappears must not hang the loop: the cap is the guard.
+scenario none
+RECOVER_MM_WAIT=2 run_recover
+expect_eq "bounded waits: a modem that never comes back ends in exit 1" "$code" 1
+
+# --- install-resume-hook: opt-in only, and never a user-writable path ---------
+# The hook runs as root after every resume. It must point at a root-owned copy
+# of the tool, never at the source tree or anything under $HOME. The tests stand
+# in for "root" with the current user by reassigning ROOT_UID/ROOT_GID, and for
+# /usr with directories under $tmp.
+export SLEEP_HOOK_DIR="$tmp/sleep" LIBEXEC_DIR="$tmp/libexec"
+ROOT_UID=$(id -u)
+ROOT_GID=$(id -g)
+mkdir -p "$SLEEP_HOOK_DIR" "$LIBEXEC_DIR"
+chmod 755 "$SLEEP_HOOK_DIR" "$LIBEXEC_DIR"
+installed_files() { find "$SLEEP_HOOK_DIR" "$LIBEXEC_DIR" -mindepth 1; }
+set +e
+out=$(cmd_install_resume_hook --dry-run --tool "$HOME/src/quectel-usbnet/quectel-usbnet" 2>&1)
+code=$?
+set -e
+expect_eq "install dry run exits 0" "$code" 0
+expect_contains "install dry run shows the hook" "$out" "timeout"
+expect_contains "install dry run names the root-owned copy" "$out" "$LIBEXEC_DIR/quectel-usbnet"
+if [[ $out == *"$HOME"* ]]; then fail "the dry-run hook never mentions \$HOME"; else ok "the dry-run hook never mentions \$HOME"; fi
+expect_eq "install dry run writes nothing" "$(installed_files)" ""
+expect_eq "no other command installs a hook or a copy" \
+  "$(
+    cmd_status >/dev/null 2>&1 || true
+    cmd_recover --dry-run >/dev/null 2>&1
+    installed_files
+  )" ""
+
+hooktool="$tmp/hooktool"
+cat >"$hooktool" <<'HT'
+#!/usr/bin/env bash
+echo "hook ran: $*" >>"$HOOK_LOG"
+HT
+chmod +x "$hooktool"
+export HOOK_LOG="$tmp/hook.log" QUECTEL_RESUME_DELAY=0 QUECTEL_RESUME_LOGGER=cat
+: >"$HOOK_LOG"
+cmd_install_resume_hook --tool "$hooktool" >/dev/null
+hook="$SLEEP_HOOK_DIR/quectel-usbnet-recover"
+copy="$LIBEXEC_DIR/quectel-usbnet"
+if [ -x "$hook" ]; then ok "install writes an executable hook"; else fail "install writes an executable hook"; fi
+if [ -x "$copy" ]; then ok "install writes an executable copy of the tool"; else fail "install writes an executable copy of the tool"; fi
+expect_eq "the copy is mode 0755" "$(stat -c %a "$copy")" 755
+expect_eq "the copy is the given source" "$(cat "$copy")" "$(cat "$hooktool")"
+hook_text=$(cat "$hook")
+expect_contains "the hook runs only the root-owned copy" "$hook_text" "tool=\"$copy\""
+for bad in "$hooktool" "$HOME" "$HERE" "$TOOL"; do
+  if [[ $hook_text == *"$bad"* ]]; then
+    fail "the hook never names a source or user path" "found '$bad'"
+  else
+    ok "the hook never names a source or user path"
+  fi
+done
+expect_contains "the hook is time limited" "$hook_text" "timeout"
+expect_contains "the hook runs in the background" "$hook_text" "&"
+
+"$hook" pre suspend
+sleep 0.5
+expect_eq "the hook does nothing before suspend" "$(cat "$HOOK_LOG")" ""
+"$hook" post suspend
+for _ in $(seq 1 50); do
+  [ -s "$HOOK_LOG" ] && break
+  sleep 0.1
+done
+expect_contains "the hook runs recover after resume" "$(cat "$HOOK_LOG")" "hook ran: recover"
+
+# The hook refuses a copy that something else could have edited.
+: >"$HOOK_LOG"
+chmod 775 "$copy"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses a group-writable copy" "$(cat "$HOOK_LOG")" ""
+chmod 757 "$copy"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses an other-writable copy" "$(cat "$HOOK_LOG")" ""
+chmod 755 "$copy"
+chmod 777 "$LIBEXEC_DIR"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses a copy in a writable directory" "$(cat "$HOOK_LOG")" ""
+chmod 755 "$LIBEXEC_DIR"
+mv "$copy" "$copy.real"
+ln -s "$copy.real" "$copy"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses a symlinked copy" "$(cat "$HOOK_LOG")" ""
+rm -f "$copy"
+mv "$copy.real" "$copy"
+# the stand-in owner is the current user; a different owner is refused too
+sed -i "s/-user $ROOT_UID /-user 99999 /" "$hook"
+"$hook" post suspend
+sleep 0.5
+expect_eq "the hook refuses a copy with the wrong owner" "$(cat "$HOOK_LOG")" ""
+
+# Re-running the install updates the copy.
+cat >"$hooktool" <<'HT'
+#!/usr/bin/env bash
+echo "hook ran v2: $*" >>"$HOOK_LOG"
+HT
+cmd_install_resume_hook --tool "$hooktool" >/dev/null
+expect_contains "re-running install updates the copy" "$(cat "$copy")" "v2"
+"$hook" post suspend
+for _ in $(seq 1 50); do
+  [ -s "$HOOK_LOG" ] && break
+  sleep 0.1
+done
+expect_contains "the reinstalled hook works again" "$(cat "$HOOK_LOG")" "hook ran v2: recover"
+
+# Refusals: a destination directory others can write, or a foreign file.
+chmod 775 "$LIBEXEC_DIR"
+set +e
+out=$(cmd_install_resume_hook --tool "$hooktool" 2>&1)
+code=$?
+set -e
+expect_eq "install refuses a group-writable destination directory" "$code" 1
+expect_contains "the refusal names the directory" "$out" "not safe"
+chmod 757 "$LIBEXEC_DIR"
+set +e
+(cmd_install_resume_hook --tool "$hooktool") >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "install refuses an other-writable destination directory" "$code" 1
+chmod 755 "$LIBEXEC_DIR"
+set +e
+(
+  ROOT_UID=99999
+  cmd_install_resume_hook --tool "$hooktool"
+) >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "install refuses a destination directory that is not root-owned" "$code" 1
+
+rm -f "$hook" "$copy"
+echo "# someone else's script" >"$hook"
+set +e
+out=$(cmd_install_resume_hook --tool "$hooktool" 2>&1)
+code=$?
+set -e
+expect_eq "install refuses to overwrite a hook it did not write" "$code" 1
+expect_contains "the refusal says why" "$out" "not written by"
+expect_eq "a refused install leaves no copy behind" "$(ls "$LIBEXEC_DIR")" ""
+rm -f "$hook"
+echo "# someone else's tool" >"$copy"
+set +e
+(cmd_install_resume_hook --tool "$hooktool") >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "install refuses to overwrite a copy it did not write" "$code" 1
+rm -f "$copy"
+
+out=$(TEST_ROOT=no cmd_install_resume_hook --tool "$hooktool" 2>&1)
+expect_contains "install without root re-executes through a privilege helper" "$out" "REEXEC"
+expect_eq "install without root wrote nothing yet" "$(installed_files)" ""
+
+# --- uninstall-resume-hook: removes only what the installer wrote -------------
+# "Wrote" is recognised by the script's own header for the copy and a marker for
+# the hook, so a real copy of this script is installed for these checks.
+cmd_install_resume_hook --tool "$TOOL" >/dev/null
+if [ -e "$hook" ] && [ -e "$copy" ]; then ok "install with the real script writes both files"; else fail "install with the real script writes both files"; fi
+cmd_uninstall_resume_hook >/dev/null
+expect_eq "uninstall removes the hook and the copy" "$(installed_files)" ""
+set +e
+(cmd_uninstall_resume_hook) >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "uninstall with nothing installed succeeds" "$code" 0
+echo "# someone else's script" >"$hook"
+echo "# someone else's tool" >"$copy"
+cmd_uninstall_resume_hook >/dev/null 2>&1 || true
+if [ -e "$hook" ] && [ -e "$copy" ]; then ok "uninstall leaves files it did not write"; else fail "uninstall leaves files it did not write"; fi
+rm -f "$hook" "$copy"
+out=$(TEST_ROOT=no cmd_uninstall_resume_hook 2>&1)
+expect_contains "uninstall without root re-executes through a privilege helper" "$out" "REEXEC"
+
+unset NMCLI MMCLI SYSTEMCTL USB_SYSFS RECOVER_SLEEP RECOVER_MM_WAIT RECOVER_NM_WAIT SLEEP_HOOK_DIR LIBEXEC_DIR
+unset -f is_root reexec_root sysfs_write at_cmd find_at_port
+# Put the real implementations back for the command-line checks below.
+# shellcheck source=quectel-usbnet
+source "$TOOL"
+
+# --- the recover command line -----------------------------------------------
+out=$("$TOOL" recover --dry-run 2>&1)
+expect_contains "recover --dry-run works from the command line" "$out" "nothing will be touched"
+out=$("$TOOL" install-resume-hook --dry-run 2>&1)
+expect_contains "install-resume-hook --dry-run works from the command line" "$out" "post"
+set +e
+"$TOOL" recover --bogus >/dev/null 2>&1
+code=$?
+set -e
+expect_eq "recover with an unknown option exits 2" "$code" 2
+
 # --- the SIM application state, against a fake qmicli ------------------------
 # A fake qmicli, systemctl and id go first on PATH. systemctl always reports
 # ModemManager as running and logs what it was asked, so the tests can check
