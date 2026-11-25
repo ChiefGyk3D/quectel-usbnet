@@ -1021,6 +1021,8 @@ UPLINK_SAFE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
 # The longest cell-first request, in seconds (30 days): --for refuses more, and a
 # mode file that says more is malformed.
 UPLINK_MAX_FOR=2592000
+# The name suffix of the failover profile the install clones from a modem profile.
+UPLINK_FO_SUFFIX=" (quectel-usbnet failover)"
 UPLINK_UNIT="quectel-uplink"
 UPLINK_RESTORE_UNIT="quectel-uplink-restore"
 UPLINK_UNIT_MARK="# written by quectel-usbnet uplink install"
@@ -1037,6 +1039,7 @@ declare -A UP_STATE=()
 declare -A UP_PROBE=()
 declare -A UP_HIST=()
 declare -A UP_LED=()
+declare -A UP_PAIRS=()
 UP_DEVLIST=""
 UP_DIR=""
 UP_LDIR=""
@@ -1134,6 +1137,8 @@ uplink_init() {
   UP_VERIFY_TRIES=${QUECTEL_UPLINK_VERIFY_TRIES:-6}
   UP_VERIFY_WAIT=${QUECTEL_UPLINK_VERIFY_WAIT:-1}
   UP_CELL_METRIC=${QUECTEL_UPLINK_CELL_METRIC:-50}
+  UP_ACT_TRIES=${QUECTEL_UPLINK_ACT_TRIES:-30}
+  UP_ACT_TIMEOUT=${QUECTEL_UPLINK_ACT_TIMEOUT:-45}
   UP_TARGETS=${QUECTEL_UPLINK_TARGETS:-"1.1.1.1 9.9.9.9"}
   UP_TARGETS6=${QUECTEL_UPLINK_TARGETS6:-"2606:4700:4700::1111 2620:fe::fe"}
   uplink_int_in "$UP_FAILS" 1 20 || bad="$bad QUECTEL_UPLINK_FAILS"
@@ -1144,6 +1149,8 @@ uplink_init() {
   uplink_int_in "$UP_NM_TIMEOUT" 2 60 || bad="$bad QUECTEL_UPLINK_NM_TIMEOUT"
   uplink_int_in "$UP_VERIFY_TRIES" 1 20 || bad="$bad QUECTEL_UPLINK_VERIFY_TRIES"
   uplink_int_in "$UP_VERIFY_WAIT" 0 10 || bad="$bad QUECTEL_UPLINK_VERIFY_WAIT"
+  uplink_int_in "$UP_ACT_TRIES" 1 120 || bad="$bad QUECTEL_UPLINK_ACT_TRIES"
+  uplink_int_in "$UP_ACT_TIMEOUT" 10 180 || bad="$bad QUECTEL_UPLINK_ACT_TIMEOUT"
   # below Ethernet's automatic 100, so an open cellular link wins while it is open
   uplink_int_in "$UP_CELL_METRIC" 1 99 || bad="$bad QUECTEL_UPLINK_CELL_METRIC"
   for t in $UP_TARGETS $UP_TARGETS6; do
@@ -1518,6 +1525,12 @@ uplink_nm() {
   LC_ALL=C "$UP_TIMEOUT" -k 2 "$UP_NM_TIMEOUT" "$UP_NMCLI" --escape no "$@"
 }
 
+# A connection activation: it takes seconds (a modem drops its link and comes back),
+# so it gets its own, longer bound.
+uplink_nm_act() {
+  LC_ALL=C "$UP_TIMEOUT" -k 2 "$UP_ACT_TIMEOUT" "$UP_NMCLI" --escape no --wait "$((UP_ACT_TIMEOUT - 5))" "$@"
+}
+
 # Reads `nmcli --escape no -t -f DEVICE,TYPE,STATE device` on stdin and prints
 # "TYPE DEVICE up|down" for each ethernet, wifi and gsm device with a plain name.
 # Without escaping a device name could hold a colon, so each line is split from
@@ -1839,10 +1852,12 @@ uplink_initial_status() {
 #
 # Every runtime change this manager makes to a device is first written here, with
 # the values to put back. One line per device:
-#   DEVICE LINK UUID ND4 ND6 RM4 RM6
+#   DEVICE ethernet|wifi UUID ND4 ND6 RM4 RM6     a runtime demotion (cell-first)
+#   DEVICE cell NORMAL-UUID FAILOVER-UUID failover  the modem is on, or being moved to,
+#                                                   its failover profile
 # ND = never-default (yes|no), RM = route metric (-1 is automatic), as the active
-# profile has them. A line means "this device was changed at runtime and has not been
-# put back". A run or `uplink restore` after a crash, a kill or a logout reads it
+# profile has them. A line means "this device was changed and has not been put
+# back". A run or `uplink restore` after a crash, a kill or a logout reads it
 # and puts the values back; a line whose device is gone or has been re-activated
 # (a different profile UUID: NetworkManager resets runtime changes then) is dropped.
 
@@ -1860,7 +1875,8 @@ uplink_ledger_load() {
     return 1
   fi
   while IFS= read -r line || [ -n "$line" ]; do
-    if ! [[ $line =~ ^[A-Za-z0-9_.@-]{1,15}\ (ethernet|wifi|cell)\ [0-9A-Fa-f-]{8,40}\ (yes|no)\ (yes|no)\ (-1|[0-9]{1,9})\ (-1|[0-9]{1,9})$ ]]; then
+    if ! [[ $line =~ ^[A-Za-z0-9_.@-]{1,15}\ (ethernet|wifi)\ [0-9A-Fa-f-]{8,40}\ (yes|no)\ (yes|no)\ (-1|[0-9]{1,9})\ (-1|[0-9]{1,9})$ ]] &&
+      ! [[ $line =~ ^[A-Za-z0-9_.@-]{1,15}\ cell\ [0-9A-Fa-f-]{8,40}\ [0-9A-Fa-f-]{8,40}\ failover$ ]]; then
       uplink_log "ERROR: the ledger $f is not valid; nothing changed (put the settings back by hand: nmcli device reapply <device> for each device, then remove the file)"
       return 1
     fi
@@ -1869,7 +1885,11 @@ uplink_ledger_load() {
       uplink_log "ERROR: the ledger $f repeats $dev; nothing changed"
       return 1
     fi
-    UP_LED[$dev]="$link $uuid $a $b $c $d"
+    if [ "$link" = cell ]; then
+      UP_LED[$dev]="$link $uuid $a $b"
+    else
+      UP_LED[$dev]="$link $uuid $a $b $c $d"
+    fi
   done <"$f"
 }
 
@@ -1921,11 +1941,10 @@ uplink_modify() {
 
 # Writes a ledger line for a device BEFORE it is changed, unless it already has one
 # for the same activation (the first previous value wins). $1 = device, $2 = link.
-# Sets UP_FRESH to true when it added a line. Fails if the values cannot be read or
+# Fails if the values cannot be read or
 # the ledger cannot be saved. (Not run in a subshell: it changes UP_LED.)
 uplink_ledger_record() {
   local dev=$1 link=$2 cur old o
-  UP_FRESH=false
   cur=$(uplink_cur_values "$dev") || {
     uplink_log "ERROR: cannot read the current settings of $dev; not changing it"
     return 1
@@ -1941,7 +1960,6 @@ uplink_ledger_record() {
     uplink_log "ERROR: cannot write the ledger; not changing $dev"
     return 1
   }
-  UP_FRESH=true
 }
 
 # What NetworkManager says about a device and its activation, for a ledger line.
@@ -1953,6 +1971,7 @@ uplink_ledger_record() {
 uplink_active_state() {
   local dev=$1 want=$2 devs now
   UP_ACTIVE=""
+  UP_ACTIVE_UUID=""
   devs=$(uplink_nm -t -f DEVICE device) || {
     uplink_log "ERROR: cannot read the device list; the ledger keeps $dev"
     return 1
@@ -1969,6 +1988,7 @@ uplink_active_state() {
     uplink_log "ERROR: cannot read the active profile of $dev; the ledger keeps it"
     return 1
   }
+  UP_ACTIVE_UUID=$now
   if [ -z "$now" ]; then
     UP_ACTIVE=re-activated
   elif [[ $now =~ ^[0-9A-Fa-f-]{8,40}$ ]]; then
@@ -1979,15 +1999,143 @@ uplink_active_state() {
   fi
 }
 
-# Puts a device back to the values in its ledger line and drops the line. A device
-# that is gone, or re-activated since (another profile UUID), already lost the
-# runtime change: the line is dropped. $1 = device. Sets UP_OUT to what it did.
+# The profile pairs the install made: one line "NORMAL-UUID FAILOVER-UUID" per modem
+# profile, in the ledger directory. Loads UP_PAIRS (normal -> failover). No file is
+# no pairs. Anything not exactly that fails.
+uplink_pairs_load() {
+  local f line n fo
+  UP_PAIRS=()
+  [ -n "$UP_LDIR" ] || return 0
+  f=$UP_LDIR/profiles
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then return 0; fi
+  if [ ! -f "$f" ] || [ -L "$f" ]; then
+    uplink_log "ERROR: $f is not a plain file; not using failover profiles"
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    if ! [[ $line =~ ^[0-9A-Fa-f-]{8,40}\ [0-9A-Fa-f-]{8,40}$ ]]; then
+      uplink_log "ERROR: $f is not valid; not using failover profiles"
+      return 1
+    fi
+    read -r n fo <<<"$line"
+    if [ -n "${UP_PAIRS[$n]:-}" ]; then
+      uplink_log "ERROR: $f repeats a profile; not using failover profiles"
+      return 1
+    fi
+    UP_PAIRS[$n]=$fo
+  done <"$f"
+}
+
+# Is this profile what the install made as a failover profile: its name ends with
+# the failover suffix, it never autoconnects (so a reboot or a modem reconnect
+# comes back on the normal, closed profile), and it is open (never-default off)?
+# $1 = its UUID.
+uplink_failover_ok() {
+  local vals id ac nd4 nd6
+  vals=$(uplink_nm -g connection.id,connection.autoconnect,ipv4.never-default,ipv6.never-default connection show uuid "$1") || {
+    uplink_log "ERROR: cannot read the failover profile $1; not using it"
+    return 1
+  }
+  {
+    read -r id
+    read -r ac
+    read -r nd4
+    read -r nd6
+  } <<<"$vals" || return 1
+  if [[ $id != *"$UPLINK_FO_SUFFIX" ]] || [ "$ac" != no ] || [ "$nd4" != no ] || [ "$nd6" != no ]; then
+    uplink_log "ERROR: profile $1 is not a failover profile as the install makes it (name, autoconnect no, never-default no); not using it"
+    return 1
+  fi
+}
+
+# Which pair of profiles belongs to the modem device $1: the one whose normal or
+# failover profile is active on it. Sets UP_PN, UP_PF and UP_CELL_NOW (the active
+# UUID). Fails, with the reason, if the active profile cannot be read, belongs to no
+# pair, or its failover profile is not as the install makes it.
+uplink_cell_pair() {
+  local dev=$1 now n
+  UP_PN=""
+  UP_PF=""
+  UP_CELL_NOW=""
+  now=$(uplink_nm -g GENERAL.CON-UUID device show "$dev" | head -n 1) || {
+    uplink_log "ERROR: cannot read the active profile of $dev; not changing it"
+    return 1
+  }
+  if ! [[ $now =~ ^[0-9A-Fa-f-]{8,40}$ ]]; then
+    uplink_log "ERROR: $dev has no active profile; not changing it"
+    return 1
+  fi
+  uplink_pairs_load || return 1
+  for n in "${!UP_PAIRS[@]}"; do
+    if [ "$now" = "$n" ] || [ "$now" = "${UP_PAIRS[$n]}" ]; then
+      UP_PN=$n
+      UP_PF=${UP_PAIRS[$n]}
+    fi
+  done
+  if [ -z "$UP_PN" ]; then
+    uplink_log "ERROR: no failover profile is installed for the profile active on $dev (run the install steps); not changing it"
+    return 1
+  fi
+  UP_CELL_NOW=$now
+  uplink_failover_ok "$UP_PF"
+}
+
+# Activates a profile on a device and waits, bounded, until it is the active one.
+# The modem drops its link while it switches, for seconds. $1 = device, $2 = UUID.
+uplink_cell_up() {
+  local dev=$1 target=$2 tries=0 now
+  uplink_nm_act connection up uuid "$target" ifname "$dev" >/dev/null || {
+    uplink_log "ERROR: nmcli could not activate profile $target on $dev"
+    return 1
+  }
+  while [ "$tries" -lt "$UP_ACT_TRIES" ]; do
+    tries=$((tries + 1))
+    now=$(uplink_nm -g GENERAL.CON-UUID device show "$dev" | head -n 1) || now=""
+    if [ "$now" = "$target" ]; then return 0; fi
+    [ "$tries" -ge "$UP_ACT_TRIES" ] || uplink_sleep "$UP_VERIFY_WAIT"
+  done
+  uplink_log "ERROR: $dev did not come up on profile $target"
+  return 1
+}
+
+# Puts a modem back on its normal profile and drops its ledger line. $1 = device,
+# $2 = the normal profile, $3 = the failover profile.
+uplink_restore_cell() {
+  local dev=$1 normal=$2 fo=$3
+  uplink_active_state "$dev" "$fo" || return 1
+  if [ "$UP_ACTIVE" = same ]; then
+    uplink_cell_up "$dev" "$normal" || {
+      uplink_log "ERROR: $dev could not be put back on its normal profile; the ledger keeps the entry (nmcli connection up uuid $normal ifname $dev)"
+      return 1
+    }
+    UP_OUT="restored $dev: its normal profile $normal is active again"
+  elif [ "$UP_ACTIVE_UUID" = "$normal" ]; then
+    UP_OUT="dropped $dev: its normal profile is already active"
+  else
+    UP_OUT="dropped $dev: $UP_ACTIVE, NetworkManager already reset it"
+  fi
+  unset "UP_LED[$dev]"
+  uplink_ledger_save || return 1
+}
+
+# Puts a device back as its ledger line says and drops the line. A device that is
+# gone, or re-activated since (another profile UUID), already lost the runtime
+# change: the line is dropped. A demoted Ethernet or Wi-Fi device is put back with
+# `device modify`, and then the default route must really be back: that is not
+# something a modem showed (its modify cannot add a default route back), so if it is
+# not, the device's own connection is re-activated, which resets everything, and if
+# that does not bring it back either, the exact repair command is printed.
+# $1 = device. Sets UP_OUT to what it did.
 uplink_restore_dev() {
-  local dev=$1 line link uuid a b c d cur
+  local dev=$1 line link uuid a b c d
   UP_OUT=""
   line=${UP_LED[$dev]:-}
   [ -n "$line" ] || return 0
   read -r link uuid a b c d <<<"$line"
+  if [ "$link" = cell ]; then
+    uplink_restore_cell "$dev" "$uuid" "$a"
+    return
+  fi
   uplink_active_state "$dev" "$uuid" || return 1
   if [ "$UP_ACTIVE" != same ]; then
     UP_OUT="dropped $dev: $UP_ACTIVE, NetworkManager already reset it"
@@ -1998,6 +2146,21 @@ uplink_restore_dev() {
   if ! uplink_modify "$dev" "$a" "$b" "$c" "$d"; then
     uplink_log "ERROR: nmcli could not put $dev back; the ledger keeps the entry"
     return 1
+  fi
+  if ! uplink_wait_route "$dev" present; then
+    uplink_log "the default route of $dev did not come back after the change was undone; re-activating its connection"
+    local ok=true
+    uplink_cell_up "$dev" "$uuid" || ok=false
+    if $ok && ! uplink_wait_route "$dev" present "$UP_ACT_TRIES"; then ok=false; fi
+    # a re-activation resets every runtime change, so the demotion is gone either way
+    unset "UP_LED[$dev]"
+    uplink_ledger_save || return 1
+    if ! $ok; then
+      uplink_log "ERROR: $dev has no default route even after re-activating it. Repair by hand: nmcli connection up uuid $uuid ifname $dev"
+      return 1
+    fi
+    UP_OUT="restored $dev: its default route came back only after re-activating its connection"
+    return 0
   fi
   UP_OUT="restored $dev: never-default $a/$b, route-metric $c/$d"
   unset "UP_LED[$dev]"
@@ -2017,8 +2180,8 @@ uplink_demote_dev() {
 # route on any of the interfaces in $1 (space separated). Success when it does.
 # Fails with 2 when the table cannot be read.
 uplink_wait_route() {
-  local ifaces=$1 want=$2 tries=0 i any
-  while [ "$tries" -lt "$UP_VERIFY_TRIES" ]; do
+  local ifaces=$1 want=$2 max=${3:-$UP_VERIFY_TRIES} tries=0 i any
+  while [ "$tries" -lt "$max" ]; do
     tries=$((tries + 1))
     uplink_routes_read || return 2
     any=false
@@ -2027,7 +2190,7 @@ uplink_wait_route() {
     done
     if [ "$want" = present ] && $any; then return 0; fi
     if [ "$want" = absent ] && ! $any; then return 0; fi
-    [ "$tries" -ge "$UP_VERIFY_TRIES" ] || uplink_sleep "$UP_VERIFY_WAIT"
+    [ "$tries" -ge "$max" ] || uplink_sleep "$UP_VERIFY_WAIT"
   done
   return 1
 }
@@ -2081,13 +2244,16 @@ uplink_open_rollback() {
   for d in $1; do uplink_restore_say "$d" || true; done
 }
 
-# Opens cellular: never-default off and a route metric below Ethernet's and Wi-Fi's,
-# so it carries traffic while it is open (a dead Ethernet or Wi-Fi keeps its own
-# default route and would otherwise win on metric). The change is in the ledger
-# first, and confirmed in the route table; if it does not show, it is put back.
-# Uses the last scan. Fails if cellular did not open.
+# Opens cellular: the modem is moved to its failover profile (never-default off, a
+# route metric below Ethernet's and Wi-Fi's, so it carries traffic while it is open;
+# a dead Ethernet or Wi-Fi keeps its own default route and would otherwise win on
+# metric). A modem that was activated with never-default has no gateway in
+# NetworkManager's live configuration, and `device modify` cannot bring it back
+# (measured), so only a new activation can. The ledger line is written before the
+# activation, and the route is waited for; if it does not show, the modem is put
+# back on its normal profile. Uses the last scan. Fails if cellular did not open.
 uplink_open_cell() {
-  local i opened="" ifs=""
+  local i opened="" ifs="" dev
   uplink_link_devs cell
   [ "${#UP_L_DEVS[@]}" -gt 0 ] || {
     uplink_log "ERROR: no usable modem device; routes left as they are"
@@ -2095,21 +2261,29 @@ uplink_open_cell() {
   }
   local -a devs=("${UP_L_DEVS[@]}") ipfs=("${UP_L_IFS[@]}")
   for i in "${!devs[@]}"; do
+    dev=${devs[$i]}
     ifs+="${ipfs[$i]} "
-    if [ -n "${UP_LED[${devs[$i]}]:-}" ] && uplink_holds "$UP_HOLD" "${ipfs[$i]}"; then continue; fi
-    if ! uplink_ledger_record "${devs[$i]}" cell; then
+    if ! uplink_cell_pair "$dev"; then
       uplink_open_rollback "$opened"
       return 1
     fi
-    if ! uplink_modify "${devs[$i]}" no no "$UP_CELL_METRIC" "$UP_CELL_METRIC"; then
-      uplink_log "ERROR: nmcli could not open ${devs[$i]}"
-      if $UP_FRESH; then opened+="${devs[$i]} "; fi
+    if [ -n "${UP_LED[$dev]:-}" ] && uplink_holds "$UP_HOLD" "${ipfs[$i]}"; then continue; fi
+    if [ -z "${UP_LED[$dev]:-}" ]; then
+      UP_LED[$dev]="cell $UP_PN $UP_PF failover"
+      if ! uplink_ledger_save; then
+        unset "UP_LED[$dev]"
+        uplink_log "ERROR: cannot write the ledger; not changing $dev"
+        uplink_open_rollback "$opened"
+        return 1
+      fi
+    fi
+    opened+="$dev "
+    if [ "$UP_CELL_NOW" != "$UP_PF" ] && ! uplink_cell_up "$dev" "$UP_PF"; then
       uplink_open_rollback "$opened"
       return 1
     fi
-    opened+="${devs[$i]} "
   done
-  if ! uplink_wait_route "$ifs" present; then
+  if ! uplink_wait_route "$ifs" present "$UP_ACT_TRIES"; then
     uplink_log "ERROR: cellular did not get a default route; putting it back"
     uplink_open_rollback "$opened"
     return 1
@@ -2156,13 +2330,18 @@ uplink_close_cell() {
     if [ -n "$line" ]; then
       uplink_restore_say "$d" || return 1
     elif uplink_holds "$UP_HOLD" "${ipfs[$i]}"; then
-      uplink_demote_dev "$d" || {
-        uplink_log "ERROR: nmcli could not close $d"
-        return 1
-      }
+      if uplink_cell_pair "$d" && [ "$UP_CELL_NOW" = "$UP_PF" ]; then
+        # on the failover profile with no ledger line (it was lost): normal again
+        uplink_cell_up "$d" "$UP_PN" || return 1
+      else
+        uplink_demote_dev "$d" || {
+          uplink_log "ERROR: nmcli could not close $d"
+          return 1
+        }
+      fi
     fi
   done
-  if ! uplink_wait_route "$ifs" absent; then
+  if ! uplink_wait_route "$ifs" absent "$UP_ACT_TRIES"; then
     uplink_log "ERROR: cellular still holds a default route after closing it"
     return 1
   fi
@@ -2307,6 +2486,14 @@ uplink_evaluate() {
     uplink_routes_read || return 1
   fi
   uplink_probe_links
+  # The modem drops its link for seconds while it switches profiles. A modem the
+  # ledger says is on its failover profile and is listed but not connected is
+  # switching, not unhealthy: no measurement this round.
+  if [ "${UP_STATE[cell]}" = down ]; then
+    for link in $(uplink_led_devs); do
+      if [ "${UP_LED[$link]%% *}" = cell ]; then UP_PROBE[cell]=skip; fi
+    done
+  fi
   for link in ethernet wifi cell; do
     if [ -n "${UP_HIST[$link]:-}" ]; then
       read -r st fails oks <<<"${UP_HIST[$link]}"
@@ -2638,7 +2825,7 @@ Description=Keep cellular a quiet fallback behind Ethernet and Wi-Fi
 Type=oneshot
 $(uplink_service_env "$@")
 ExecStart=%h/$UPLINK_COPY_REL uplink run
-TimeoutStartSec=60
+TimeoutStartSec=150
 EOF
 }
 
@@ -2694,6 +2881,8 @@ cmd_uplink_install() {
   [[ $src =~ [[:cntrl:]] ]] && die "the path of this script contains a control character and cannot be printed into a command"
   [ "$(sed -n 2p "$src")" = "$UPLINK_COPY_LINE" ] || die "line 2 of $src is not the expected marker line; refusing to print install steps for an unrecognized script"
   qnm=$(printf '%q' "$nmcli")
+  local metric=${QUECTEL_UPLINK_CELL_METRIC:-50}
+  uplink_int_in "$metric" 1 99 || die "QUECTEL_UPLINK_CELL_METRIC must be 1 to 99"
   cat <<EOF
 # Uplink manager: install steps. Nothing has been run; read them, then run them
 # as the logged-in user; nothing here needs root.
@@ -2702,9 +2891,13 @@ cmd_uplink_install() {
 # changed until all of them pass. Then:
 #   0. checks: the unit directory, the copy and the state directories are ours,
 #      real directories or plain files, no foreign or symlinked file in the way
-#   1. the cellular profile(s) get ipv4.never-default and ipv6.never-default, so
-#      cellular holds no default route after boot, a reconnect or a manager crash
-#      (stored in the profile; the one change that outlives the manager)
+#   1. every cellular profile gets a failover clone (open, route metric $metric, never
+#      autoconnects), and the profile itself gets ipv4.never-default and
+#      ipv6.never-default yes, so cellular holds no default route after boot, a
+#      reconnect or a manager crash; the failover profile is only ever activated by
+#      the manager, and a reconnect comes back on the closed profile (stored in
+#      the profiles; the changes that outlive the manager). All or none, or an
+#      exact repair list.
 #   2. a copy of this script goes to ~/$UPLINK_COPY_REL
 #   3. a systemd --user timer runs 'uplink run' every 15 seconds, and a small
 #      service puts every recorded change back whenever the timer stops
@@ -2757,64 +2950,141 @@ if [ -L "\$dest" ] || { [ -e "\$dest" ] && { [ ! -f "\$dest" ] || [ "\$(sed -n 2
 fi
 echo "checks passed"
 
-# 1. Close the cellular profile(s), all of them or none. They are found from
-#    NetworkManager by type; the profile name differs from machine to machine.
-#    The list and the previous values are read first, so nothing is changed if
-#    that fails; if a change fails, the ones already made are put back.
-list=\$(LC_ALL=C $qnm --escape no -t -f UUID,TYPE connection show) || {
-  echo "cannot list the connection profiles; nothing was changed" >&2
+# 1. The cellular profiles. Per modem profile ("the normal one"): a second, failover
+#    profile is made by cloning it (same SIM and APN settings by construction),
+#    named like it plus a fixed suffix, open (never-default no, route metric
+#    $metric) and NEVER autoconnecting, so after a crash, a reboot or a modem
+#    reconnect the modem comes back on the normal profile; and the normal profile
+#    is closed (never-default yes on both families). All of it is one step: it
+#    either completes, or everything made so far is undone, or you get an exact
+#    repair list. Everything is read first, so nothing is changed if a read fails
+#    or a profile name is taken by something that is not ours.
+fosuffix='$UPLINK_FO_SUFFIX'
+nmc() { LC_ALL=C $qnm "\$@"; }
+fail0() {
+  echo "\$1; nothing was changed" >&2
   exit 1
 }
+list=\$(nmc --escape no -t -f UUID,TYPE connection show) || fail0 "cannot list the connection profiles"
+names=\$(nmc --escape no -t -f UUID,NAME connection show) || fail0 "cannot list the connection profile names"
+oldpairs=""
+if [ -e "\$statedir/profiles" ] || [ -L "\$statedir/profiles" ]; then
+  if [ -L "\$statedir/profiles" ] || [ ! -f "\$statedir/profiles" ]; then fail0 "refusing: \$statedir/profiles is not a plain file"; fi
+  oldpairs=\$(cat "\$statedir/profiles")
+fi
 gsm=()
 prev=()
+fname=()
+fo=()
 while IFS=: read -r uuid ptype; do
   [ "\$ptype" = gsm ] || continue
   case \$uuid in
-    "" | *[!0-9A-Fa-f-]*)
-      echo "refusing: an odd profile id; nothing was changed" >&2
-      exit 1
-      ;;
+    "" | *[!0-9A-Fa-f-]*) fail0 "refusing: an odd profile id" ;;
   esac
-  old=\$(LC_ALL=C $qnm --escape no -g ipv4.never-default,ipv6.never-default connection show uuid "\$uuid") || {
-    echo "cannot read profile \$uuid; nothing was changed" >&2
-    exit 1
-  }
+  nm=\$(nmc --escape no -g connection.id connection show uuid "\$uuid") || fail0 "cannot read the name of profile \$uuid"
+  case \$nm in
+    *"\$fosuffix") continue ;; # a failover profile, not a modem profile
+  esac
+  old=\$(nmc --escape no -g ipv4.never-default,ipv6.never-default connection show uuid "\$uuid") || fail0 "cannot read profile \$uuid"
   old=\${old//\$'\n'/ }
   case \$old in
     "yes yes" | "yes no" | "no yes" | "no no") ;;
+    *) fail0 "unexpected values for profile \$uuid" ;;
+  esac
+  fn="\$nm\$fosuffix"
+  holders=""
+  while IFS= read -r nl; do
+    [ "\${nl#*:}" = "\$fn" ] && holders="\$holders \${nl%%:*}"
+  done <<<"\$names"
+  holders=\${holders# }
+  f=""
+  case \$holders in
+    "") ;;
+    *" "*) fail0 "refusing: more than one profile is named '\$fn'" ;;
     *)
-      echo "unexpected values for profile \$uuid; nothing was changed" >&2
-      exit 1
+      # one profile has that name: it is ours only if the state file pairs it with this one
+      if printf '%s\n' "\$oldpairs" | grep -qxF "\$uuid \$holders"; then
+        f=\$holders
+      else
+        fail0 "refusing: a profile named '\$fn' exists and was not made by quectel-usbnet"
+      fi
       ;;
   esac
   gsm+=("\$uuid")
   prev+=("\$old")
+  fname+=("\$fn")
+  fo+=("\$f")
 done <<<"\$list"
+
+created=()
+closed=0
+repair=()
+undo() {
+  local j f
+  for ((j = 0; j < closed; j++)); do
+    set -- \${prev[\$j]}
+    nmc connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
+      nmc connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
+      repair+=("profile \${gsm[\$j]}: nmcli connection modify uuid \${gsm[\$j]} ipv4.never-default \$1 ipv6.never-default \$2")
+  done
+  for f in "\${created[@]}"; do
+    nmc connection delete uuid "\$f" || nmc connection delete uuid "\$f" ||
+      repair+=("failover profile \$f: nmcli connection delete uuid \$f")
+  done
+  if [ "\${#repair[@]}" -gt 0 ]; then
+    echo "" >&2
+    echo "!!! REPAIR NEEDED: these changes could NOT be undone (tried twice)." >&2
+    echo "!!! Nothing was installed. Undo each by hand with the command next to it:" >&2
+    for f in "\${repair[@]}"; do echo "!!!   \$f" >&2; done
+  fi
+}
+fail() {
+  echo "\$1" >&2
+  undo
+  exit 1
+}
+
+# 1a. The failover profiles (clones), only where there is none yet.
 for i in "\${!gsm[@]}"; do
-  if LC_ALL=C $qnm connection modify uuid "\${gsm[\$i]}" ipv4.never-default yes ipv6.never-default yes; then
+  f=\${fo[\$i]}
+  if [ -z "\$f" ]; then
+    nmc connection clone uuid "\${gsm[\$i]}" "\${fname[\$i]}" >/dev/null || fail "could not create the failover profile for \${gsm[\$i]}; undoing"
+    f=\$(nmc --escape no -g connection.uuid connection show id "\${fname[\$i]}") || f=""
+    case \$f in
+      "" | *[!0-9A-Fa-f-]*)
+        nmc connection delete id "\${fname[\$i]}" || repair+=("failover profile '\${fname[\$i]}': nmcli connection delete id '\${fname[\$i]}'")
+        fail "could not read the id of the failover profile for \${gsm[\$i]}; undoing"
+        ;;
+    esac
+    created+=("\$f")
+    fo[\$i]=\$f
+  fi
+  nmc connection modify uuid "\$f" ipv4.never-default no ipv6.never-default no ipv4.route-metric $metric ipv6.route-metric $metric connection.autoconnect no connection.autoconnect-priority -999 ||
+    fail "could not set up the failover profile \$f; undoing"
+  echo "failover profile \$f ready (never autoconnects)"
+done
+
+# 1b. Close the normal profiles.
+for i in "\${!gsm[@]}"; do
+  if nmc connection modify uuid "\${gsm[\$i]}" ipv4.never-default yes ipv6.never-default yes; then
+    closed=\$((i + 1))
     echo "closed profile \${gsm[\$i]}"
   else
-    echo "could not close profile \${gsm[\$i]}; putting back the ones already closed" >&2
-    stuck=()
-    for ((j = 0; j < i; j++)); do
-      set -- \${prev[\$j]}
-      LC_ALL=C $qnm connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
-        LC_ALL=C $qnm connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
-        stuck+=("\$j")
-    done
-    if [ "\${#stuck[@]}" -gt 0 ]; then
-      echo "" >&2
-      echo "!!! REPAIR NEEDED: these profiles were closed and could NOT be put back (tried twice)." >&2
-      echo "!!! Nothing was installed. Put each one back by hand with the command next to it:" >&2
-      for j in "\${stuck[@]}"; do
-        set -- \${prev[\$j]}
-        echo "!!!   profile \${gsm[\$j]}: nmcli connection modify uuid \${gsm[\$j]} ipv4.never-default \$1 ipv6.never-default \$2" >&2
-      done
-    fi
-    exit 1
+    fail "could not close profile \${gsm[\$i]}; putting back the ones already closed"
   fi
 done
-[ "\${#gsm[@]}" -gt 0 ] || echo "no gsm profile found; set never-default on it yourself once it exists"
+
+# 1c. Which failover profile belongs to which: the manager reads this, and the
+#     uninstall deletes only profiles listed here.
+if [ "\${#gsm[@]}" -gt 0 ]; then
+  mkdir -p -m 0700 -- "\$statedir" || fail "cannot create \$statedir; undoing"
+  ptmp=\$(mktemp "\$statedir/.profiles.XXXXXX") || fail "cannot write \$statedir/profiles; undoing"
+  for i in "\${!gsm[@]}"; do printf '%s %s\n' "\${gsm[\$i]}" "\${fo[\$i]}" >>"\$ptmp"; done
+  chmod 0600 "\$ptmp"
+  mv -T -- "\$ptmp" "\$statedir/profiles" || fail "cannot write \$statedir/profiles; undoing"
+else
+  echo "no gsm profile found; set never-default on it yourself once it exists"
+fi
 
 # 2. The copy.
 mkdir -p -m 0700 -- "\$dir"
@@ -2874,8 +3144,9 @@ EOF
 # state. Runs nothing. A unit or the copy is deleted only if it carries the
 # marker this tool wrote, and nothing is deleted if the restore did not finish.
 cmd_uplink_uninstall() {
-  local PATH=$UPLINK_SAFE_PATH
+  local PATH=$UPLINK_SAFE_PATH qnm
   [ $# -eq 0 ] || usage
+  qnm=$(printf '%q' "$(uplink_resolve_tool nmcli "${QUECTEL_UPLINK_NMCLI:-}")")
   cat <<EOF
 # Uplink manager: uninstall steps. Nothing has been run; read them, then run them
 # as the logged-in user. Only files carrying this tool's marker are deleted, and
@@ -2902,6 +3173,34 @@ if [ -x "\$dest" ] && [ ! -L "\$dest" ]; then
 elif [ -e "\$statedir/ledger" ]; then
   echo "the copy is gone but a ledger is left; run 'quectel-usbnet uplink restore' from the repo first, or 'nmcli device reapply <device>' for each device" >&2
   exit 1
+fi
+
+# 2b. Delete the failover profiles the install made: only those listed in the
+#     profiles file, and only if the name still ends with the failover suffix. A
+#     deletion that fails stops everything before anything else is removed.
+fosuffix='$UPLINK_FO_SUFFIX'
+if [ -L "\$statedir/profiles" ]; then
+  echo "refusing: \$statedir/profiles is a symlink" >&2
+  exit 1
+fi
+if [ -f "\$statedir/profiles" ]; then
+  while read -r pn pf; do
+    case \$pf in "" | *[!0-9A-Fa-f-]*) continue ;; esac
+    if pname=\$(LC_ALL=C $qnm --escape no -g connection.id connection show uuid "\$pf" 2>/dev/null); then
+      case \$pname in
+        *"\$fosuffix")
+          if LC_ALL=C $qnm connection delete uuid "\$pf"; then
+            echo "deleted failover profile \$pf"
+          else
+            echo "could not delete failover profile \$pf; nothing else was removed. Delete it by hand: nmcli connection delete uuid \$pf" >&2
+            exit 1
+          fi
+          ;;
+        *) echo "left profile \$pf: its name is not a failover name" ;;
+      esac
+    fi
+  done <"\$statedir/profiles"
+  rm -f -- "\$statedir/profiles"
 fi
 
 # 3. Remove what we wrote, only if it is ours.

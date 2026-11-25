@@ -35,7 +35,10 @@ mkdir -p "$ubin"
 #   calls              every call, in order
 cat >"$ubin/apply" <<'FAKE'
 #!/usr/bin/env bash
-# apply DEV ND4 ND6 RM4 RM6: what NetworkManager does to the routes of a device
+# apply DEV ND4 ND6 RM4 RM6: what NetworkManager does to the routes of a device.
+# A device with a nogw_DEV file has lost its gateway from NetworkManager's live
+# configuration (a modem activated with never-default): the routes of an allowed
+# family cannot come back by a runtime change, only by a new activation (measured).
 dev=$1
 iface=$dev
 [ ! -f "$UW/ipif_$dev" ] || iface=$(cat "$UW/ipif_$dev")
@@ -43,6 +46,8 @@ for fam in 4 6; do
   if [ "$fam" = 4 ]; then nd=$2 rm=$4; else nd=$3 rm=$5; fi
   if [ "$nd" = yes ]; then
     rm -f "$UW/rt${fam}_$iface"
+  elif [ -f "$UW/nogw_$dev" ]; then
+    :
   elif [ -f "$UW/tpl${fam}_$iface" ]; then
     if [ "$rm" = -1 ]; then
       cp "$UW/tpl${fam}_$iface" "$UW/rt${fam}_$iface"
@@ -58,6 +63,17 @@ echo "nmcli LC_ALL=${LC_ALL:-unset} $*" >>"$UW/calls"
 while [ "${1:-}" = --escape ] || [ "${1:-}" = --wait ]; do shift 2; done
 [ ! -f "$UW/fail_nmcli" ] || { echo "Error: boom" >&2; exit 1; }
 nroutes() { cat "$UW"/rt4_* "$UW"/rt6_* 2>/dev/null | grep -c . || true; }
+# hook: right after this device is changed to this value, the modem loses its
+# route, its link, or both (the file holds "DEVICE VALUE [route|link|both]")
+run_hook() {
+  if [ -f "$UW/hook_after_modify" ]; then
+    read -r hd hv hm <"$UW/hook_after_modify"
+    if [ "$hd $hv" = "$1 $2" ]; then
+      case ${hm:-both} in route | both) rm -f "$UW/rt4_wwan0" "$UW/rt6_wwan0" ;; esac
+      case ${hm:-both} in link | both) touch "$UW/nolink_cdc-wdm0" ;; esac
+    fi
+  fi
+}
 case "$1 $2 $3 $4" in
   "-t -f DEVICE,TYPE,STATE device")
     [ ! -f "$UW/fail_list" ] || { echo "Error: boom" >&2; exit 1; }
@@ -71,6 +87,25 @@ case "$1 $2 $3 $4" in
   "-t -f UUID,TYPE connection")
     [ ! -f "$UW/fail_conlist" ] || { echo "Error: boom" >&2; exit 1; }
     cat "$UW/connections"
+    ;;
+  "-t -f UUID,NAME connection")
+    [ ! -f "$UW/fail_conlist" ] || { echo "Error: boom" >&2; exit 1; }
+    cat "$UW/connnames" 2>/dev/null || true
+    ;;
+  "-g connection.id connection show")
+    [ ! -f "$UW/fail_conname_$6" ] || { echo "Error: no such profile" >&2; exit 1; }
+    if [ -f "$UW/name_$6" ]; then cat "$UW/name_$6"; else echo "Profile $6"; fi
+    ;;
+  "-g connection.uuid connection show")
+    # connection show id NAME
+    [ ! -f "$UW/fail_conuuid" ] || { echo "Error: no such profile" >&2; exit 1; }
+    grep -F -- ":$6" "$UW/connnames" | grep -x -- ".*:$6" | head -n 1 | cut -d: -f1
+    ;;
+  "-g connection.id,connection.autoconnect,ipv4.never-default,ipv6.never-default connection show")
+    [ ! -f "$UW/fail_conread_$6" ] || { echo "Error: no such profile" >&2; exit 1; }
+    if [ -f "$UW/name_$6" ]; then cat "$UW/name_$6"; else echo "Profile $6"; fi
+    if [ -f "$UW/ac_$6" ]; then cat "$UW/ac_$6"; else echo yes; fi
+    if [ -f "$UW/prof_$6" ]; then head -n 2 "$UW/prof_$6"; else printf 'no\nno\n'; fi
     ;;
   "-g ipv4.never-default,ipv6.never-default connection show")
     [ ! -f "$UW/fail_conread_$6" ] || { echo "Error: no such profile" >&2; exit 1; }
@@ -89,6 +124,29 @@ case "$1 $2 $3 $4" in
     [ ! -f "$UW/fail_cur" ] || { echo "Error: no such profile" >&2; exit 1; }
     cat "$UW/prof_$6"
     ;;
+  "connection clone uuid "*)
+    # connection clone uuid N NEWNAME: a copy of the profile, with a new uuid and name
+    [ ! -f "$UW/fail_clone" ] && [ ! -f "$UW/fail_clone_$4" ] || { echo "Error: clone failed" >&2; exit 1; }
+    new="f0f0-$4"
+    if [ -f "$UW/prof_$4" ]; then cp "$UW/prof_$4" "$UW/prof_$new"; else printf 'no\nno\n-1\n-1\n' >"$UW/prof_$new"; fi
+    echo "$5" >"$UW/name_$new"
+    echo yes >"$UW/ac_$new"
+    echo "$new:gsm" >>"$UW/connections"
+    echo "$new:$5" >>"$UW/connnames"
+    ;;
+  "connection delete uuid "*)
+    [ ! -f "$UW/fail_condel_$4" ] || { echo "Error: delete failed" >&2; exit 1; }
+    grep -v "^$4:" "$UW/connections" >"$UW/connections.new" || true
+    mv "$UW/connections.new" "$UW/connections"
+    grep -v "^$4:" "$UW/connnames" >"$UW/connnames.new" || true
+    mv "$UW/connnames.new" "$UW/connnames"
+    rm -f "$UW/name_$4" "$UW/prof_$4" "$UW/ac_$4"
+    ;;
+  "connection delete id "*)
+    [ ! -f "$UW/fail_condel_id" ] || { echo "Error: delete failed" >&2; exit 1; }
+    grep -v -F -x -- "$(grep -F -- ":${*:4}" "$UW/connnames" | head -n 1)" "$UW/connnames" >"$UW/connnames.new" || true
+    mv "$UW/connnames.new" "$UW/connnames"
+    ;;
   "connection modify uuid "*)
     [ ! -f "$UW/fail_conmod_$4" ] || { echo "Error: modify failed" >&2; exit 1; }
     # fail_conrestore_UUID: putting a profile back (anything but yes/yes) fails;
@@ -101,11 +159,52 @@ case "$1 $2 $3 $4" in
         exit 1
       fi
     fi
-    # the profile changes: never-default is rewritten in the fake profile, when it has one
-    if [ -f "$UW/prof_$4" ]; then
-      { echo "$6"; echo "$8"; tail -n 2 "$UW/prof_$4"; } >"$UW/prof_$4.new"
-      mv "$UW/prof_$4.new" "$UW/prof_$4"
+    u=$4
+    shift 4
+    if [ -f "$UW/prof_$u" ]; then
+      mapfile -t pv <"$UW/prof_$u"
+      while [ $# -ge 2 ]; do
+        case $1 in
+          ipv4.never-default) pv[0]=$2 ;;
+          ipv6.never-default) pv[1]=$2 ;;
+          ipv4.route-metric) pv[2]=$2 ;;
+          ipv6.route-metric) pv[3]=$2 ;;
+          connection.autoconnect) echo "$2" >"$UW/ac_$u" ;;
+        esac
+        shift 2
+      done
+      printf '%s\n' "${pv[@]}" >"$UW/prof_$u.new"
+      mv "$UW/prof_$u.new" "$UW/prof_$u"
     fi
+    ;;
+  "connection up uuid "*)
+    # connection up uuid U ifname DEV: a new activation; resets every runtime change
+    u=$4
+    dev=$6
+    if [ -f "$UW/fail_up_$u" ] || [ -f "$UW/fail_modify_$dev" ]; then
+      echo "Error: activation failed" >&2
+      exit 1
+    fi
+    if ! grep -qx -- "$u" "$UW/profiles_$dev" 2>/dev/null; then
+      echo "Error: no such profile for this device" >&2
+      exit 1
+    fi
+    if [ -f "$UW/noop_modify" ]; then exit 0; fi
+    if [ -f "$UW/noop_modify_once" ]; then
+      rm -f "$UW/noop_modify_once"
+      exit 0
+    fi
+    echo "$u" >"$UW/uuid_$dev"
+    rm -f "$UW/props_$dev" "$UW/nogw_$dev"
+    mapfile -t pv <"$UW/prof_$u"
+    if [ "${pv[0]}" = yes ]; then touch "$UW/nogw_$dev"; fi
+    # up_noroute_DEV: the activation takes, the device comes up on the profile, but
+    # no default route appears
+    if [ ! -f "$UW/up_noroute_$dev" ]; then
+      "$UBIN/apply" "$dev" "${pv[0]}" "${pv[1]}" "${pv[2]}" "${pv[3]}"
+    fi
+    run_hook "$dev" "${pv[0]}"
+    echo "routes=$(nroutes) after up $dev ${pv[0]}" >>"$UW/calls"
     ;;
   "device modify "*)
     dev=$3
@@ -124,16 +223,11 @@ case "$1 $2 $3 $4" in
       exit 0
     fi
     printf '%s\n%s\n%s\n%s\n' "$2" "$4" "$6" "$8" >"$UW/props_$dev"
+    # demote_sets_nogw: removing a device's defaults also loses its gateway, as the
+    # modem showed; only a new activation brings it back (the pessimistic case)
+    if [ -f "$UW/demote_sets_nogw" ] && [ "$2" = yes ]; then touch "$UW/nogw_$dev"; fi
     "$UBIN/apply" "$dev" "$2" "$4" "$6" "$8"
-    # hook: right after this device is changed to this value, the modem loses its
-    # route, its link, or both (the file holds "DEVICE VALUE [route|link|both]")
-    if [ -f "$UW/hook_after_modify" ]; then
-      read -r hd hv hm <"$UW/hook_after_modify"
-      if [ "$hd $hv" = "$dev $2" ]; then
-        case ${hm:-both} in route | both) rm -f "$UW/rt4_wwan0" "$UW/rt6_wwan0" ;; esac
-        case ${hm:-both} in link | both) touch "$UW/nolink_cdc-wdm0" ;; esac
-      fi
-    fi
+    run_hook "$dev" "$2"
     echo "routes=$(nroutes) after modify $dev $2" >>"$UW/calls"
     ;;
   *) exit 9 ;;
@@ -210,6 +304,7 @@ export QUECTEL_UPLINK_TARGETS="192.0.2.1 198.51.100.1"
 export QUECTEL_UPLINK_TARGETS6="2001:db8::1 2001:db8::2"
 export QUECTEL_UPLINK_VERIFY_WAIT=0
 export QUECTEL_UPLINK_VERIFY_TRIES=2
+export QUECTEL_UPLINK_ACT_TRIES=2
 T0=1700000000
 M0=1000
 
@@ -227,9 +322,21 @@ uscene() {
     echo wwan0 >"$UW/ipif_cdc-wdm0"
     echo "default dev wwan0 proto static metric 1100" >"$UW/tpl4_wwan0"
     echo "default dev wwan0 proto static metric 1100 pref medium" >"$UW/tpl6_wwan0"
+    # the modem has two profiles: the normal one (closed, ...03) and the failover one
+    # (open, never autoconnects, ...05). It was activated closed, so it has no gateway
+    # in NetworkManager's live configuration (nogw): only a new activation of the
+    # failover profile gives it a default route; `device modify` cannot.
+    printf '00000003-0000-0000-0000-000000000000\n00000005-0000-0000-0000-000000000000\n' >"$UW/profiles_cdc-wdm0"
+    printf 'yes\nyes\n1100\n1100\n' >"$UW/prof_00000003-0000-0000-0000-000000000000"
+    printf 'no\nno\n50\n50\n' >"$UW/prof_00000005-0000-0000-0000-000000000000"
+    echo "Test Modem" >"$UW/name_00000003-0000-0000-0000-000000000000"
+    echo "Test Modem (quectel-usbnet failover)" >"$UW/name_00000005-0000-0000-0000-000000000000"
+    echo no >"$UW/ac_00000005-0000-0000-0000-000000000000"
+    mkdir -m 0700 "$ULD"
+    echo "00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000" >"$ULD/profiles"
     if [ "$3" != gone ]; then
       echo 00000003-0000-0000-0000-000000000000 >"$UW/uuid_cdc-wdm0"
-      printf 'yes\nyes\n1100\n1100\n' >"$UW/prof_00000003-0000-0000-0000-000000000000"
+      touch "$UW/nogw_cdc-wdm0"
     fi
     [ "$3" != ok ] || echo ok >"$UW/ping_wwan0"
   fi
@@ -249,12 +356,14 @@ uadd() {
   cp "$UW/tpl4_$dev" "$UW/rt4_$dev"
   echo "0000000$n-0000-0000-0000-000000000000" >"$UW/uuid_$dev"
   printf 'no\nno\n-1\n-1\n' >"$UW/prof_0000000$n-0000-0000-0000-000000000000"
+  echo "0000000$n-0000-0000-0000-000000000000" >"$UW/profiles_$dev"
   if [ "$state" = ok ]; then echo ok >"$UW/ping_$dev"; fi
   return 0
 }
 # uopen: the modem profile is not closed yet, so cellular holds default routes
 uopen() {
   printf 'no\nno\n1100\n1100\n' >"$UW/prof_00000003-0000-0000-0000-000000000000"
+  rm -f "$UW/nogw_cdc-wdm0"
   cp "$UW/tpl4_wwan0" "$UW/rt4_wwan0"
   cp "$UW/tpl6_wwan0" "$UW/rt6_wwan0"
 }
@@ -271,7 +380,16 @@ uholders() {
 ucalls() { cat "$UW/calls" 2>/dev/null || true; }
 # umods: the device modify calls, in order, compact: "DEVICE never-default route-metric;"
 umods() {
-  ucalls | grep 'device modify' | sed -E 's/^nmcli LC_ALL=C --escape no --wait [0-9]+ device modify ([^ ]+) ipv4.never-default ([a-z]+) ipv6.never-default ([a-z]+) ipv4.route-metric (-?[0-9]+) ipv6.route-metric (-?[0-9]+)$/\1 \2 \4/' | tr '\n' ';' || true
+  # a modem is opened and closed by activating its failover or normal profile: shown
+  # as "cdc-wdm0 no 50" (open) and "cdc-wdm0 yes 1100" (closed); another activation
+  # (Ethernet, Wi-Fi) as "eth0 up"
+  ucalls | grep -e 'device modify' -e 'connection up uuid' | sed -E \
+    -e 's/^nmcli LC_ALL=C --escape no --wait [0-9]+ device modify ([^ ]+) ipv4.never-default ([a-z]+) ipv6.never-default ([a-z]+) ipv4.route-metric (-?[0-9]+) ipv6.route-metric (-?[0-9]+)$/\1 \2 \4/' \
+    -e 's/^nmcli LC_ALL=C --escape no --wait [0-9]+ connection up uuid 00000005-[0-9a-f-]+ ifname cdc-wdm0$/cdc-wdm0 no 50/' \
+    -e 's/^nmcli LC_ALL=C --escape no --wait [0-9]+ connection up uuid 00000003-[0-9a-f-]+ ifname cdc-wdm0$/cdc-wdm0 yes 1100/' \
+    -e 's/^nmcli LC_ALL=C --escape no --wait [0-9]+ connection up uuid 00000006-[0-9a-f-]+ ifname cdc-wdm1$/cdc-wdm1 no 50/' \
+    -e 's/^nmcli LC_ALL=C --escape no --wait [0-9]+ connection up uuid 00000004-[0-9a-f-]+ ifname cdc-wdm1$/cdc-wdm1 yes 1100/' \
+    -e 's/^nmcli LC_ALL=C --escape no --wait [0-9]+ connection up uuid [0-9a-f-]+ ifname ([a-z0-9]+)$/\1 up/' | tr '\n' ';' || true
 }
 # uledger: the devices in the ledger, sorted
 uledger() {
@@ -495,7 +613,8 @@ expect_eq "failover: only cellular was changed: opened, with a metric below both
 expect_eq "failover: Wi-Fi was never touched" "$(ucalls | grep -c 'modify wlan0' || true)" 0
 expect_eq "failover: Wi-Fi keeps its own default route; cellular holds one too" "$(uholders)" "wlan0 wwan0"
 expect_eq "failover: the ledger lists the modem" "$(uledger)" "cdc-wdm0"
-expect_eq "failover: the ledger holds the previous (closed) values" "$(cut -d' ' -f2- "$ULD/ledger")" "cell 00000003-0000-0000-0000-000000000000 yes yes 1100 1100"
+expect_eq "failover: the ledger holds the normal and the failover profile" "$(cut -d' ' -f2- "$ULD/ledger")" "cell 00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000 failover"
+expect_eq "failover: cellular is opened by activating its failover profile, not by device modify" "$(ucalls | grep -c 'device modify cdc-wdm0' || true)" 0
 expect_eq "failover: the machine never had no default route" "$(ucalls | grep -c 'routes=0 ' || true)" 0
 expect_eq "failover: exit 0" "$ucli_rc" 0
 ucli status --json
@@ -610,18 +729,63 @@ expect_eq "close guard: nothing was modified" "$(umods)" ""
 expect_eq "close guard: cellular still holds its default" "$(uholders)" "wwan0"
 rm -f "$UW/ping_dropsroute_wlan0"
 
-# A profile with values that are not what nmcli prints is not trusted
+# The failover profile is only used if it is what the install makes: its name, never
+# autoconnecting, open. Anything else is not trusted and cellular is not opened.
+fo_case() {
+  # fo_case NAME SETUP-COMMAND
+  uscene gone ok ok
+  eval "$2"
+  rm -f "$UW/ping_wlan0"
+  ucli run
+  unow 15
+  ucli run
+  unow 30
+  ucli run
+  expect_eq "failover profile ($1): cellular is not opened" "$ucli_rc" 1
+  expect_contains "failover profile ($1): says why" "$ucli_out" "$3"
+  expect_eq "failover profile ($1): nothing is activated" "$(umods)" ""
+  expect_eq "failover profile ($1): Wi-Fi keeps its routes" "$(uholders)" "wlan0"
+  expect_eq "failover profile ($1): no ledger line is left" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
+}
+fo_case "autoconnect yes" "echo yes >\"\$UW/ac_00000005-0000-0000-0000-000000000000\"" "is not a failover profile as the install makes it"
+fo_case "a foreign name" "echo 'Somebody Else' >\"\$UW/name_00000005-0000-0000-0000-000000000000\"" "is not a failover profile as the install makes it"
+fo_case "never-default yes" "printf 'yes\\nno\\n50\\n50\\n' >\"\$UW/prof_00000005-0000-0000-0000-000000000000\"" "is not a failover profile as the install makes it"
+fo_case "unreadable" "touch \"\$UW/fail_conread_00000005-0000-0000-0000-000000000000\"" "cannot read the failover profile"
+fo_case "no pairs file" "rm -f \"\$ULD/profiles\"" "no failover profile is installed"
+fo_case "a malformed pairs file" "echo garbage >\"\$ULD/profiles\"" "is not valid; not using failover profiles"
+fo_case "a repeated pair" "printf '%s\\n%s\\n' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "repeats a profile"
+fo_case "a symlinked pairs file" "mv \"\$ULD/profiles\" \"\$tmp/pairs_real\" && ln -s \"\$tmp/pairs_real\" \"\$ULD/profiles\"" "is not a plain file; not using failover profiles"
+fo_case "another modem's pair only" "echo '00000009-0000-0000-0000-000000000000 0000000a-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "no failover profile is installed"
+fo_case "an unreadable active profile" "touch \"\$UW/fail_cur\"" "cannot read the active profile of cdc-wdm0"
+
+# The measured behavior: `device modify` cannot give a closed modem a default route
+# back, only a new activation can. The fake reproduces it, so a manager that opened
+# cellular with `device modify` would never get a route.
 uscene gone ok ok
-printf 'maybe\nyes\n1100\n1100\n' >"$UW/prof_00000003-0000-0000-0000-000000000000"
-rm -f "$UW/ping_wlan0"
+"$ubin/nmcli" device modify cdc-wdm0 ipv4.never-default no ipv6.never-default no ipv4.route-metric 50 ipv6.route-metric 50
+expect_eq "measured: device modify on a closed modem gives it no default route" "$(uholders)" "wlan0"
+"$ubin/nmcli" connection up uuid 00000005-0000-0000-0000-000000000000 ifname cdc-wdm0
+expect_eq "measured: activating the failover profile does, with the failover metric" "$(uholders)" "wlan0 wwan0"
+expect_contains "measured: the route has metric 50" "$(cat "$UW/rt4_wwan0")" "metric 50"
+"$ubin/nmcli" connection up uuid 00000003-0000-0000-0000-000000000000 ifname cdc-wdm0
+expect_eq "measured: activating the normal profile removes it again" "$(uholders)" "wlan0"
+
+# A modem that is switching profiles is not an unhealthy modem
+uscene gone ok ok
 ucli run
+rm -f "$UW/ping_wlan0"
 unow 15
 ucli run
 unow 30
 ucli run
-expect_eq "garbage profile values: cellular is not opened" "$ucli_rc" 1
-expect_contains "garbage profile values: says why" "$ucli_out" "cannot read the current settings of cdc-wdm0"
-expect_eq "garbage profile values: nothing modified" "$(umods)" ""
+sed -i 's/^cdc-wdm0:gsm:connected/cdc-wdm0:gsm:disconnected/' "$UW/devices"
+unow 45
+ucli run
+expect_contains "switching modem: the round is not a measurement of the modem" "$ucli_out" "cell=down/up(skip)"
+unow 60
+ucli run
+expect_contains "switching modem: still not, a second round later" "$ucli_out" "cell=down/up(skip)"
+expect_eq "switching modem: the ledger line is kept while it switches" "$(uledger)" "cdc-wdm0"
 
 # IPv6: a link with only an IPv6 default route is judged on IPv6.
 uscene gone ok ok
@@ -978,7 +1142,7 @@ ucli cell-first
 ucli restore
 expect_eq "restore: exit 0" "$ucli_rc" 0
 expect_eq "restore: Ethernet and Wi-Fi first, then cellular" "$(umods)" "eth0 no -1;wlan0 no -1;cdc-wdm0 yes 1100;"
-expect_contains "restore: says what it restored" "$ucli_out" "restored cdc-wdm0: never-default yes/yes, route-metric 1100/1100"
+expect_contains "restore: says what it restored" "$ucli_out" "restored cdc-wdm0: its normal profile 00000003-0000-0000-0000-000000000000 is active again"
 expect_eq "restore: the ledger is empty" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
 # cellular is the only way out: it is not closed
 uscene gone ok ok
@@ -1013,14 +1177,14 @@ expect_contains "malformed ledger: says to put things back by hand" "$ucli_out" 
 ucli restore
 expect_eq "malformed ledger: restore refuses too" "$ucli_rc" 1
 # two lines for one device are unknown too
-printf '%s\n%s\n' "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 yes yes 1100 1100" "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 yes yes 1100 1100" >"$ULD/ledger"
+printf '%s\n%s\n' "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000 failover" "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000 failover" >"$ULD/ledger"
 : >"$UW/calls"
 ucli run
 expect_eq "a ledger that repeats a device: exit 1" "$ucli_rc" 1
 expect_contains "a ledger that repeats a device: says so" "$ucli_out" "repeats cdc-wdm0"
 # a symlinked ledger file is not followed, even to valid content
 rm -f "$ULD/ledger"
-printf '%s\n' "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 yes yes 1100 1100" >"$tmp/real_ledger"
+printf '%s\n' "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000 failover" >"$tmp/real_ledger"
 ln -s "$tmp/real_ledger" "$ULD/ledger"
 ucli run
 expect_eq "a symlinked ledger file: exit 1" "$ucli_rc" 1
@@ -1078,7 +1242,7 @@ fail_start
 touch "$UW/fail_cur"
 ucli run
 expect_eq "profile unreadable: exit 1" "$ucli_rc" 1
-expect_contains "profile unreadable: says so" "$ucli_out" "cannot read the current settings of cdc-wdm0"
+expect_contains "profile unreadable: says so" "$ucli_out" "cannot read the active profile of cdc-wdm0"
 expect_eq "profile unreadable: nothing modified" "$(umods)" ""
 rm -f "$UW/fail_cur"
 
@@ -1087,7 +1251,7 @@ fail_start
 touch "$UW/fail_modify_cdc-wdm0"
 ucli run
 expect_eq "open fails: exit 1" "$ucli_rc" 1
-expect_contains "open fails: says why" "$ucli_out" "nmcli could not open cdc-wdm0"
+expect_contains "open fails: says why" "$ucli_out" "nmcli could not activate profile"
 expect_eq "open fails: Wi-Fi keeps its routes" "$(uholders)" "wlan0"
 rm -f "$UW/fail_modify_cdc-wdm0"
 
@@ -1096,27 +1260,29 @@ fail_start
 touch "$UW/noop_modify"
 ucli run
 expect_eq "open is a no-op: exit 1" "$ucli_rc" 1
-expect_contains "open is a no-op: says cellular got no route" "$ucli_out" "cellular did not get a default route"
+expect_contains "open is a no-op: says the modem did not come up on the profile" "$ucli_out" "did not come up on profile"
 expect_eq "open is a no-op: Wi-Fi keeps its routes" "$(uholders)" "wlan0"
-expect_eq "open is a no-op: it is put back" "$(umods)" "cdc-wdm0 no 50;cdc-wdm0 yes 1100;"
+expect_eq "open is a no-op: the activation was tried once" "$(umods)" "cdc-wdm0 no 50;"
 expect_eq "open is a no-op: the ledger is empty again" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
 rm -f "$UW/noop_modify"
 
-# an interface whose name only starts like cellular's is not cellular
+# an interface whose name only starts like cellular's is not cellular: the failover
+# profile comes up but brings no route of its own; a default route on wwan00 must not
+# count as one on wwan0
 fail_start
-touch "$UW/noop_modify"
+rm -f "$UW/tpl4_wwan0" "$UW/tpl6_wwan0"
 echo "default dev wwan00 scope link metric 50" >"$UW/rt4_wwan00"
 ucli run
 expect_eq "name prefix: a default route on wwan00 is not one on wwan0" "$ucli_rc" 1
 expect_contains "name prefix: so cellular is still found not open" "$ucli_out" "cellular did not get a default route"
-rm -f "$UW/noop_modify"
+expect_eq "name prefix: and it is put back on its normal profile" "$(umods)" "cdc-wdm0 no 50;cdc-wdm0 yes 1100;"
 
 # the first attempt to open cellular fails, the put-back works: the ledger is empty again
 fail_start
 cat >"$ubin/nmcli.failopen" <<'FAKE'
 #!/usr/bin/env bash
 # the first attempt to open the modem fails
-if [[ "$*" == *"device modify cdc-wdm0 ipv4.never-default no"* ]] && [ ! -f "$UW/failed_once" ]; then
+if [[ "$*" == *"connection up uuid 00000005-"* ]] && [ ! -f "$UW/failed_once" ]; then
   touch "$UW/failed_once"
   echo "nmcli LC_ALL=${LC_ALL:-unset} $*" >>"$UW/calls"
   echo "Error: no" >&2
@@ -1130,7 +1296,8 @@ ucli_out=$(QUECTEL_UPLINK_NMCLI="$ubin/nmcli.failopen" "$TOOL" uplink run 2>&1) 
 expect_eq "failed open: exit 1" "$ucli_rc" 1
 expect_eq "failed open: what was recorded is taken back out of the ledger" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
 
-# closing cellular is not taken on trust: if its route is still there afterwards, the run fails
+# closing cellular is not taken on trust. (1) the activation of the normal profile is
+# silently lost: the modem stays on the failover profile, the line stays, the run fails
 fail_start
 ucli run >/dev/null # cellular is open now
 echo ok >"$UW/ping_wlan0"
@@ -1138,8 +1305,8 @@ unow 45
 ucli run >/dev/null
 cat >"$ubin/nmcli.stayopen" <<'FAKE'
 #!/usr/bin/env bash
-# closing the modem is silently lost
-if [[ "$*" == *"device modify cdc-wdm0 ipv4.never-default yes"* ]]; then
+# putting the modem back on its normal profile is silently lost
+if [[ "$*" == *"connection up uuid 00000003-"* ]]; then
   echo "nmcli LC_ALL=${LC_ALL:-unset} $*" >>"$UW/calls"
   exit 0
 fi
@@ -1150,7 +1317,29 @@ unow 60
 ucli_rc=0
 ucli_out=$(QUECTEL_UPLINK_NMCLI="$ubin/nmcli.stayopen" "$TOOL" uplink run 2>&1) || ucli_rc=$?
 expect_eq "close is lost: exit 1" "$ucli_rc" 1
-expect_contains "close is lost: says the route is still there" "$ucli_out" "still holds a default route after closing it"
+expect_contains "close is lost: says the modem could not be put back" "$ucli_out" "could not be put back on its normal profile"
+expect_eq "close is lost: the ledger keeps the line" "$(uledger)" "cdc-wdm0"
+expect_eq "close is lost: the modem is still the open one" "$(uholders)" "wlan0 wwan0"
+# (2) the profile is active again but a default route lingers: the route is checked too
+fail_start
+ucli run >/dev/null
+echo ok >"$UW/ping_wlan0"
+unow 45
+ucli run >/dev/null
+cat >"$ubin/nmcli.lingers" <<'FAKE'
+#!/usr/bin/env bash
+# the normal profile comes up, but a default route stays on the modem
+"$UBIN/nmcli" "$@" || exit $?
+if [[ "$*" == *"connection up uuid 00000003-"* ]]; then
+  cp "$UW/tpl4_wwan0" "$UW/rt4_wwan0"
+fi
+FAKE
+chmod +x "$ubin/nmcli.lingers"
+unow 60
+ucli_rc=0
+ucli_out=$(QUECTEL_UPLINK_NMCLI="$ubin/nmcli.lingers" "$TOOL" uplink run 2>&1) || ucli_rc=$?
+expect_eq "close lingers: exit 1" "$ucli_rc" 1
+expect_contains "close lingers: says the route is still there" "$ucli_out" "still holds a default route after closing it"
 
 # one demotion in cell-first fails: everything goes back
 uscene ok ok ok
@@ -1422,6 +1611,12 @@ usecond() {
   echo "default dev wwan1 proto static metric 1100 pref medium" >"$UW/tpl6_wwan1"
   echo 00000004-0000-0000-0000-000000000000 >"$UW/uuid_cdc-wdm1"
   printf 'yes\nyes\n1100\n1100\n' >"$UW/prof_00000004-0000-0000-0000-000000000000"
+  printf 'no\nno\n50\n50\n' >"$UW/prof_00000006-0000-0000-0000-000000000000"
+  printf '00000004-0000-0000-0000-000000000000\n00000006-0000-0000-0000-000000000000\n' >"$UW/profiles_cdc-wdm1"
+  echo "Test Modem 2 (quectel-usbnet failover)" >"$UW/name_00000006-0000-0000-0000-000000000000"
+  echo no >"$UW/ac_00000006-0000-0000-0000-000000000000"
+  echo "00000004-0000-0000-0000-000000000000 00000006-0000-0000-0000-000000000000" >>"$ULD/profiles"
+  touch "$UW/nogw_cdc-wdm1"
   echo ok >"$UW/ping_wwan1"
 }
 
@@ -1482,7 +1677,7 @@ ucli cell-first
 expect_eq "two modems, the second fails (cell-first): exit 1" "$ucli_rc" 1
 expect_contains "two modems, the second fails (cell-first): the cell-first revert path ran" "$ucli_out" "reverting: restoring Ethernet and Wi-Fi first"
 expect_eq "two modems, the second fails (cell-first): the first is closed again" "$(uholders)" "eth0 wlan0"
-expect_eq "two modems, the second fails (cell-first): only the second (its put-back fails too, it never changed) is left in the ledger" "$(uledger)" "cdc-wdm1"
+expect_eq "two modems, the second fails (cell-first): nothing is left in the ledger" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
 expect_eq "two modems, the second fails (cell-first): Ethernet and Wi-Fi were never touched" "$(ucalls | grep -c -e 'modify eth0' -e 'modify wlan0' || true)" 0
 expect_eq "two modems, the second fails (cell-first): the first was opened, then put back" "$(umods | cut -d';' -f1,3)" "cdc-wdm0 no 50;cdc-wdm0 yes 1100"
 uscene gone ok ok
@@ -1496,7 +1691,7 @@ unow 30
 ucli run
 expect_eq "two modems, the second fails (failover): exit 1" "$ucli_rc" 1
 expect_eq "two modems, the second fails (failover): the first is closed again" "$(uholders)" "wlan0"
-expect_eq "two modems, the second fails (failover): only the second (it never changed) is left in the ledger" "$(uledger)" "cdc-wdm1"
+expect_eq "two modems, the second fails (failover): nothing is left in the ledger" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
 # the second modem's profile cannot be read (no active connection): the first is put back
 uscene gone ok ok
 usecond
@@ -1592,6 +1787,90 @@ ucli run
 expect_eq "a stale plain ledger.new is replaced, the run works" "$ucli_rc" 0
 expect_eq "a stale plain ledger.new: gone afterwards" "$([ -e "$ULD/ledger.new" ] && echo yes || echo no)" no
 expect_eq "a stale plain ledger.new: the ledger is written" "$(uledger)" "cdc-wdm0"
+
+# --- round 5: the live result. A modem opens only by activating its failover profile; Ethernet and
+# Wi-Fi are put back and then really checked ---------------------------------------------------------
+# cell-first needs a failover profile too: without one nothing is demoted
+uscene ok ok ok
+rm -f "$ULD/profiles"
+ucli cell-first
+expect_eq "cell-first without a failover profile: exit 1" "$ucli_rc" 1
+expect_contains "cell-first without a failover profile: says to run the install" "$ucli_out" "no failover profile is installed"
+expect_eq "cell-first without a failover profile: nothing was changed" "$(umods)" ""
+expect_eq "cell-first without a failover profile: Ethernet and Wi-Fi keep their routes" "$(uholders)" "eth0 wlan0"
+
+# a modem on its failover profile whose ledger line was lost is put back on the normal one
+uscene gone ok ok
+ucli run
+rm -f "$UW/ping_wlan0"
+unow 15
+ucli run
+unow 30
+ucli run
+expect_eq "lost line: setup, cellular is open" "$(uholders)" "wlan0 wwan0"
+echo ok >"$UW/ping_wlan0"
+rm -f "$ULD/ledger"
+unow 45
+ucli run
+expect_eq "lost line: a run that finds the modem on failover with no line writes it again" "$(uledger)" "cdc-wdm0"
+rm -f "$ULD/ledger"
+unow 60
+: >"$UW/calls"
+ucli run
+expect_eq "lost line: the modem is put back on its normal profile" "$(umods)" "cdc-wdm0 yes 1100;"
+expect_eq "lost line: only Wi-Fi holds a default again" "$(uholders)" "wlan0"
+
+# a modem that is already on its failover profile (a line lost, a run killed between the
+# two steps) with no default route is not activated again; it is put back
+uscene gone ok ok
+echo 00000005-0000-0000-0000-000000000000 >"$UW/uuid_cdc-wdm0"
+rm -f "$UW/ping_wlan0"
+ucli run
+unow 15
+ucli run
+expect_eq "already on failover with no route: exit 1" "$ucli_rc" 1
+expect_eq "already on failover with no route: the failover profile is not activated again" "$(umods)" "cdc-wdm0 yes 1100;"
+expect_eq "already on failover with no route: it is back on the normal profile" "$(cat "$UW/uuid_cdc-wdm0")" "00000003-0000-0000-0000-000000000000"
+
+# Wi-Fi and Ethernet: restoring by `device modify` is unmeasured. If the default route
+# does not come back, the device's own connection is re-activated and checked again
+uscene ok ok ok
+touch "$UW/demote_sets_nogw"
+ucli cell-first
+expect_eq "restore fallback: setup, demoted" "$(uholders)" "wwan0"
+: >"$UW/calls"
+ucli auto
+expect_eq "restore fallback: exit 0" "$ucli_rc" 0
+expect_contains "restore fallback: says it re-activates" "$ucli_out" "re-activating its connection"
+expect_eq "restore fallback: modify first, then the re-activation, per device; cellular last" "$(umods)" "eth0 no -1;eth0 up;wlan0 no -1;wlan0 up;cdc-wdm0 yes 1100;"
+expect_eq "restore fallback: Ethernet and Wi-Fi hold their defaults again" "$(uholders)" "eth0 wlan0"
+expect_eq "restore fallback: the ledger is empty" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
+expect_contains "restore fallback: the output names what came back only by re-activation" "$ucli_out" "came back only after re-activating its connection"
+# and if even that does not bring it back: the exact repair command, non-zero
+uscene ok ok ok
+touch "$UW/demote_sets_nogw"
+ucli cell-first
+touch "$UW/fail_up_00000001-0000-0000-0000-000000000000"
+ucli auto
+expect_eq "restore fails: exit 1" "$ucli_rc" 1
+expect_contains "restore fails: prints the exact repair command" "$ucli_out" "Repair by hand: nmcli connection up uuid 00000001-0000-0000-0000-000000000000 ifname eth0"
+expect_eq "restore fails: the line of that device is dropped (a re-activation resets the demotion; no loop)" "$(uledger | grep -c eth0 || true)" 0
+rm -f "$UW/fail_up_00000001-0000-0000-0000-000000000000"
+# a re-activation that takes but brings no route is not success either
+uscene ok ok ok
+touch "$UW/demote_sets_nogw"
+ucli cell-first
+touch "$UW/up_noroute_eth0"
+ucli auto
+expect_eq "restore with a useless re-activation: exit 1" "$ucli_rc" 1
+expect_contains "restore with a useless re-activation: prints the repair command" "$ucli_out" "Repair by hand: nmcli connection up uuid 00000001-0000-0000-0000-000000000000 ifname eth0"
+rm -f "$UW/up_noroute_eth0"
+# when the modify does bring the route back (the likely case), there is no re-activation
+uscene ok ok ok
+ucli cell-first
+: >"$UW/calls"
+ucli auto
+expect_eq "restore without fallback: no device is re-activated" "$(umods | grep -c ' up;' || true)" 0
 
 # --- status --json: the contract the tray builds against --------------------------------------------------
 uscene none ok ok
@@ -1726,6 +2005,7 @@ expect_contains "install: the timer runs every 15 seconds" "$steps" "OnUnitActiv
 expect_contains "install: a systemd user timer, enabled with --user" "$steps" "systemctl --user enable --now quectel-uplink.timer"
 expect_contains "install: the service runs uplink run from the copy" "$steps" "ExecStart=%h/.local/libexec/quectel-usbnet-uplink uplink run"
 expect_contains "install: a restore service runs uplink restore when the timer stops" "$steps" "ExecStop=%h/.local/libexec/quectel-usbnet-uplink uplink restore"
+expect_contains "install: the service has time for a modem activation" "$steps" "TimeoutStartSec=150"
 expect_contains "install: the restore service is tied to the timer" "$steps" "PartOf=quectel-uplink.timer"
 expect_contains "install: the timer pulls the restore service in" "$steps" "Wants=quectel-uplink-restore.service"
 expect_contains "install: says what a stop leaves behind and how it heals" "$steps" "What a stopped, crashed or killed manager leaves behind"
@@ -1755,8 +2035,18 @@ uopen
 : >"$UW/calls"
 out=$(run_install) || fail "install: the printed steps run" "$out"
 expect_eq "install steps: the two gsm profiles are closed, by uuid" \
-  "$(ucalls | grep 'connection modify' | sed 's/^nmcli LC_ALL=C --escape no //' | tr '\n' ';')" \
+  "$(ucalls | grep 'connection modify' | grep -v route-metric | sed 's/^nmcli LC_ALL=C --escape no //' | tr '\n' ';')" \
   "nmcli LC_ALL=C connection modify uuid bbbb-2222 ipv4.never-default yes ipv6.never-default yes;nmcli LC_ALL=C connection modify uuid dddd-4444 ipv4.never-default yes ipv6.never-default yes;"
+expect_eq "install steps: each modem profile got a failover clone, open, never autoconnecting, lowest priority" \
+  "$(ucalls | grep 'connection modify' | grep route-metric | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" \
+  "connection modify uuid f0f0-bbbb-2222 ipv4.never-default no ipv6.never-default no ipv4.route-metric 50 ipv6.route-metric 50 connection.autoconnect no connection.autoconnect-priority -999;connection modify uuid f0f0-dddd-4444 ipv4.never-default no ipv6.never-default no ipv4.route-metric 50 ipv6.route-metric 50 connection.autoconnect no connection.autoconnect-priority -999;"
+expect_eq "install steps: the clones are cloned from the right profiles with the fixed name" \
+  "$(ucalls | grep 'connection clone' | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" \
+  "connection clone uuid bbbb-2222 Profile bbbb-2222 (quectel-usbnet failover);connection clone uuid dddd-4444 Profile dddd-4444 (quectel-usbnet failover);"
+expect_eq "install steps: the failover profile never autoconnects" "$(cat "$UW/ac_f0f0-bbbb-2222")" no
+expect_eq "install steps: the profiles file pairs each modem profile with its failover" "$(cat "$inst_home/state/quectel-usbnet/profiles")" "bbbb-2222 f0f0-bbbb-2222
+dddd-4444 f0f0-dddd-4444"
+expect_eq "install steps: the profiles file is private" "$(stat -c %a "$inst_home/state/quectel-usbnet/profiles")" 600
 expect_eq "install steps: no other profile is touched" "$(ucalls | grep 'connection modify' | grep -c -e aaaa -e cccc || true)" 0
 expect_eq "install steps: the copy is executable" "$(stat -c %a "$inst_home/.local/libexec/quectel-usbnet-uplink")" 755
 expect_eq "install steps: the copy is the script" "$(sed -n 2p "$inst_home/.local/libexec/quectel-usbnet-uplink")" "# quectel-usbnet: read or change the USB network mode of a Quectel modem."
@@ -1790,6 +2080,11 @@ fresh_home() {
   rm -rf "$inst_home"
   mkdir -p "$unit_dir" "$inst_home/.local/libexec" "$tmp/target_dir"
   echo victim >"$tmp/target_dir/victim"
+  # the world forgets the failover profiles an earlier install made
+  rm -f "$UW"/*f0f0-*
+  grep -v 'f0f0-' "$UW/connections" >"$UW/connections.new" || true
+  mv "$UW/connections.new" "$UW/connections"
+  : >"$UW/connnames"
 }
 fresh_home
 echo "[Unit]" >"$unit_dir/quectel-uplink.service"
@@ -1849,7 +2144,7 @@ mkdir -p "$inst_home/state/quectel-usbnet"
 chmod 700 "$inst_home/state/quectel-usbnet"
 : >"$UW/calls"
 out=$(run_install) || fail "install: a private state directory is accepted" "$out"
-expect_eq "install: with everything in order, the profiles are closed" "$(ucalls | grep -c 'connection modify' || true)" 2
+expect_eq "install: with everything in order, the profiles are closed" "$(ucalls | grep 'connection modify' | grep -vc route-metric || true)" 2
 
 # M3: closing the profiles is all or nothing, and nothing is installed after a failure
 printf 'bbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
@@ -1894,7 +2189,7 @@ touch "$UW/fail_conmod_dddd-4444"
 if out=$(run_install); then fail "install: a failure on the second profile stops the steps"; else ok "install: a failure on the second profile stops the steps"; fi
 expect_contains "install: a failure on the second profile says it puts the first back" "$out" "putting back the ones already closed"
 expect_eq "install: the profile calls are close one, close two (fails), put one back" \
-  "$(ucalls | grep 'connection modify' | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" \
+  "$(ucalls | grep 'connection modify' | grep -v route-metric | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" \
   "connection modify uuid bbbb-2222 ipv4.never-default yes ipv6.never-default yes;connection modify uuid dddd-4444 ipv4.never-default yes ipv6.never-default yes;connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes;"
 expect_eq "install: the first profile has exactly its old values again" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
 expect_eq "install: the second profile was never changed" "$(head -n 2 "$UW/prof_dddd-4444" | tr '\n' ' ')" "yes no "
@@ -1929,6 +2224,82 @@ out=$(run_install) || fail "install: with nothing failing, both profiles are clo
 expect_eq "install: both profiles are closed" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')$(head -n 2 "$UW/prof_dddd-4444" | tr '\n' ' ')" "yes yes yes yes "
 expect_eq "install: and it is installed" "$(nothing_installed && echo no || echo yes)" yes
 printf 'aaaa-1111:802-3-ethernet\nbbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
+
+# The failover profiles: made by cloning, only where there is none, undone as one step.
+printf 'bbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+# a profile already has the failover name and the state file does not pair it with ours: foreign
+fresh_home
+echo "ffff-0001:Profile bbbb-2222 (quectel-usbnet failover)" >"$UW/connnames"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a foreign profile with the failover name stops the steps"; else ok "install: a foreign profile with the failover name stops the steps"; fi
+expect_contains "install: a foreign profile with the failover name is named" "$out" "was not made by quectel-usbnet; nothing was changed"
+expect_eq "install: a foreign profile with the failover name: nothing cloned, nothing modified" "$(ucalls | grep -c -e 'connection clone' -e 'connection modify' || true)" 0
+expect_eq "install: a foreign profile with the failover name: nothing installed" "$(nothing_installed && echo yes || echo no)" yes
+# two profiles of that name: also refused
+fresh_home
+printf 'ffff-0001:Profile bbbb-2222 (quectel-usbnet failover)\nffff-0002:Profile bbbb-2222 (quectel-usbnet failover)\n' >"$UW/connnames"
+if out=$(run_install); then fail "install: two profiles with the failover name stop the steps"; else ok "install: two profiles with the failover name stop the steps"; fi
+expect_contains "install: two profiles with the failover name are named" "$out" "more than one profile is named"
+# a clone that cannot be made
+fresh_home
+touch "$UW/fail_clone"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a failed clone stops the steps"; else ok "install: a failed clone stops the steps"; fi
+expect_contains "install: a failed clone says so" "$out" "could not create the failover profile for bbbb-2222; undoing"
+expect_eq "install: a failed clone: no profile is modified" "$(ucalls | grep -c 'connection modify' || true)" 0
+expect_eq "install: a failed clone: nothing installed" "$(nothing_installed && echo yes || echo no)" yes
+rm -f "$UW/fail_clone"
+# the second clone fails: the first one is deleted again
+fresh_home
+touch "$UW/fail_clone_dddd-4444"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a failed second clone stops the steps"; else ok "install: a failed second clone stops the steps"; fi
+expect_contains "install: a failed second clone deletes the first clone" "$(ucalls)" "connection delete uuid f0f0-bbbb-2222"
+expect_eq "install: a failed second clone: the first clone is gone from the world" "$(grep -c 'f0f0-' "$UW/connections" || true)" 0
+expect_eq "install: a failed second clone: no normal profile was closed" "$(ucalls | grep 'connection modify' | grep -vc route-metric || true)" 0
+expect_eq "install: a failed second clone: no profiles file" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo yes || echo no)" no
+rm -f "$UW/fail_clone_dddd-4444"
+# the clone cannot be set up
+fresh_home
+touch "$UW/fail_conmod_f0f0-bbbb-2222"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a failover profile that cannot be set up stops the steps"; else ok "install: a failover profile that cannot be set up stops the steps"; fi
+expect_contains "install: the failover profile that cannot be set up is deleted" "$(ucalls)" "connection delete uuid f0f0-bbbb-2222"
+expect_eq "install: the failover profile that cannot be set up: no normal profile was closed" "$(ucalls | grep 'connection modify' | grep -vc route-metric || true)" 0
+rm -f "$UW/fail_conmod_f0f0-bbbb-2222"
+# closing the second normal profile fails: the first is put back and both clones are deleted
+fresh_home
+touch "$UW/fail_conmod_dddd-4444"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a failed close deletes the clones"; else ok "install: a failed close deletes the clones"; fi
+expect_contains "install: a failed close deletes the first clone" "$(ucalls)" "connection delete uuid f0f0-bbbb-2222"
+expect_contains "install: a failed close deletes the second clone" "$(ucalls)" "connection delete uuid f0f0-dddd-4444"
+expect_eq "install: a failed close: no clone is left" "$(grep -c 'f0f0-' "$UW/connections" || true)" 0
+expect_eq "install: a failed close: the first profile has its old values" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
+expect_eq "install: a failed close: no profiles file" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo yes || echo no)" no
+# and a delete that cannot be done is on the repair list with its exact command
+fresh_home
+touch "$UW/fail_condel_f0f0-bbbb-2222"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a clone that cannot be deleted stops the steps"; else ok "install: a clone that cannot be deleted stops the steps"; fi
+expect_contains "install: a clone that cannot be deleted is on the repair list" "$out" "nmcli connection delete uuid f0f0-bbbb-2222"
+expect_contains "install: and the repair banner is printed" "$out" "REPAIR NEEDED"
+expect_eq "install: the clone that could be deleted is not on the list" "$(printf '%s' "$out" | grep -c 'delete uuid f0f0-dddd-4444' || true)" 0
+rm -f "$UW/fail_conmod_dddd-4444" "$UW/fail_condel_f0f0-bbbb-2222"
+# a second install reuses its own failover profiles and clones nothing
+fresh_home
+printf 'bbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+out=$(run_install) || fail "install: the first install" "$out"
+: >"$UW/calls"
+out=$(run_install) || fail "install: a second install" "$out"
+expect_eq "install: a second install clones nothing" "$(ucalls | grep -c 'connection clone' || true)" 0
+expect_eq "install: a second install does not mistake its own failover profiles for modem profiles" "$(ucalls | grep 'connection modify' | grep -vc route-metric || true)" 2
+expect_eq "install: a second install keeps the pairs" "$(wc -l <"$inst_home/state/quectel-usbnet/profiles")" 2
+expect_eq "install: a second install keeps the failover profiles open" "$(head -n 2 "$UW/prof_f0f0-bbbb-2222" | tr '\n' ' ')" "no no "
 
 # a tool whose path would break a unit file is refused
 mkdir -p "$tmp/odd dir"
@@ -2022,6 +2393,39 @@ expect_eq "uninstall: that ledger is kept" "$([ -e "$inst_home/state/quectel-usb
 rm -f "$inst_home/state/quectel-usbnet/ledger"
 rmdir "$inst_home/state/quectel-usbnet"
 expect_contains "uninstall: the printed block is valid bash" "$(bash -n "$tmp/uninstall_block.sh" 2>&1 && echo syntax-ok)" syntax-ok
+
+# the failover profiles at uninstall: only the ones the install made, and a failed delete stops everything
+fresh_home
+uscene ok ok ok
+printf '00000003-0000-0000-0000-000000000000:gsm\n' >"$UW/connections"
+out=$(run_install) || fail "install: for the failover uninstall test" "$out"
+expect_eq "uninstall setup: the failover profile exists" "$(grep -c 'f0f0-00000003' "$UW/connections" || true)" 1
+echo "cccc-3333 cccc-3333" >>"$inst_home/state/quectel-usbnet/profiles"
+printf 'cccc-3333:Profile cccc-3333\n' >>"$UW/connnames"
+touch "$UW/fail_condel_f0f0-00000003-0000-0000-0000-000000000000"
+if out=$(run_uninstall); then fail "uninstall: a failed profile delete stops the steps"; else ok "uninstall: a failed profile delete stops the steps"; fi
+expect_contains "uninstall: a failed profile delete says how to delete it" "$out" "nmcli connection delete uuid f0f0-00000003-0000-0000-0000-000000000000"
+expect_eq "uninstall: a failed profile delete removes nothing else" "$([ -e "$unit_dir/quectel-uplink.timer" ] && [ -e "$inst_home/.local/libexec/quectel-usbnet-uplink" ] && echo kept || echo removed)" kept
+rm -f "$UW/fail_condel_f0f0-00000003-0000-0000-0000-000000000000"
+: >"$UW/calls"
+out=$(run_uninstall) || fail "uninstall: the failover profiles go" "$out"
+expect_contains "uninstall: says it deleted the failover profile" "$out" "deleted failover profile f0f0-00000003-0000-0000-0000-000000000000"
+expect_eq "uninstall: the failover profile is gone" "$(grep -c 'f0f0-00000003' "$UW/connections" || true)" 0
+expect_contains "uninstall: a listed profile whose name is not a failover name is left" "$out" "left profile cccc-3333"
+expect_eq "uninstall: and never deleted" "$(ucalls | grep -c 'delete uuid cccc-3333' || true)" 0
+expect_eq "uninstall: the normal modem profile is never deleted" "$(ucalls | grep -c 'delete uuid 00000003' || true)" 0
+expect_eq "uninstall: the pairs file is removed" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo yes || echo no)" no
+expect_eq "uninstall: the units are removed" "$([ -e "$unit_dir/quectel-uplink.timer" ] && echo kept || echo removed)" removed
+# a symlinked pairs file is refused, nothing is deleted through it
+fresh_home
+mkdir -p "$inst_home/state/quectel-usbnet"
+chmod 700 "$inst_home/state/quectel-usbnet"
+echo "00000003-0000-0000-0000-000000000000 f0f0-00000003-0000-0000-0000-000000000000" >"$tmp/target_dir/pairs"
+ln -s "$tmp/target_dir/pairs" "$inst_home/state/quectel-usbnet/profiles"
+: >"$UW/calls"
+if out=$(run_uninstall); then fail "uninstall: a symlinked pairs file stops the steps"; else ok "uninstall: a symlinked pairs file stops the steps"; fi
+expect_eq "uninstall: a symlinked pairs file: nothing is deleted" "$(ucalls | grep -c 'connection delete' || true)" 0
+expect_eq "uninstall: a symlinked pairs file: its target is intact" "$(wc -l <"$tmp/target_dir/pairs")" 1
 
 # guard-uninstall: printed only, marker-checked, and valid bash
 gsteps=$("$TOOL" guard-uninstall 2>&1)
