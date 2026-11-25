@@ -3143,6 +3143,9 @@ tmpfiles=()
 madedirs=()
 tried_enable=0
 ranfirst=0
+# the timer as it is before this run touches anything: undone to exactly that
+was_enabled=\$(systemctl --user is-enabled $UPLINK_UNIT.timer 2>/dev/null || true)
+was_active=\$(systemctl --user is-active $UPLINK_UNIT.timer 2>/dev/null || true)
 # stash FILE: remember what is there before it is replaced (a copy to put back, or
 # that it was not there at all)
 stash() {
@@ -3164,8 +3167,14 @@ mkdir_ours() {
 undo() {
   local j f rec
   if [ "\$tried_enable" = 1 ]; then
-    systemctl --user disable --now $UPLINK_UNIT.timer || systemctl --user disable --now $UPLINK_UNIT.timer ||
-      repair+=("timer: systemctl --user disable --now $UPLINK_UNIT.timer")
+    if [ "\$was_enabled" = enabled ]; then
+      # it was enabled before this run: stop it while this is undone, put it back below
+      systemctl --user stop $UPLINK_UNIT.timer || systemctl --user stop $UPLINK_UNIT.timer ||
+        repair+=("timer: systemctl --user stop $UPLINK_UNIT.timer")
+    else
+      systemctl --user disable --now $UPLINK_UNIT.timer || systemctl --user disable --now $UPLINK_UNIT.timer ||
+        repair+=("timer: systemctl --user disable --now $UPLINK_UNIT.timer")
+    fi
   fi
   if [ "\$ranfirst" = 1 ] && [ -x "\$dest" ]; then
     "\$dest" uplink restore || "\$dest" uplink restore ||
@@ -3179,6 +3188,14 @@ undo() {
     rm -f -- "\$f" || repair+=("file \$f: rm -f -- \$f")
   done
   if [ "\$tried_enable" = 1 ]; then systemctl --user daemon-reload || true; fi
+  if [ "\$tried_enable" = 1 ] && [ "\$was_enabled" = enabled ]; then
+    systemctl --user enable $UPLINK_UNIT.timer || systemctl --user enable $UPLINK_UNIT.timer ||
+      repair+=("timer: systemctl --user enable $UPLINK_UNIT.timer")
+    if [ "\$was_active" = active ]; then
+      systemctl --user start $UPLINK_UNIT.timer || systemctl --user start $UPLINK_UNIT.timer ||
+        repair+=("timer: systemctl --user start $UPLINK_UNIT.timer")
+    fi
+  fi
   for ((j = 0; j < closed; j++)); do
     set -- \${prev[\$j]}
     nmc connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
@@ -3234,8 +3251,10 @@ done
 
 # 1b. Close the normal profiles.
 for i in "\${!gsm[@]}"; do
+  # counted before the call: a modify that applies one family and then fails must be
+  # put back with the ones already done
+  closed=\$((i + 1))
   if nmc connection modify uuid "\${gsm[\$i]}" ipv4.never-default yes ipv6.never-default yes; then
-    closed=\$((i + 1))
     echo "closed profile \${gsm[\$i]}"
   else
     fail "could not close profile \${gsm[\$i]}; putting back the ones already closed"
@@ -3364,21 +3383,35 @@ if ! pairs_load "\$statedir/profiles"; then
   echo "refusing to delete anything: \$statedir/profiles is not a valid pairs file (see above)" >&2
   exit 1
 fi
+if [ "\${#pair_f[@]}" -gt 0 ]; then
+  allnames=\$(LC_ALL=C $qnm --escape no -t -f UUID,NAME connection show) || {
+    echo "cannot list the connection profiles; nothing was removed. Run these steps again when NetworkManager answers." >&2
+    exit 1
+  }
+fi
 for i in "\${!pair_f[@]}"; do
   pf=\${pair_f[\$i]}
-  if pname=\$(LC_ALL=C $qnm --escape no -g connection.id connection show uuid "\$pf" 2>/dev/null); then
-    case \$pname in
-      *"\$fosuffix")
-        if LC_ALL=C $qnm connection delete uuid "\$pf"; then
-          echo "deleted failover profile \$pf"
-        else
-          echo "could not delete failover profile \$pf; nothing else was removed. Delete it by hand: nmcli connection delete uuid \$pf" >&2
-          exit 1
-        fi
-        ;;
-      *) echo "left profile \$pf: its name is not a failover name" ;;
-    esac
+  # only a profile that is not in the list is already gone; a profile that is listed
+  # but cannot be read is NOT "nothing to delete"
+  if ! printf '%s\n' "\$allnames" | grep -q "^\$pf:"; then
+    echo "failover profile \$pf is already gone"
+    continue
   fi
+  if ! pname=\$(LC_ALL=C $qnm --escape no -g connection.id connection show uuid "\$pf"); then
+    echo "cannot read failover profile \$pf; nothing was removed (the pairs file and the manager are kept). Run these steps again, or delete it by hand: nmcli connection delete uuid \$pf" >&2
+    exit 1
+  fi
+  case \$pname in
+    *"\$fosuffix")
+      if LC_ALL=C $qnm connection delete uuid "\$pf"; then
+        echo "deleted failover profile \$pf"
+      else
+        echo "could not delete failover profile \$pf; nothing else was removed. Delete it by hand: nmcli connection delete uuid \$pf" >&2
+        exit 1
+      fi
+      ;;
+    *) echo "left profile \$pf: its name is not a failover name" ;;
+  esac
 done
 rm -f -- "\$statedir/profiles"
 
@@ -3404,6 +3437,15 @@ if [ -n "\${XDG_RUNTIME_DIR:-}" ] && [ -d "\$XDG_RUNTIME_DIR/quectel-usbnet" ] &
   rm -f -- "\$XDG_RUNTIME_DIR/quectel-usbnet/mode" "\$XDG_RUNTIME_DIR/quectel-usbnet/mode.new" \\
     "\$XDG_RUNTIME_DIR/quectel-usbnet/links" "\$XDG_RUNTIME_DIR/quectel-usbnet/links.new" \\
     "\$XDG_RUNTIME_DIR/quectel-usbnet/lock"
+  # the fallback-wait markers: exactly fallback.<device>, plain files only
+  for m in "\$XDG_RUNTIME_DIR/quectel-usbnet"/fallback.*; do
+    [ -e "\$m" ] || [ -L "\$m" ] || continue
+    if [ ! -L "\$m" ] && [ -f "\$m" ] && [[ \${m##*/} =~ ^fallback\.[A-Za-z0-9_.@-]{1,15}\$ ]]; then
+      rm -f -- "\$m"
+    else
+      echo "left \$m: not a fallback marker this tool writes"
+    fi
+  done
   rmdir -- "\$XDG_RUNTIME_DIR/quectel-usbnet" 2>/dev/null || true
 fi
 if [ -d "\$statedir" ] && [ ! -L "\$statedir" ]; then

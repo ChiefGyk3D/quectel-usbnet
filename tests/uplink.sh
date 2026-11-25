@@ -156,6 +156,11 @@ case "$1 $2 $3 $4" in
     ;;
   "connection modify uuid "*)
     [ ! -f "$UW/fail_conmod_$4" ] || { echo "Error: modify failed" >&2; exit 1; }
+    # fail_conclose_UUID: closing this profile (never-default yes on both) fails
+    if [ -f "$UW/fail_conclose_$4" ] && [ "$6$8" = yesyes ]; then
+      echo "Error: modify failed" >&2
+      exit 1
+    fi
     # fail_conrestore_UUID: putting a profile back (anything but yes/yes) fails;
     # fail_conrestore_once_UUID: the first such attempt fails, the retry works
     if [ "$6$8" != yesyes ]; then
@@ -167,6 +172,15 @@ case "$1 $2 $3 $4" in
       fi
     fi
     u=$4
+    # partial_conmod_UUID: closing this profile applies IPv4 and then fails on IPv6
+    if [ -f "$UW/partial_conmod_$u" ] && [ "$5" = ipv4.never-default ] && [ "$6$8" = yesyes ]; then
+      mapfile -t pv <"$UW/prof_$u"
+      pv[0]=yes
+      printf '%s\n' "${pv[@]}" >"$UW/prof_$u.new"
+      mv "$UW/prof_$u.new" "$UW/prof_$u"
+      echo "Error: ipv6.never-default: could not be set" >&2
+      exit 1
+    fi
     shift 4
     if [ -f "$UW/prof_$u" ]; then
       mapfile -t pv <"$UW/prof_$u"
@@ -2111,10 +2125,31 @@ mkdir -p "$tmp/sbin_fake"
 cat >"$tmp/sbin_fake/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 echo "systemctl $*" >>"$UW/calls"
+# the timer's state is kept in sc_enabled and sc_active
 case "$*" in
   *daemon-reload*) [ ! -f "$UW/fail_sc_reload" ] || exit 1 ;;
-  *enable*) [ ! -f "$UW/fail_sc_enable" ] || exit 1 ;;
-  *disable*) [ ! -f "$UW/fail_sc_disable" ] || exit 1 ;;
+  *is-enabled*)
+    if [ -f "$UW/sc_enabled" ]; then echo enabled; else echo disabled; exit 1; fi
+    ;;
+  *is-active*)
+    if [ -f "$UW/sc_active" ]; then echo active; else echo inactive; exit 1; fi
+    ;;
+  *"enable --now"*)
+    [ ! -f "$UW/fail_sc_enable" ] || exit 1
+    touch "$UW/sc_enabled" "$UW/sc_active"
+    # fail_sc_enable_after: the timer is enabled and started, and the command still fails
+    [ ! -f "$UW/fail_sc_enable_after" ] || exit 1
+    ;;
+  *"--user enable "*)
+    [ ! -f "$UW/fail_sc_enable" ] || exit 1
+    touch "$UW/sc_enabled"
+    ;;
+  *disable*)
+    [ ! -f "$UW/fail_sc_disable" ] || exit 1
+    rm -f "$UW/sc_enabled" "$UW/sc_active"
+    ;;
+  *"--user start "*) touch "$UW/sc_active" ;;
+  *"--user stop "*) rm -f "$UW/sc_active" ;;
 esac
 FAKE
 chmod +x "$tmp/sbin_fake/systemctl"
@@ -2182,6 +2217,7 @@ conflict() {
 }
 fresh_home() {
   rm -rf "$inst_home"
+  rm -f "$UW/sc_enabled" "$UW/sc_active" # the timer is not enabled or running
   mkdir -p "$unit_dir" "$inst_home/.local/libexec" "$tmp/target_dir"
   echo victim >"$tmp/target_dir/victim"
   # the world forgets the failover profiles an earlier install made
@@ -2288,30 +2324,30 @@ expect_contains "install: odd previous values are named" "$out" "unexpected valu
 expect_eq "install: odd previous values: nothing modified, not even the first" "$(ucalls | grep -c 'connection modify' || true)" 0
 printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
 fresh_home
-touch "$UW/fail_conmod_dddd-4444"
+touch "$UW/fail_conclose_dddd-4444"
 : >"$UW/calls"
 if out=$(run_install); then fail "install: a failure on the second profile stops the steps"; else ok "install: a failure on the second profile stops the steps"; fi
 expect_contains "install: a failure on the second profile says it puts the first back" "$out" "putting back the ones already closed"
-expect_eq "install: the profile calls are close one, close two (fails), put one back" \
+expect_eq "install: the profile calls are close one, close two (fails), put both back (the one that failed too: it may be half applied)" \
   "$(ucalls | grep 'connection modify' | grep -v route-metric | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" \
-  "connection modify uuid bbbb-2222 ipv4.never-default yes ipv6.never-default yes;connection modify uuid dddd-4444 ipv4.never-default yes ipv6.never-default yes;connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes;"
+  "connection modify uuid bbbb-2222 ipv4.never-default yes ipv6.never-default yes;connection modify uuid dddd-4444 ipv4.never-default yes ipv6.never-default yes;connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes;connection modify uuid dddd-4444 ipv4.never-default yes ipv6.never-default no;"
 expect_eq "install: the first profile has exactly its old values again" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
 expect_eq "install: the second profile was never changed" "$(head -n 2 "$UW/prof_dddd-4444" | tr '\n' ' ')" "yes no "
 expect_eq "install: nothing is installed after the failure" "$(nothing_installed && echo yes || echo no)" yes
-rm -f "$UW/fail_conmod_dddd-4444"
+rm -f "$UW/fail_conclose_dddd-4444"
 # M-b: the put-back is retried once
 fresh_home
-touch "$UW/fail_conmod_dddd-4444" "$UW/fail_conrestore_once_bbbb-2222"
+touch "$UW/fail_conclose_dddd-4444" "$UW/fail_conrestore_once_bbbb-2222"
 : >"$UW/calls"
 if out=$(run_install); then fail "install: a failed close with a flaky put-back stops the steps"; else ok "install: a failed close with a flaky put-back stops the steps"; fi
 expect_eq "install: the put-back is tried a second time" "$(ucalls | grep -c 'connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes' || true)" 2
 expect_eq "install: and then the first profile has its old values" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
 expect_eq "install: no repair list when the retry works" "$(printf '%s' "$out" | grep -c 'REPAIR NEEDED' || true)" 0
-rm -f "$UW/fail_conmod_dddd-4444"
+rm -f "$UW/fail_conclose_dddd-4444"
 # M-b: the put-back fails twice: an explicit repair list, non-zero, nothing installed
 fresh_home
 printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
-touch "$UW/fail_conmod_dddd-4444" "$UW/fail_conrestore_bbbb-2222"
+touch "$UW/fail_conclose_dddd-4444" "$UW/fail_conrestore_bbbb-2222"
 : >"$UW/calls"
 if out=$(run_install); then fail "install: a put-back that cannot be done stops the steps"; else ok "install: a put-back that cannot be done stops the steps"; fi
 expect_contains "install: it says repair is needed" "$out" "REPAIR NEEDED"
@@ -2320,7 +2356,7 @@ expect_eq "install: the profile that was put back or never closed is not on the 
 expect_eq "install: the put-back was tried twice" "$(ucalls | grep -c 'connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes' || true)" 2
 expect_eq "install: nothing is installed" "$(nothing_installed && echo yes || echo no)" yes
 expect_eq "install: the profile really is still closed (that is what the list is for)" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "yes yes "
-rm -f "$UW/fail_conmod_dddd-4444" "$UW/fail_conrestore_bbbb-2222"
+rm -f "$UW/fail_conclose_dddd-4444" "$UW/fail_conrestore_bbbb-2222"
 printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
 fresh_home
 : >"$UW/calls"
@@ -2375,7 +2411,7 @@ expect_eq "install: the failover profile that cannot be set up: no normal profil
 rm -f "$UW/fail_conmod_f0f0-bbbb-2222"
 # closing the second normal profile fails: the first is put back and both clones are deleted
 fresh_home
-touch "$UW/fail_conmod_dddd-4444"
+touch "$UW/fail_conclose_dddd-4444"
 : >"$UW/calls"
 if out=$(run_install); then fail "install: a failed close deletes the clones"; else ok "install: a failed close deletes the clones"; fi
 expect_contains "install: a failed close deletes the first clone" "$(ucalls)" "connection delete uuid f0f0-bbbb-2222"
@@ -2391,7 +2427,7 @@ if out=$(run_install); then fail "install: a clone that cannot be deleted stops 
 expect_contains "install: a clone that cannot be deleted is on the repair list" "$out" "nmcli connection delete uuid f0f0-bbbb-2222"
 expect_contains "install: and the repair banner is printed" "$out" "REPAIR NEEDED"
 expect_eq "install: the clone that could be deleted is not on the list" "$(printf '%s' "$out" | grep -c 'delete uuid f0f0-dddd-4444' || true)" 0
-rm -f "$UW/fail_conmod_dddd-4444" "$UW/fail_condel_f0f0-bbbb-2222"
+rm -f "$UW/fail_conclose_dddd-4444" "$UW/fail_condel_f0f0-bbbb-2222"
 # a second install reuses its own failover profiles and clones nothing
 fresh_home
 printf 'bbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
@@ -2429,6 +2465,8 @@ for seam in fail_sc_reload fail_sc_enable fail_ip4 fail_mv; do
   else
     expect_eq "install ($seam): no restore is run before the first evaluation" "$(printf '%s' "$out" | grep -c 'nothing to restore' || true)" 0
   fi
+  expect_eq "install ($seam): the timer is not left enabled" "$([ -e "$UW/sc_enabled" ] && echo yes || echo no)" no
+  expect_eq "install ($seam): the timer is not left running" "$([ -e "$UW/sc_active" ] && echo yes || echo no)" no
   if [ "$seam" = fail_sc_reload ] || [ "$seam" = fail_mv ]; then
     expect_eq "install ($seam): the timer was never enabled, so it is not disabled" "$(ucalls | grep -c 'systemctl --user disable' || true)" 0
   else
@@ -2436,6 +2474,58 @@ for seam in fail_sc_reload fail_sc_enable fail_ip4 fail_mv; do
   fi
 done
 expect_eq "install: a failed install leaves no state directory it made" "$([ -e "$inst_home/state/quectel-usbnet" ] && echo yes || echo no)" no
+# a close that applies IPv4 and then fails on IPv6 is put back with the rest
+fresh_home
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+touch "$UW/partial_conmod_bbbb-2222"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a half-applied close stops the steps"; else ok "install: a half-applied close stops the steps"; fi
+rm -f "$UW/partial_conmod_bbbb-2222"
+expect_eq "install: a half-applied close: the profile has its recorded values again" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
+expect_eq "install: a half-applied close: no repair is needed" "$(printf '%s' "$out" | grep -c 'REPAIR NEEDED' || true)" 0
+expect_eq "install: a half-applied close: nothing is left" "$(files_left)" 0
+# the same on the second profile: the first is put back too
+fresh_home
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'no\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+touch "$UW/partial_conmod_dddd-4444"
+if out=$(run_install); then fail "install: a half-applied close on the second profile stops the steps"; else ok "install: a half-applied close on the second profile stops the steps"; fi
+rm -f "$UW/partial_conmod_dddd-4444"
+expect_eq "install: a half-applied close on the second profile: the first has its values" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
+expect_eq "install: a half-applied close on the second profile: the second has its values" "$(head -n 2 "$UW/prof_dddd-4444" | tr '\n' ' ')" "no no "
+
+# The timer is put back to exactly what it was: a failed re-install of a working install
+# leaves it enabled and running; one that was enabled but stopped stays stopped
+fresh_home
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+out=$(run_install) || fail "install: a working install, for the timer tests" "$out"
+expect_eq "timer: the working install enabled and started it" "$([ -e "$UW/sc_enabled" ] && [ -e "$UW/sc_active" ] && echo yes || echo no)" yes
+for seam in fail_sc_enable_after fail_ip4; do
+  touch "$UW/$seam"
+  : >"$UW/calls"
+  if out=$(run_install); then fail "timer ($seam): a failed re-install stops the steps"; else ok "timer ($seam): a failed re-install stops the steps"; fi
+  rm -f "$UW/$seam"
+  expect_eq "timer ($seam): it is still enabled" "$([ -e "$UW/sc_enabled" ] && echo yes || echo no)" yes
+  expect_eq "timer ($seam): and still running" "$([ -e "$UW/sc_active" ] && echo yes || echo no)" yes
+  expect_eq "timer ($seam): a timer that was enabled before is never disabled" "$(ucalls | grep -c 'systemctl --user disable' || true)" 0
+  expect_eq "timer ($seam): no repair is needed" "$(printf '%s' "$out" | grep -c 'REPAIR NEEDED' || true)" 0
+done
+rm -f "$UW/sc_active"
+touch "$UW/fail_sc_enable_after"
+if out=$(run_install); then fail "timer: a failed re-install of an enabled but stopped timer stops the steps"; else ok "timer: a failed re-install of an enabled but stopped timer stops the steps"; fi
+rm -f "$UW/fail_sc_enable_after"
+expect_eq "timer: enabled and stopped before, enabled after" "$([ -e "$UW/sc_enabled" ] && echo yes || echo no)" yes
+expect_eq "timer: enabled and stopped before, still stopped after" "$([ -e "$UW/sc_active" ] && echo yes || echo no)" no
+# an enable that cannot be put back goes on the repair list
+touch "$UW/sc_enabled" "$UW/sc_active"
+touch "$UW/fail_sc_enable_after"
+: >"$UW/calls"
+if out=$(run_install); then fail "timer: a failed re-install"; else ok "timer: a failed re-install"; fi
+rm -f "$UW/fail_sc_enable_after"
+expect_eq "timer: it is started again with the same two commands" "$(ucalls | grep -c -e 'systemctl --user enable quectel-uplink.timer' -e 'systemctl --user start quectel-uplink.timer' || true)" 2
+
 # an undo step that fails goes on the repair list with its command
 fresh_home
 printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
@@ -2458,10 +2548,10 @@ printf 'no\nno\n900\n900\n' >"$UW/prof_f0f0-bbbb-2222"
 echo 7 >"$UW/pri_f0f0-bbbb-2222"
 pairs_before=$(cat "$inst_home/state/quectel-usbnet/profiles")
 copy_before=$(cksum <"$inst_home/.local/libexec/quectel-usbnet-uplink")
-touch "$UW/fail_conmod_dddd-4444"
+touch "$UW/fail_conclose_dddd-4444"
 : >"$UW/calls"
 if out=$(run_install); then fail "install: a re-install whose later close fails stops"; else ok "install: a re-install whose later close fails stops"; fi
-rm -f "$UW/fail_conmod_dddd-4444"
+rm -f "$UW/fail_conclose_dddd-4444"
 expect_eq "re-install: the existing failover profile has its old autoconnect again" "$(cat "$UW/ac_f0f0-bbbb-2222")" yes
 expect_eq "re-install: and its old route metrics and never-default" "$(head -n 4 "$UW/prof_f0f0-bbbb-2222" | tr '\n' ' ')" "no no 900 900 "
 expect_eq "re-install: and its old autoconnect priority" "$(cat "$UW/pri_f0f0-bbbb-2222")" 7
@@ -2557,7 +2647,7 @@ expect_eq "uninstall: a foreign file with our name is left" "$(cat "$unit_dir/qu
 expect_contains "uninstall: and says so" "$out" "left"
 # the runtime state is removed by exact name
 mkdir -p "$tmp/xdg_u/quectel-usbnet"
-touch "$tmp/xdg_u/quectel-usbnet/mode" "$tmp/xdg_u/quectel-usbnet/links" "$tmp/xdg_u/quectel-usbnet/lock" "$tmp/xdg_u/quectel-usbnet/keepme"
+touch "$tmp/xdg_u/quectel-usbnet/mode" "$tmp/xdg_u/quectel-usbnet/links" "$tmp/xdg_u/quectel-usbnet/lock" "$tmp/xdg_u/quectel-usbnet/keepme" "$tmp/xdg_u/quectel-usbnet/fallback.eth0" "$tmp/xdg_u/quectel-usbnet/fallback.wlp113s0"
 out=$(run_uninstall) || true
 expect_eq "uninstall: the state files are removed" "$(find "$tmp/xdg_u/quectel-usbnet" -mindepth 1 | tr '\n' ' ')" "$tmp/xdg_u/quectel-usbnet/keepme "
 # the leftovers of an interrupted ledger write go too, and the empty state directory with them
@@ -2607,6 +2697,7 @@ expect_eq "uninstall: the units are removed" "$([ -e "$unit_dir/quectel-uplink.t
 fresh_home
 echo "Somebody (quectel-usbnet failover)" >"$UW/name_aaaaaaaa-0000"
 echo "Somebody Else (quectel-usbnet failover)" >"$UW/name_bbbbbbbb-0000"
+printf 'aaaaaaaa-0000:Somebody (quectel-usbnet failover)\nbbbbbbbb-0000:Somebody Else (quectel-usbnet failover)\n' >"$UW/connnames"
 mkdir -p "$inst_home/state/quectel-usbnet"
 chmod 700 "$inst_home/state/quectel-usbnet"
 for bad in "garbage aaaaaaaa-0000 arbitrary extra text" "11111111 aaaaaaaa-0000 extra" "11111111-0000 aaaaaaaa-0000\n11111111-0000 bbbbbbbb-0000" "11111111-0000 aaaaaaaa-0000\n22222222-0000 aaaaaaaa-0000" "11111111-0000 aaaaaaaa-0000\naaaaaaaa-0000 bbbbbbbb-0000" "11111111-0000 aaaaaaaa-0000\n22222222-0000 11111111-0000" "aaaaaaaa-0000 aaaaaaaa-0000" "short aaaaaaaa-0000" "11111111-0000"; do
@@ -2622,6 +2713,52 @@ printf '11111111-0000 aaaaaaaa-0000\n22222222-0000 bbbbbbbb-0000\n' >"$inst_home
 : >"$UW/calls"
 out=$(run_uninstall) || fail "uninstall: a valid pairs file" "$out"
 expect_eq "uninstall: a valid file deletes exactly its failover profiles" "$(ucalls | grep 'connection delete' | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" "connection delete uuid aaaaaaaa-0000;connection delete uuid bbbbbbbb-0000;"
+# a failover profile that is listed but cannot be read is not "nothing to delete"
+fresh_home
+uscene ok ok ok
+printf '00000003-0000-0000-0000-000000000000:gsm\n' >"$UW/connections"
+out=$(run_install) || fail "install: for the read failure test" "$out"
+touch "$UW/fail_conname_f0f0-00000003-0000-0000-0000-00000000000"
+: >"$UW/calls"
+if out=$(run_uninstall); then fail "uninstall: an unreadable failover profile stops the steps"; else ok "uninstall: an unreadable failover profile stops the steps"; fi
+expect_contains "uninstall: an unreadable failover profile: says how to delete it" "$out" "nmcli connection delete uuid f0f0-00000003-0000-0000-0000-00000000000"
+expect_contains "uninstall: an unreadable failover profile: says it is kept for a re-run" "$out" "the pairs file and the manager are kept"
+expect_eq "uninstall: an unreadable failover profile: nothing was deleted" "$(ucalls | grep -c 'connection delete' || true)" 0
+expect_eq "uninstall: an unreadable failover profile: the pairs file is kept" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo kept || echo removed)" kept
+expect_eq "uninstall: an unreadable failover profile: the manager copy is kept" "$([ -e "$inst_home/.local/libexec/quectel-usbnet-uplink" ] && echo kept || echo removed)" kept
+expect_eq "uninstall: an unreadable failover profile: the units are kept" "$([ -e "$unit_dir/quectel-uplink.timer" ] && echo kept || echo removed)" kept
+touch "$UW/fail_conlist"
+if out=$(run_uninstall); then fail "uninstall: an unreadable profile list stops the steps"; else ok "uninstall: an unreadable profile list stops the steps"; fi
+expect_contains "uninstall: an unreadable profile list is named" "$out" "cannot list the connection profiles; nothing was removed"
+expect_eq "uninstall: an unreadable profile list: the pairs file is kept" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo kept || echo removed)" kept
+rm -f "$UW/fail_conlist" "$UW/fail_conname_f0f0-00000003-0000-0000-0000-00000000000"
+# a profile that is not in the list at all is already gone, and that is fine
+grep -v 'f0f0-' "$UW/connnames" >"$UW/connnames.new" || true
+mv "$UW/connnames.new" "$UW/connnames"
+: >"$UW/calls"
+out=$(run_uninstall) || fail "uninstall: a failover profile that is already gone" "$out"
+expect_contains "uninstall: a profile that is already gone is said so" "$out" "is already gone"
+expect_eq "uninstall: a profile that is already gone: nothing to delete" "$(ucalls | grep -c 'connection delete' || true)" 0
+expect_eq "uninstall: a profile that is already gone: the pairs file is removed" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo kept || echo removed)" removed
+# the fallback-wait markers go too, but only plain files by that exact name
+fresh_home
+mkdir -p "$tmp/xdg_u/quectel-usbnet"
+rm -f "$tmp/xdg_u/quectel-usbnet/keepme"
+touch "$tmp/xdg_u/quectel-usbnet/fallback.eth0"
+echo keep >"$tmp/target_dir/marker_target"
+ln -s "$tmp/target_dir/marker_target" "$tmp/xdg_u/quectel-usbnet/fallback.wlan0"
+touch "$tmp/xdg_u/quectel-usbnet/fallback.not a device name that is far too long"
+out=$(run_uninstall) || true
+expect_eq "uninstall: a plain fallback marker is removed" "$([ -e "$tmp/xdg_u/quectel-usbnet/fallback.eth0" ] && echo kept || echo removed)" removed
+expect_eq "uninstall: a symlinked fallback marker is left" "$([ -L "$tmp/xdg_u/quectel-usbnet/fallback.wlan0" ] && echo left || echo removed)" left
+expect_eq "uninstall: and its target is intact" "$(cat "$tmp/target_dir/marker_target")" keep
+expect_eq "uninstall: a file with a name no marker has is left" "$([ -e "$tmp/xdg_u/quectel-usbnet/fallback.not a device name that is far too long" ] && echo left || echo removed)" left
+expect_contains "uninstall: and says it left them" "$out" "left $tmp/xdg_u/quectel-usbnet/fallback.wlan0"
+expect_eq "uninstall: the runtime directory stays while something is left in it" "$([ -d "$tmp/xdg_u/quectel-usbnet" ] && echo kept || echo removed)" kept
+rm -f "$tmp/xdg_u/quectel-usbnet/fallback.wlan0" "$tmp/xdg_u/quectel-usbnet/fallback.not a device name that is far too long"
+out=$(run_uninstall) || true
+expect_eq "uninstall: with only plain markers the runtime directory goes" "$([ -d "$tmp/xdg_u/quectel-usbnet" ] && echo kept || echo removed)" removed
+fresh_home
 # a symlinked pairs file is refused, nothing is deleted through it
 fresh_home
 mkdir -p "$inst_home/state/quectel-usbnet"
