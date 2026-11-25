@@ -1616,6 +1616,14 @@ if helpers_check /tmp; then
 else
   ok "dir owner: /tmp (world-writable, sticky) is refused"
 fi
+if [ -d "$HOME" ] && [ "$(readlink -f "$HOME")" = "$HOME" ] && [ -z "$(find "$HOME" -maxdepth 0 -perm /022)" ] && [ "$(stat -c %u "$HOME")" != 0 ]; then
+  # closed to group and others, so only the owner check can refuse it
+  if helpers_check "$HOME"; then
+    fail "dir owner: a closed directory owned by an ordinary user is refused on ownership alone"
+  else
+    ok "dir owner: a closed directory owned by an ordinary user is refused on ownership alone"
+  fi
+fi
 if helpers_check "$inst/root/units"; then
   fail "dir owner: a directory owned by another uid than root is refused"
 else
