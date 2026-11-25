@@ -101,11 +101,18 @@ case "$1 $2 $3 $4" in
     [ ! -f "$UW/fail_conuuid" ] || { echo "Error: no such profile" >&2; exit 1; }
     grep -F -- ":$6" "$UW/connnames" | grep -x -- ".*:$6" | head -n 1 | cut -d: -f1
     ;;
-  "-g connection.id,connection.autoconnect,ipv4.never-default,ipv6.never-default connection show")
+  "-g connection.id,connection.autoconnect,ipv4.never-default,ipv6.never-default,ipv4.route-metric,ipv6.route-metric connection show")
     [ ! -f "$UW/fail_conread_$6" ] || { echo "Error: no such profile" >&2; exit 1; }
     if [ -f "$UW/name_$6" ]; then cat "$UW/name_$6"; else echo "Profile $6"; fi
     if [ -f "$UW/ac_$6" ]; then cat "$UW/ac_$6"; else echo yes; fi
-    if [ -f "$UW/prof_$6" ]; then head -n 2 "$UW/prof_$6"; else printf 'no\nno\n'; fi
+    if [ -f "$UW/prof_$6" ]; then head -n 4 "$UW/prof_$6"; else printf 'no\nno\n-1\n-1\n'; fi
+    ;;
+  "-g ipv4.never-default,ipv6.never-default,ipv4.route-metric,ipv6.route-metric,connection.autoconnect,connection.autoconnect-priority connection show")
+    # the six values the install saves before it touches an existing failover profile
+    [ ! -f "$UW/fail_conread_$6" ] || { echo "Error: no such profile" >&2; exit 1; }
+    if [ -f "$UW/prof_$6" ]; then head -n 4 "$UW/prof_$6"; else printf 'no\nno\n-1\n-1\n'; fi
+    if [ -f "$UW/ac_$6" ]; then cat "$UW/ac_$6"; else echo yes; fi
+    if [ -f "$UW/pri_$6" ]; then cat "$UW/pri_$6"; else echo 0; fi
     ;;
   "-g ipv4.never-default,ipv6.never-default connection show")
     [ ! -f "$UW/fail_conread_$6" ] || { echo "Error: no such profile" >&2; exit 1; }
@@ -127,7 +134,7 @@ case "$1 $2 $3 $4" in
   "connection clone uuid "*)
     # connection clone uuid N NEWNAME: a copy of the profile, with a new uuid and name
     [ ! -f "$UW/fail_clone" ] && [ ! -f "$UW/fail_clone_$4" ] || { echo "Error: clone failed" >&2; exit 1; }
-    new="f0f0-$4"
+    new="f0f0-${4:0:35}"
     if [ -f "$UW/prof_$4" ]; then cp "$UW/prof_$4" "$UW/prof_$new"; else printf 'no\nno\n-1\n-1\n' >"$UW/prof_$new"; fi
     echo "$5" >"$UW/name_$new"
     echo yes >"$UW/ac_$new"
@@ -170,6 +177,7 @@ case "$1 $2 $3 $4" in
           ipv4.route-metric) pv[2]=$2 ;;
           ipv6.route-metric) pv[3]=$2 ;;
           connection.autoconnect) echo "$2" >"$UW/ac_$u" ;;
+          connection.autoconnect-priority) echo "$2" >"$UW/pri_$u" ;;
         esac
         shift 2
       done
@@ -197,6 +205,10 @@ case "$1 $2 $3 $4" in
     echo "$u" >"$UW/uuid_$dev"
     rm -f "$UW/props_$dev" "$UW/nogw_$dev"
     mapfile -t pv <"$UW/prof_$u"
+    # up_metric_DEV: the activation brings its route with this metric, not the profile's
+    if [ -f "$UW/up_metric_$dev" ]; then pv[2]=$(cat "$UW/up_metric_$dev"); pv[3]=${pv[2]}; fi
+    if [ -f "$UW/up_metric4_$dev" ]; then pv[2]=$(cat "$UW/up_metric4_$dev"); fi
+    if [ -f "$UW/up_metric6_$dev" ]; then pv[3]=$(cat "$UW/up_metric6_$dev"); fi
     if [ "${pv[0]}" = yes ]; then touch "$UW/nogw_$dev"; fi
     # up_noroute_DEV: the activation takes, the device comes up on the profile, but
     # no default route appears
@@ -753,10 +765,43 @@ fo_case "never-default yes" "printf 'yes\\nno\\n50\\n50\\n' >\"\$UW/prof_0000000
 fo_case "unreadable" "touch \"\$UW/fail_conread_00000005-0000-0000-0000-000000000000\"" "cannot read the failover profile"
 fo_case "no pairs file" "rm -f \"\$ULD/profiles\"" "no failover profile is installed"
 fo_case "a malformed pairs file" "echo garbage >\"\$ULD/profiles\"" "is not valid; not using failover profiles"
-fo_case "a repeated pair" "printf '%s\\n%s\\n' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "repeats a profile"
+fo_case "a repeated pair" "printf '%s\\n%s\\n' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "repeats or mixes up a profile"
 fo_case "a symlinked pairs file" "mv \"\$ULD/profiles\" \"\$tmp/pairs_real\" && ln -s \"\$tmp/pairs_real\" \"\$ULD/profiles\"" "is not a plain file; not using failover profiles"
 fo_case "another modem's pair only" "echo '00000009-0000-0000-0000-000000000000 0000000a-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "no failover profile is installed"
+fo_case "an IPv4 route metric of 1100" "printf 'no\\nno\\n1100\\n50\\n' >\"\$UW/prof_00000005-0000-0000-0000-000000000000\"" "is not a failover profile as the install makes it"
+fo_case "an IPv6 route metric of 1100" "printf 'no\\nno\\n50\\n1100\\n' >\"\$UW/prof_00000005-0000-0000-0000-000000000000\"" "is not a failover profile as the install makes it"
+fo_case "an automatic route metric" "printf 'no\\nno\\n-1\\n-1\\n' >\"\$UW/prof_00000005-0000-0000-0000-000000000000\"" "is not a failover profile as the install makes it"
+fo_case "two modem profiles sharing one failover profile" "printf '%s\\n%s\\n' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' '00000009-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "repeats or mixes up a profile"
+fo_case "a normal profile that is another's failover" "printf '%s\\n%s\\n' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' '00000005-0000-0000-0000-000000000000 00000009-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "repeats or mixes up a profile"
+fo_case "a failover profile that is another's normal profile" "printf '%s\\n%s\\n' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' '00000009-0000-0000-0000-000000000000 00000003-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "repeats or mixes up a profile"
+fo_case "one modem profile with two failover profiles" "printf '%s\\n%s\\n' '00000003-0000-0000-0000-000000000000 00000005-0000-0000-0000-000000000000' '00000003-0000-0000-0000-000000000000 00000009-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "repeats or mixes up a profile"
+fo_case "a profile paired with itself" "echo '00000003-0000-0000-0000-000000000000 00000003-0000-0000-0000-000000000000' >\"\$ULD/profiles\"" "pairs a profile with itself"
 fo_case "an unreadable active profile" "touch \"\$UW/fail_cur\"" "cannot read the active profile of cdc-wdm0"
+
+# the route the modem comes up with must carry the promised metric, or a dead Wi-Fi at
+# metric 600 would still win; if it does not, the modem is put back and the run fails
+uscene gone ok ok
+echo 777 >"$UW/up_metric_cdc-wdm0"
+rm -f "$UW/ping_wlan0"
+ucli run
+unow 15
+ucli run
+expect_eq "wrong route metric: exit 1" "$ucli_rc" 1
+expect_contains "wrong route metric: says what it got and what was promised" "$ucli_out" "not the promised 50"
+expect_eq "wrong route metric: the modem is put back on its normal profile" "$(umods)" "cdc-wdm0 no 50;cdc-wdm0 yes 1100;"
+expect_eq "wrong route metric: Wi-Fi keeps its routes, cellular holds none" "$(uholders)" "wlan0"
+expect_eq "wrong route metric: the ledger is empty" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
+for fam in 4 6; do
+  uscene gone ok ok
+  echo 777 >"$UW/up_metric${fam}_cdc-wdm0"
+  rm -f "$UW/ping_wlan0"
+  ucli run
+  unow 15
+  ucli run
+  expect_eq "wrong IPv$fam route metric only: exit 1" "$ucli_rc" 1
+  expect_contains "wrong IPv$fam route metric only: says so" "$ucli_out" "not the promised 50"
+  expect_eq "wrong IPv$fam route metric only: put back" "$(uholders)" "wlan0"
+done
 
 # The measured behavior: `device modify` cannot give a closed modem a default route
 # back, only a new activation can. The fake reproduces it, so a manager that opened
@@ -1846,7 +1891,8 @@ expect_eq "restore fallback: modify first, then the re-activation, per device; c
 expect_eq "restore fallback: Ethernet and Wi-Fi hold their defaults again" "$(uholders)" "eth0 wlan0"
 expect_eq "restore fallback: the ledger is empty" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
 expect_contains "restore fallback: the output names what came back only by re-activation" "$ucli_out" "came back only after re-activating its connection"
-# and if even that does not bring it back: the exact repair command, non-zero
+# a FAILED activation proves nothing: the ledger line stays, the repair command is
+# printed, and the timer does not hammer it every 15 seconds
 uscene ok ok ok
 touch "$UW/demote_sets_nogw"
 ucli cell-first
@@ -1854,7 +1900,49 @@ touch "$UW/fail_up_00000001-0000-0000-0000-000000000000"
 ucli auto
 expect_eq "restore fails: exit 1" "$ucli_rc" 1
 expect_contains "restore fails: prints the exact repair command" "$ucli_out" "Repair by hand: nmcli connection up uuid 00000001-0000-0000-0000-000000000000 ifname eth0"
-expect_eq "restore fails: the line of that device is dropped (a re-activation resets the demotion; no loop)" "$(uledger | grep -c eth0 || true)" 0
+expect_contains "restore fails: keeps the line of that device" "$(uledger)" "eth0"
+expect_eq "restore fails: and does not close cellular behind it" "$(uholders)" "wlan0 wwan0"
+rm -f "$UST/mode" # as after a logout: the timer's run is in auto mode and heals
+unow 15
+: >"$UW/calls"
+ucli run
+expect_eq "restore fails: a timer run right after does not re-activate it again" "$(umods | grep -c 'eth0 up' || true)" 0
+expect_contains "restore fails: it says when the next try is" "$ucli_out" "the next try is in"
+expect_eq "restore fails: the line is still there" "$(uledger | grep -c eth0 || true)" 1
+unow 400
+: >"$UW/calls"
+ucli run
+expect_eq "restore fails: after the wait the timer run tries again" "$(umods | grep -c 'eth0 up' || true)" 1
+rm -f "$UW/fail_up_00000001-0000-0000-0000-000000000000"
+: >"$UW/calls"
+unow 401
+ucli restore
+expect_eq "restore fails: a command you run yourself always tries, and repairs it" "$ucli_rc" 0
+expect_eq "restore fails: the device is back" "$(uholders)" "eth0 wlan0"
+expect_eq "restore fails: the ledger is empty" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
+# a backoff marker from a clock that is now behind (a reboot that kept the runtime
+# directory) is not a reason to wait
+uscene ok ok ok
+touch "$UW/demote_sets_nogw"
+ucli cell-first
+touch "$UW/fail_up_00000001-0000-0000-0000-000000000000"
+ucli auto
+rm -f "$UST/mode"
+export QUECTEL_UPLINK_MONO=$((M0 - 500))
+: >"$UW/calls"
+ucli run
+expect_eq "restore fails: a marker from the future is ignored, the timer run tries" "$(umods | grep -c 'eth0 up' || true)" 1
+rm -f "$UW/fail_up_00000001-0000-0000-0000-000000000000"
+unow 0
+# a manual restore does not wait for the timer's backoff
+uscene ok ok ok
+touch "$UW/demote_sets_nogw"
+ucli cell-first
+touch "$UW/fail_up_00000001-0000-0000-0000-000000000000"
+ucli auto
+: >"$UW/calls"
+ucli restore
+expect_eq "restore fails: restore by hand tries at once, not after the backoff" "$(umods | grep -c 'eth0 up' || true)" 1
 rm -f "$UW/fail_up_00000001-0000-0000-0000-000000000000"
 # a re-activation that takes but brings no route is not success either
 uscene ok ok ok
@@ -2023,8 +2111,24 @@ mkdir -p "$tmp/sbin_fake"
 cat >"$tmp/sbin_fake/systemctl" <<'FAKE'
 #!/usr/bin/env bash
 echo "systemctl $*" >>"$UW/calls"
+case "$*" in
+  *daemon-reload*) [ ! -f "$UW/fail_sc_reload" ] || exit 1 ;;
+  *enable*) [ ! -f "$UW/fail_sc_enable" ] || exit 1 ;;
+  *disable*) [ ! -f "$UW/fail_sc_disable" ] || exit 1 ;;
+esac
 FAKE
 chmod +x "$tmp/sbin_fake/systemctl"
+# a mv that fails when placing the restore unit, if told to (a failure between the
+# temp file and its final name)
+cat >"$tmp/sbin_fake/mv" <<'FAKE'
+#!/usr/bin/env bash
+if [ -f "$UW/fail_mv" ] && [[ "$*" == *quectel-uplink-restore.service ]]; then
+  echo "mv: cannot move" >&2
+  exit 1
+fi
+exec /usr/bin/mv "$@"
+FAKE
+chmod +x "$tmp/sbin_fake/mv"
 printf 'aaaa-1111:802-3-ethernet\nbbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
 printf '%s\n' "$steps" | sed -n "/^bash -e <<'UPLINK_INSTALL'/,/^UPLINK_INSTALL/p" | sed '1d;$d' >"$tmp/install_block.sh"
 run_install() {
@@ -2298,8 +2402,91 @@ out=$(run_install) || fail "install: the first install" "$out"
 out=$(run_install) || fail "install: a second install" "$out"
 expect_eq "install: a second install clones nothing" "$(ucalls | grep -c 'connection clone' || true)" 0
 expect_eq "install: a second install does not mistake its own failover profiles for modem profiles" "$(ucalls | grep 'connection modify' | grep -vc route-metric || true)" 2
+expect_eq "install: a second install leaves no backup file behind" "$(find "$inst_home" -name '.quectel-bak.*' -o -name '.*.??????' | wc -l)" 0
 expect_eq "install: a second install keeps the pairs" "$(wc -l <"$inst_home/state/quectel-usbnet/profiles")" 2
 expect_eq "install: a second install keeps the failover profiles open" "$(head -n 2 "$UW/prof_f0f0-bbbb-2222" | tr '\n' ' ')" "no no "
+
+# Everything after the profiles is part of the same transaction: copy, units, systemctl,
+# the first evaluation. A failure anywhere undoes all of it.
+printf 'bbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
+files_left() { find "$inst_home" -type f | wc -l; }
+for seam in fail_sc_reload fail_sc_enable fail_ip4 fail_mv; do
+  fresh_home
+  printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+  printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+  touch "$UW/$seam"
+  : >"$UW/calls"
+  if out=$(run_install); then fail "install ($seam): the steps stop"; else ok "install ($seam): the steps stop"; fi
+  rm -f "$UW/$seam"
+  expect_contains "install ($seam): says it undoes" "$out" "undoing"
+  expect_eq "install ($seam): no file of ours is left" "$(files_left)" 0
+  expect_eq "install ($seam): no clone is left" "$(grep -c 'f0f0-' "$UW/connections" || true)" 0
+  expect_eq "install ($seam): the first profile has its old values" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
+  expect_eq "install ($seam): the second profile has its old values" "$(head -n 2 "$UW/prof_dddd-4444" | tr '\n' ' ')" "yes no "
+  expect_eq "install ($seam): no repair is needed" "$(printf '%s' "$out" | grep -c 'REPAIR NEEDED' || true)" 0
+  if [ "$seam" = fail_ip4 ]; then
+    expect_contains "install ($seam): what the first evaluation may have changed is put back (restore ran)" "$out" "nothing to restore"
+  else
+    expect_eq "install ($seam): no restore is run before the first evaluation" "$(printf '%s' "$out" | grep -c 'nothing to restore' || true)" 0
+  fi
+  if [ "$seam" = fail_sc_reload ] || [ "$seam" = fail_mv ]; then
+    expect_eq "install ($seam): the timer was never enabled, so it is not disabled" "$(ucalls | grep -c 'systemctl --user disable' || true)" 0
+  else
+    expect_eq "install ($seam): the timer is disabled again" "$(ucalls | grep -c 'systemctl --user disable --now quectel-uplink.timer' || true)" 1
+  fi
+done
+expect_eq "install: a failed install leaves no state directory it made" "$([ -e "$inst_home/state/quectel-usbnet" ] && echo yes || echo no)" no
+# an undo step that fails goes on the repair list with its command
+fresh_home
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+touch "$UW/fail_sc_enable" "$UW/fail_sc_disable"
+if out=$(run_install); then fail "install: a timer that cannot be disabled again"; else ok "install: a timer that cannot be disabled again"; fi
+rm -f "$UW/fail_sc_enable" "$UW/fail_sc_disable"
+expect_contains "install: an undo that fails is on the repair list" "$out" "systemctl --user disable --now quectel-uplink.timer"
+expect_contains "install: and the repair banner is printed" "$out" "REPAIR NEEDED"
+expect_eq "install: the rest was undone anyway: no file left" "$(files_left)" 0
+expect_eq "install: the rest was undone anyway: no clone left" "$(grep -c 'f0f0-' "$UW/connections" || true)" 0
+
+# An existing failover profile that is touched by a re-install is put back as it was
+fresh_home
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+out=$(run_install) || fail "install: the first install, for the re-install test" "$out"
+echo yes >"$UW/ac_f0f0-bbbb-2222"
+printf 'no\nno\n900\n900\n' >"$UW/prof_f0f0-bbbb-2222"
+echo 7 >"$UW/pri_f0f0-bbbb-2222"
+pairs_before=$(cat "$inst_home/state/quectel-usbnet/profiles")
+copy_before=$(cksum <"$inst_home/.local/libexec/quectel-usbnet-uplink")
+touch "$UW/fail_conmod_dddd-4444"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a re-install whose later close fails stops"; else ok "install: a re-install whose later close fails stops"; fi
+rm -f "$UW/fail_conmod_dddd-4444"
+expect_eq "re-install: the existing failover profile has its old autoconnect again" "$(cat "$UW/ac_f0f0-bbbb-2222")" yes
+expect_eq "re-install: and its old route metrics and never-default" "$(head -n 4 "$UW/prof_f0f0-bbbb-2222" | tr '\n' ' ')" "no no 900 900 "
+expect_eq "re-install: and its old autoconnect priority" "$(cat "$UW/pri_f0f0-bbbb-2222")" 7
+expect_eq "re-install: the pairs file is as it was" "$(cat "$inst_home/state/quectel-usbnet/profiles")" "$pairs_before"
+expect_eq "re-install: the installed copy is as it was" "$(cksum <"$inst_home/.local/libexec/quectel-usbnet-uplink")" "$copy_before"
+expect_eq "re-install: the first normal profile has its old values" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "yes yes "
+# a re-install that fails late puts the old copy, units and pairs file back
+touch "$UW/fail_sc_reload"
+echo "# local edit" >>"$inst_home/.local/libexec/quectel-usbnet-uplink"
+copy_before=$(cksum <"$inst_home/.local/libexec/quectel-usbnet-uplink")
+unit_before=$(cksum <"$unit_dir/quectel-uplink.service")
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a re-install that fails at systemctl stops"; else ok "install: a re-install that fails at systemctl stops"; fi
+rm -f "$UW/fail_sc_reload"
+expect_eq "re-install failing late: the old copy is back" "$(cksum <"$inst_home/.local/libexec/quectel-usbnet-uplink")" "$copy_before"
+expect_eq "re-install failing late: the old units are back" "$(cksum <"$unit_dir/quectel-uplink.service")" "$unit_before"
+expect_eq "re-install failing late: the old pairs file is back" "$(cat "$inst_home/state/quectel-usbnet/profiles")" "$pairs_before"
+expect_eq "re-install failing late: no backup file is left" "$(find "$inst_home" -name '.quectel-bak.*' | wc -l)" 0
+expect_eq "re-install failing late: the failover profile keeps what it had" "$(cat "$UW/ac_f0f0-bbbb-2222")" yes
+# a corrupt pairs file is refused by the install too, before anything is changed
+printf 'bbbb-2222 f0f0-bbbb-2222 extra\n' >"$inst_home/state/quectel-usbnet/profiles"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a corrupt pairs file stops the steps"; else ok "install: a corrupt pairs file stops the steps"; fi
+expect_contains "install: a corrupt pairs file is named as the reason" "$out" "refusing to use"
+expect_eq "install: a corrupt pairs file: nothing was changed" "$(ucalls | grep -c -e 'connection modify' -e 'connection clone' || true)" 0
 
 # a tool whose path would break a unit file is refused
 mkdir -p "$tmp/odd dir"
@@ -2400,27 +2587,46 @@ uscene ok ok ok
 printf '00000003-0000-0000-0000-000000000000:gsm\n' >"$UW/connections"
 out=$(run_install) || fail "install: for the failover uninstall test" "$out"
 expect_eq "uninstall setup: the failover profile exists" "$(grep -c 'f0f0-00000003' "$UW/connections" || true)" 1
-echo "cccc-3333 cccc-3333" >>"$inst_home/state/quectel-usbnet/profiles"
+echo "99999999 cccc-3333" >>"$inst_home/state/quectel-usbnet/profiles"
 printf 'cccc-3333:Profile cccc-3333\n' >>"$UW/connnames"
-touch "$UW/fail_condel_f0f0-00000003-0000-0000-0000-000000000000"
+touch "$UW/fail_condel_f0f0-00000003-0000-0000-0000-00000000000"
 if out=$(run_uninstall); then fail "uninstall: a failed profile delete stops the steps"; else ok "uninstall: a failed profile delete stops the steps"; fi
-expect_contains "uninstall: a failed profile delete says how to delete it" "$out" "nmcli connection delete uuid f0f0-00000003-0000-0000-0000-000000000000"
+expect_contains "uninstall: a failed profile delete says how to delete it" "$out" "nmcli connection delete uuid f0f0-00000003-0000-0000-0000-00000000000"
 expect_eq "uninstall: a failed profile delete removes nothing else" "$([ -e "$unit_dir/quectel-uplink.timer" ] && [ -e "$inst_home/.local/libexec/quectel-usbnet-uplink" ] && echo kept || echo removed)" kept
-rm -f "$UW/fail_condel_f0f0-00000003-0000-0000-0000-000000000000"
+rm -f "$UW/fail_condel_f0f0-00000003-0000-0000-0000-00000000000"
 : >"$UW/calls"
 out=$(run_uninstall) || fail "uninstall: the failover profiles go" "$out"
-expect_contains "uninstall: says it deleted the failover profile" "$out" "deleted failover profile f0f0-00000003-0000-0000-0000-000000000000"
+expect_contains "uninstall: says it deleted the failover profile" "$out" "deleted failover profile f0f0-00000003-0000-0000-0000-00000000000"
 expect_eq "uninstall: the failover profile is gone" "$(grep -c 'f0f0-00000003' "$UW/connections" || true)" 0
 expect_contains "uninstall: a listed profile whose name is not a failover name is left" "$out" "left profile cccc-3333"
 expect_eq "uninstall: and never deleted" "$(ucalls | grep -c 'delete uuid cccc-3333' || true)" 0
 expect_eq "uninstall: the normal modem profile is never deleted" "$(ucalls | grep -c 'delete uuid 00000003' || true)" 0
 expect_eq "uninstall: the pairs file is removed" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo yes || echo no)" no
 expect_eq "uninstall: the units are removed" "$([ -e "$unit_dir/quectel-uplink.timer" ] && echo kept || echo removed)" removed
+# the pairs file is read with the manager's own rules: anything else deletes nothing
+fresh_home
+echo "Somebody (quectel-usbnet failover)" >"$UW/name_aaaaaaaa-0000"
+echo "Somebody Else (quectel-usbnet failover)" >"$UW/name_bbbbbbbb-0000"
+mkdir -p "$inst_home/state/quectel-usbnet"
+chmod 700 "$inst_home/state/quectel-usbnet"
+for bad in "garbage aaaaaaaa-0000 arbitrary extra text" "11111111 aaaaaaaa-0000 extra" "11111111-0000 aaaaaaaa-0000\n11111111-0000 bbbbbbbb-0000" "11111111-0000 aaaaaaaa-0000\n22222222-0000 aaaaaaaa-0000" "11111111-0000 aaaaaaaa-0000\naaaaaaaa-0000 bbbbbbbb-0000" "11111111-0000 aaaaaaaa-0000\n22222222-0000 11111111-0000" "aaaaaaaa-0000 aaaaaaaa-0000" "short aaaaaaaa-0000" "11111111-0000"; do
+  printf '%b\n' "$bad" >"$inst_home/state/quectel-usbnet/profiles"
+  : >"$UW/calls"
+  if out=$(run_uninstall); then fail "uninstall: a pairs file '$bad' stops the steps"; else ok "uninstall: a pairs file '$bad' stops the steps"; fi
+  expect_eq "uninstall: a pairs file '$bad': nothing is deleted" "$(ucalls | grep -c 'connection delete' || true)" 0
+  expect_eq "uninstall: a pairs file '$bad': the file is kept" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo kept || echo removed)" kept
+  expect_contains "uninstall: a pairs file '$bad': says why" "$out" "not a valid pairs file"
+done
+# a valid file still deletes, in file order
+printf '11111111-0000 aaaaaaaa-0000\n22222222-0000 bbbbbbbb-0000\n' >"$inst_home/state/quectel-usbnet/profiles"
+: >"$UW/calls"
+out=$(run_uninstall) || fail "uninstall: a valid pairs file" "$out"
+expect_eq "uninstall: a valid file deletes exactly its failover profiles" "$(ucalls | grep 'connection delete' | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" "connection delete uuid aaaaaaaa-0000;connection delete uuid bbbbbbbb-0000;"
 # a symlinked pairs file is refused, nothing is deleted through it
 fresh_home
 mkdir -p "$inst_home/state/quectel-usbnet"
 chmod 700 "$inst_home/state/quectel-usbnet"
-echo "00000003-0000-0000-0000-000000000000 f0f0-00000003-0000-0000-0000-000000000000" >"$tmp/target_dir/pairs"
+echo "00000003-0000-0000-0000-000000000000 f0f0-00000003-0000-0000-0000-00000000000" >"$tmp/target_dir/pairs"
 ln -s "$tmp/target_dir/pairs" "$inst_home/state/quectel-usbnet/profiles"
 : >"$UW/calls"
 if out=$(run_uninstall); then fail "uninstall: a symlinked pairs file stops the steps"; else ok "uninstall: a symlinked pairs file stops the steps"; fi

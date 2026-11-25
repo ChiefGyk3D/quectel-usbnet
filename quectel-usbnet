@@ -1023,6 +1023,11 @@ UPLINK_SAFE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
 UPLINK_MAX_FOR=2592000
 # The name suffix of the failover profile the install clones from a modem profile.
 UPLINK_FO_SUFFIX=" (quectel-usbnet failover)"
+# After a failed re-activation of a demoted Ethernet or Wi-Fi device, the timer waits
+# this many seconds (monotonic) before it tries again; a command you run yourself
+# never waits.
+UPLINK_FALLBACK_WAIT=300
+UP_BACKOFF=false
 UPLINK_UNIT="quectel-uplink"
 UPLINK_RESTORE_UNIT="quectel-uplink-restore"
 UPLINK_UNIT_MARK="# written by quectel-usbnet uplink install"
@@ -2003,7 +2008,7 @@ uplink_active_state() {
 # profile, in the ledger directory. Loads UP_PAIRS (normal -> failover). No file is
 # no pairs. Anything not exactly that fails.
 uplink_pairs_load() {
-  local f line n fo
+  local f line n fo k
   UP_PAIRS=()
   [ -n "$UP_LDIR" ] || return 0
   f=$UP_LDIR/profiles
@@ -2018,10 +2023,18 @@ uplink_pairs_load() {
       return 1
     fi
     read -r n fo <<<"$line"
-    if [ -n "${UP_PAIRS[$n]:-}" ]; then
-      uplink_log "ERROR: $f repeats a profile; not using failover profiles"
+    if [ "$n" = "$fo" ]; then
+      uplink_log "ERROR: $f pairs a profile with itself; not using failover profiles"
       return 1
     fi
+    # every UUID appears once in the whole file: a failover profile belongs to one
+    # modem profile, and the normal and failover profiles are different sets
+    for k in "${!UP_PAIRS[@]}"; do
+      if [ "$k" = "$n" ] || [ "$k" = "$fo" ] || [ "${UP_PAIRS[$k]}" = "$n" ] || [ "${UP_PAIRS[$k]}" = "$fo" ]; then
+        uplink_log "ERROR: $f repeats or mixes up a profile; not using failover profiles"
+        return 1
+      fi
+    done
     UP_PAIRS[$n]=$fo
   done <"$f"
 }
@@ -2031,8 +2044,8 @@ uplink_pairs_load() {
 # comes back on the normal, closed profile), and it is open (never-default off)?
 # $1 = its UUID.
 uplink_failover_ok() {
-  local vals id ac nd4 nd6
-  vals=$(uplink_nm -g connection.id,connection.autoconnect,ipv4.never-default,ipv6.never-default connection show uuid "$1") || {
+  local vals id ac nd4 nd6 rm4 rm6
+  vals=$(uplink_nm -g connection.id,connection.autoconnect,ipv4.never-default,ipv6.never-default,ipv4.route-metric,ipv6.route-metric connection show uuid "$1") || {
     uplink_log "ERROR: cannot read the failover profile $1; not using it"
     return 1
   }
@@ -2041,9 +2054,12 @@ uplink_failover_ok() {
     read -r ac
     read -r nd4
     read -r nd6
+    read -r rm4
+    read -r rm6
   } <<<"$vals" || return 1
-  if [[ $id != *"$UPLINK_FO_SUFFIX" ]] || [ "$ac" != no ] || [ "$nd4" != no ] || [ "$nd6" != no ]; then
-    uplink_log "ERROR: profile $1 is not a failover profile as the install makes it (name, autoconnect no, never-default no); not using it"
+  if [[ $id != *"$UPLINK_FO_SUFFIX" ]] || [ "$ac" != no ] || [ "$nd4" != no ] || [ "$nd6" != no ] ||
+    [ "$rm4" != "$UP_CELL_METRIC" ] || [ "$rm6" != "$UP_CELL_METRIC" ]; then
+    uplink_log "ERROR: profile $1 is not a failover profile as the install makes it (name, autoconnect no, never-default no, route metric $UP_CELL_METRIC); not using it"
     return 1
   fi
 }
@@ -2118,6 +2134,34 @@ uplink_restore_cell() {
   uplink_ledger_save || return 1
 }
 
+# Rate limit for the re-activation fallback of a demoted Ethernet or Wi-Fi device: a
+# marker file in the runtime directory holds the monotonic time of the last failed
+# attempt. $1 = device. uplink_fallback_waiting sets UP_FALLBACK_LEFT.
+uplink_fallback_waiting() {
+  local f=$UP_DIR/fallback.$1 t now
+  UP_FALLBACK_LEFT=0
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  IFS= read -r t <"$f" || true
+  [[ $t =~ ^[0-9]{1,12}$ ]] || return 1
+  now=$(uplink_mono) || return 1
+  [ "$now" -ge "$t" ] || return 1
+  if [ "$((now - t))" -lt "$UPLINK_FALLBACK_WAIT" ]; then
+    UP_FALLBACK_LEFT=$((UPLINK_FALLBACK_WAIT - (now - t)))
+    return 0
+  fi
+  return 1
+}
+
+uplink_fallback_mark() {
+  local now
+  now=$(uplink_mono) || return 0
+  uplink_write_line "$UP_DIR/fallback.$1" "$now" || true
+}
+
+uplink_fallback_clear() {
+  rm -f -- "$UP_DIR/fallback.$1" 2>/dev/null || true
+}
+
 # Puts a device back as its ledger line says and drops the line. A device that is
 # gone, or re-activated since (another profile UUID), already lost the runtime
 # change: the line is dropped. A demoted Ethernet or Wi-Fi device is put back with
@@ -2148,20 +2192,32 @@ uplink_restore_dev() {
     return 1
   fi
   if ! uplink_wait_route "$dev" present; then
+    # Only a timer run waits between tries; a command you run yourself always tries.
+    if $UP_BACKOFF && uplink_fallback_waiting "$dev"; then
+      uplink_log "ERROR: $dev has no default route and its last re-activation failed; the next try is in $UP_FALLBACK_LEFT s. Repair by hand: nmcli connection up uuid $uuid ifname $dev"
+      return 1
+    fi
     uplink_log "the default route of $dev did not come back after the change was undone; re-activating its connection"
-    local ok=true
-    uplink_cell_up "$dev" "$uuid" || ok=false
-    if $ok && ! uplink_wait_route "$dev" present "$UP_ACT_TRIES"; then ok=false; fi
-    # a re-activation resets every runtime change, so the demotion is gone either way
+    if ! uplink_cell_up "$dev" "$uuid"; then
+      # A failed activation proves nothing: the demotion may still be there, so the
+      # ledger line stays (a later run, restore or auto tries again).
+      uplink_fallback_mark "$dev"
+      uplink_log "ERROR: could not re-activate $dev; the ledger keeps the entry. Repair by hand: nmcli connection up uuid $uuid ifname $dev"
+      return 1
+    fi
+    # The activation took, and a new activation resets every runtime change: the
+    # demotion is gone. The route may still be missing for another reason.
+    uplink_fallback_clear "$dev"
     unset "UP_LED[$dev]"
     uplink_ledger_save || return 1
-    if ! $ok; then
+    if ! uplink_wait_route "$dev" present "$UP_ACT_TRIES"; then
       uplink_log "ERROR: $dev has no default route even after re-activating it. Repair by hand: nmcli connection up uuid $uuid ifname $dev"
       return 1
     fi
     UP_OUT="restored $dev: its default route came back only after re-activating its connection"
     return 0
   fi
+  uplink_fallback_clear "$dev"
   UP_OUT="restored $dev: never-default $a/$b, route-metric $c/$d"
   unset "UP_LED[$dev]"
   uplink_ledger_save || return 1
@@ -2288,6 +2344,18 @@ uplink_open_cell() {
     uplink_open_rollback "$opened"
     return 1
   fi
+  # the route must carry the promised metric, or a dead Ethernet or Wi-Fi default
+  # route would still win over it
+  local ifc m4 m6
+  for ifc in $ifs; do
+    m4=$(uplink_metric_of "$UP_RT4" "$ifc")
+    m6=$(uplink_metric_of "$UP_RT6" "$ifc")
+    if { [ -n "$m4" ] && [ "$m4" != "$UP_CELL_METRIC" ]; } || { [ -n "$m6" ] && [ "$m6" != "$UP_CELL_METRIC" ]; }; then
+      uplink_log "ERROR: the default route of $ifc has metric ${m4:-}${m4:+ }${m6:-}, not the promised $UP_CELL_METRIC; putting it back"
+      uplink_open_rollback "$opened"
+      return 1
+    fi
+  done
 }
 
 # Closes cellular, but only when something else carries a default route, so closing
@@ -2562,6 +2630,7 @@ cmd_uplink_run() {
     esac
   done
   uplink_begin || return 1
+  UP_BACKOFF=true
   # A timer run that finds another evaluation in progress has nothing to do.
   uplink_lock 1 || rc=$?
   if [ "$rc" -eq 1 ]; then
@@ -2811,6 +2880,7 @@ Environment="QUECTEL_UPLINK_IP=$2"
 Environment="QUECTEL_UPLINK_PING=$3"
 Environment="QUECTEL_UPLINK_FLOCK=$4"
 Environment="QUECTEL_UPLINK_TIMEOUT=$5"
+Environment="QUECTEL_UPLINK_CELL_METRIC=$6"
 Environment="PATH=/usr/sbin:/usr/bin"
 EOF
 }
@@ -2841,7 +2911,7 @@ PartOf=$UPLINK_UNIT.timer
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-$(uplink_service_env "$@")
+$(uplink_service_env "$1" "$2" "$3" "$4" "$5" "$7")
 ExecStart=$6
 ExecStop=%h/$UPLINK_COPY_REL uplink restore
 TimeoutStopSec=60
@@ -2863,6 +2933,47 @@ AccuracySec=1s
 
 [Install]
 WantedBy=timers.target
+EOF
+}
+
+# The shell text of the pairs-file reader the printed steps use. It applies exactly
+# the rules uplink_pairs_load applies at run time: a plain file (no symlink), every
+# line two profile ids and nothing else, every id once in the whole file (so a
+# failover profile belongs to one modem profile and the two sets are disjoint).
+uplink_pairs_shell() {
+  cat <<'EOF'
+# pairs_load FILE: no file is no pairs. Fills pair_n[] and pair_f[]. If the file is
+# not valid it says why and fails.
+pairs_load() {
+  local file=$1 line n f i
+  pair_n=()
+  pair_f=()
+  [ -e "$file" ] || [ -L "$file" ] || return 0
+  if [ -L "$file" ] || [ ! -f "$file" ]; then
+    echo "$file is not a plain file" >&2
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    if ! [[ $line =~ ^[0-9A-Fa-f-]{8,40}\ [0-9A-Fa-f-]{8,40}$ ]]; then
+      echo "$file has a line that is not exactly two profile ids" >&2
+      return 1
+    fi
+    n=${line% *}
+    f=${line#* }
+    if [ "$n" = "$f" ]; then
+      echo "$file pairs a profile with itself" >&2
+      return 1
+    fi
+    for i in "${!pair_n[@]}"; do
+      if [ "${pair_n[$i]}" = "$n" ] || [ "${pair_n[$i]}" = "$f" ] || [ "${pair_f[$i]}" = "$n" ] || [ "${pair_f[$i]}" = "$f" ]; then
+        echo "$file repeats or mixes up a profile id" >&2
+        return 1
+      fi
+    done
+    pair_n+=("$n")
+    pair_f+=("$f")
+  done <"$file"
+}
 EOF
 }
 
@@ -2967,15 +3078,13 @@ fail0() {
 }
 list=\$(nmc --escape no -t -f UUID,TYPE connection show) || fail0 "cannot list the connection profiles"
 names=\$(nmc --escape no -t -f UUID,NAME connection show) || fail0 "cannot list the connection profile names"
-oldpairs=""
-if [ -e "\$statedir/profiles" ] || [ -L "\$statedir/profiles" ]; then
-  if [ -L "\$statedir/profiles" ] || [ ! -f "\$statedir/profiles" ]; then fail0 "refusing: \$statedir/profiles is not a plain file"; fi
-  oldpairs=\$(cat "\$statedir/profiles")
-fi
+$(uplink_pairs_shell)
+pairs_load "\$statedir/profiles" || fail0 "refusing to use \$statedir/profiles"
 gsm=()
 prev=()
 fname=()
 fo=()
+fpv=()
 while IFS=: read -r uuid ptype; do
   [ "\$ptype" = gsm ] || continue
   case \$uuid in
@@ -2998,39 +3107,96 @@ while IFS=: read -r uuid ptype; do
   done <<<"\$names"
   holders=\${holders# }
   f=""
+  fp=""
   case \$holders in
     "") ;;
     *" "*) fail0 "refusing: more than one profile is named '\$fn'" ;;
     *)
       # one profile has that name: it is ours only if the state file pairs it with this one
-      if printf '%s\n' "\$oldpairs" | grep -qxF "\$uuid \$holders"; then
-        f=\$holders
-      else
-        fail0 "refusing: a profile named '\$fn' exists and was not made by quectel-usbnet"
-      fi
+      for i in "\${!pair_n[@]}"; do
+        if [ "\${pair_n[\$i]}" = "\$uuid" ] && [ "\${pair_f[\$i]}" = "\$holders" ]; then f=\$holders; fi
+      done
+      [ -n "\$f" ] || fail0 "refusing: a profile named '\$fn' exists and was not made by quectel-usbnet"
+      # its properties as they are now, to put back if this install is undone
+      fp=\$(nmc --escape no -g ipv4.never-default,ipv6.never-default,ipv4.route-metric,ipv6.route-metric,connection.autoconnect,connection.autoconnect-priority connection show uuid "\$f") || fail0 "cannot read the failover profile \$f"
+      fp=\${fp//\$'\n'/ }
+      [[ \$fp =~ ^(yes|no)\ (yes|no)\ (-1|[0-9]+)\ (-1|[0-9]+)\ (yes|no)\ -?[0-9]+\$ ]] || fail0 "unexpected values for the failover profile \$f"
       ;;
   esac
   gsm+=("\$uuid")
   prev+=("\$old")
   fname+=("\$fn")
   fo+=("\$f")
+  fpv+=("\$fp")
 done <<<"\$list"
 
+# From here on, a failure undoes everything this run did, in this order: the timer,
+# whatever the manager changed, the files and units, the profiles. Each undo step
+# is tried twice; one that still fails goes on a repair list with its exact command.
 created=()
+fomod=()
 closed=0
 repair=()
+stashed=()
+fresh=()
+tmpfiles=()
+madedirs=()
+tried_enable=0
+ranfirst=0
+# stash FILE: remember what is there before it is replaced (a copy to put back, or
+# that it was not there at all)
+stash() {
+  local b
+  if [ -e "\$1" ]; then
+    b=\$(mktemp "\${1%/*}/.quectel-bak.XXXXXX") || return 1
+    tmpfiles+=("\$b")
+    cp -p -- "\$1" "\$b" || return 1
+    stashed+=("\$1|\$b")
+  else
+    fresh+=("\$1")
+  fi
+}
+# mkdir_ours DIR: create it (mode 0700) and remember that this run did
+mkdir_ours() {
+  [ -e "\$1" ] || madedirs+=("\$1")
+  mkdir -p -m 0700 -- "\$1"
+}
 undo() {
-  local j f
+  local j f rec
+  if [ "\$tried_enable" = 1 ]; then
+    systemctl --user disable --now $UPLINK_UNIT.timer || systemctl --user disable --now $UPLINK_UNIT.timer ||
+      repair+=("timer: systemctl --user disable --now $UPLINK_UNIT.timer")
+  fi
+  if [ "\$ranfirst" = 1 ] && [ -x "\$dest" ]; then
+    "\$dest" uplink restore || "\$dest" uplink restore ||
+      repair+=("what the first evaluation changed: \$dest uplink restore")
+  fi
+  for rec in "\${stashed[@]}"; do
+    mv -T -- "\${rec#*|}" "\${rec%%|*}" || mv -T -- "\${rec#*|}" "\${rec%%|*}" ||
+      repair+=("file \${rec%%|*}: mv -T -- \${rec#*|} \${rec%%|*}")
+  done
+  for f in "\${fresh[@]}"; do
+    rm -f -- "\$f" || repair+=("file \$f: rm -f -- \$f")
+  done
+  if [ "\$tried_enable" = 1 ]; then systemctl --user daemon-reload || true; fi
   for ((j = 0; j < closed; j++)); do
     set -- \${prev[\$j]}
     nmc connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
       nmc connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
       repair+=("profile \${gsm[\$j]}: nmcli connection modify uuid \${gsm[\$j]} ipv4.never-default \$1 ipv6.never-default \$2")
   done
+  for j in "\${fomod[@]}"; do
+    set -- \${fpv[\$j]}
+    nmc connection modify uuid "\${fo[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ipv4.route-metric "\$3" ipv6.route-metric "\$4" connection.autoconnect "\$5" connection.autoconnect-priority "\$6" ||
+      nmc connection modify uuid "\${fo[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ipv4.route-metric "\$3" ipv6.route-metric "\$4" connection.autoconnect "\$5" connection.autoconnect-priority "\$6" ||
+      repair+=("failover profile \${fo[\$j]}: nmcli connection modify uuid \${fo[\$j]} ipv4.never-default \$1 ipv6.never-default \$2 ipv4.route-metric \$3 ipv6.route-metric \$4 connection.autoconnect \$5 connection.autoconnect-priority \$6")
+  done
   for f in "\${created[@]}"; do
     nmc connection delete uuid "\$f" || nmc connection delete uuid "\$f" ||
       repair+=("failover profile \$f: nmcli connection delete uuid \$f")
   done
+  rm -f -- "\${tmpfiles[@]}"
+  for ((j = \${#madedirs[@]} - 1; j >= 0; j--)); do rmdir -- "\${madedirs[\$j]}" 2>/dev/null || true; done
   if [ "\${#repair[@]}" -gt 0 ]; then
     echo "" >&2
     echo "!!! REPAIR NEEDED: these changes could NOT be undone (tried twice)." >&2
@@ -3058,6 +3224,8 @@ for i in "\${!gsm[@]}"; do
     esac
     created+=("\$f")
     fo[\$i]=\$f
+  else
+    fomod+=("\$i")
   fi
   nmc connection modify uuid "\$f" ipv4.never-default no ipv6.never-default no ipv4.route-metric $metric ipv6.route-metric $metric connection.autoconnect no connection.autoconnect-priority -999 ||
     fail "could not set up the failover profile \$f; undoing"
@@ -3077,47 +3245,57 @@ done
 # 1c. Which failover profile belongs to which: the manager reads this, and the
 #     uninstall deletes only profiles listed here.
 if [ "\${#gsm[@]}" -gt 0 ]; then
-  mkdir -p -m 0700 -- "\$statedir" || fail "cannot create \$statedir; undoing"
+  mkdir_ours "\$statedir" || fail "cannot create \$statedir; undoing"
   ptmp=\$(mktemp "\$statedir/.profiles.XXXXXX") || fail "cannot write \$statedir/profiles; undoing"
-  for i in "\${!gsm[@]}"; do printf '%s %s\n' "\${gsm[\$i]}" "\${fo[\$i]}" >>"\$ptmp"; done
-  chmod 0600 "\$ptmp"
+  tmpfiles+=("\$ptmp")
+  for i in "\${!gsm[@]}"; do printf '%s %s\n' "\${gsm[\$i]}" "\${fo[\$i]}" >>"\$ptmp" || fail "cannot write \$statedir/profiles; undoing"; done
+  chmod 0600 "\$ptmp" || fail "cannot write \$statedir/profiles; undoing"
+  stash "\$statedir/profiles" || fail "cannot back up \$statedir/profiles; undoing"
   mv -T -- "\$ptmp" "\$statedir/profiles" || fail "cannot write \$statedir/profiles; undoing"
 else
   echo "no gsm profile found; set never-default on it yourself once it exists"
 fi
 
 # 2. The copy.
-mkdir -p -m 0700 -- "\$dir"
-tmp=\$(mktemp "\$dir/.quectel-usbnet-uplink.XXXXXX")
-trap 'rm -f -- "\$tmp"' EXIT
-cp -- $(printf '%q' "$src") "\$tmp"
-chmod 0755 "\$tmp"
-mv -T -- "\$tmp" "\$dest"
+mkdir_ours "\$dir" || fail "cannot create \$dir; undoing"
+tmp=\$(mktemp "\$dir/.quectel-usbnet-uplink.XXXXXX") || fail "cannot write the copy; undoing"
+tmpfiles+=("\$tmp")
+cp -- $(printf '%q' "$src") "\$tmp" || fail "cannot write the copy; undoing"
+chmod 0755 "\$tmp" || fail "cannot write the copy; undoing"
+stash "\$dest" || fail "cannot back up the old copy; undoing"
+mv -T -- "\$tmp" "\$dest" || fail "cannot place the copy; undoing"
 
 # 3. The units.
-mkdir -p -m 0700 -- "\$unitdir"
+mkdir_ours "\$unitdir" || fail "cannot create \$unitdir; undoing"
 # place_unit NAME: the unit text comes on standard input
 place_unit() {
   local utmp
-  utmp=\$(mktemp "\$unitdir/.\$1.XXXXXX")
-  cat >"\$utmp"
-  chmod 0644 "\$utmp"
-  mv -T -- "\$utmp" "\$unitdir/\$1"
+  utmp=\$(mktemp "\$unitdir/.\$1.XXXXXX") || fail "cannot write \$1; undoing"
+  tmpfiles+=("\$utmp")
+  cat >"\$utmp" || fail "cannot write \$1; undoing"
+  chmod 0644 "\$utmp" || fail "cannot write \$1; undoing"
+  stash "\$unitdir/\$1" || fail "cannot back up \$1; undoing"
+  mv -T -- "\$utmp" "\$unitdir/\$1" || fail "cannot place \$1; undoing"
 }
 place_unit $UPLINK_UNIT.service <<'UNIT'
-$(uplink_service_text "$nmcli" "$ip" "$ping" "$flock" "$tmo")
+$(uplink_service_text "$nmcli" "$ip" "$ping" "$flock" "$tmo" "$metric")
 UNIT
 place_unit $UPLINK_RESTORE_UNIT.service <<'UNIT'
-$(uplink_restore_service_text "$nmcli" "$ip" "$ping" "$flock" "$tmo" "$tru")
+$(uplink_restore_service_text "$nmcli" "$ip" "$ping" "$flock" "$tmo" "$tru" "$metric")
 UNIT
 place_unit $UPLINK_UNIT.timer <<'UNIT'
 $(uplink_timer_text)
 UNIT
-systemctl --user daemon-reload
-systemctl --user enable --now $UPLINK_UNIT.timer
+systemctl --user daemon-reload || fail "systemctl daemon-reload failed; undoing"
+tried_enable=1
+systemctl --user enable --now $UPLINK_UNIT.timer || fail "could not enable the timer; undoing"
 
-# 4. One evaluation now (the timer repeats it every 15 seconds).
-"\$dest" uplink auto
+# 4. One evaluation now (the timer repeats it every 15 seconds). If it fails, so
+#    does the install, and everything above is undone.
+ranfirst=1
+"\$dest" uplink auto || fail "the first evaluation failed; undoing"
+# done: the backups of replaced files are not needed any more
+for rec in "\${stashed[@]}"; do rm -f -- "\${rec#*|}"; done
 UPLINK_INSTALL
 
 # Afterwards:
@@ -3176,32 +3354,33 @@ elif [ -e "\$statedir/ledger" ]; then
 fi
 
 # 2b. Delete the failover profiles the install made: only those listed in the
-#     profiles file, and only if the name still ends with the failover suffix. A
-#     deletion that fails stops everything before anything else is removed.
+#     profiles file, and only if the name still ends with the failover suffix. The
+#     file is read with the same rules the manager applies; if it is not valid,
+#     nothing is deleted. A deletion that fails stops everything before anything
+#     else is removed.
 fosuffix='$UPLINK_FO_SUFFIX'
-if [ -L "\$statedir/profiles" ]; then
-  echo "refusing: \$statedir/profiles is a symlink" >&2
+$(uplink_pairs_shell)
+if ! pairs_load "\$statedir/profiles"; then
+  echo "refusing to delete anything: \$statedir/profiles is not a valid pairs file (see above)" >&2
   exit 1
 fi
-if [ -f "\$statedir/profiles" ]; then
-  while read -r pn pf; do
-    case \$pf in "" | *[!0-9A-Fa-f-]*) continue ;; esac
-    if pname=\$(LC_ALL=C $qnm --escape no -g connection.id connection show uuid "\$pf" 2>/dev/null); then
-      case \$pname in
-        *"\$fosuffix")
-          if LC_ALL=C $qnm connection delete uuid "\$pf"; then
-            echo "deleted failover profile \$pf"
-          else
-            echo "could not delete failover profile \$pf; nothing else was removed. Delete it by hand: nmcli connection delete uuid \$pf" >&2
-            exit 1
-          fi
-          ;;
-        *) echo "left profile \$pf: its name is not a failover name" ;;
-      esac
-    fi
-  done <"\$statedir/profiles"
-  rm -f -- "\$statedir/profiles"
-fi
+for i in "\${!pair_f[@]}"; do
+  pf=\${pair_f[\$i]}
+  if pname=\$(LC_ALL=C $qnm --escape no -g connection.id connection show uuid "\$pf" 2>/dev/null); then
+    case \$pname in
+      *"\$fosuffix")
+        if LC_ALL=C $qnm connection delete uuid "\$pf"; then
+          echo "deleted failover profile \$pf"
+        else
+          echo "could not delete failover profile \$pf; nothing else was removed. Delete it by hand: nmcli connection delete uuid \$pf" >&2
+          exit 1
+        fi
+        ;;
+      *) echo "left profile \$pf: its name is not a failover name" ;;
+    esac
+  fi
+done
+rm -f -- "\$statedir/profiles"
 
 # 3. Remove what we wrote, only if it is ours.
 # remove_ours FILE LINE MARKER: delete FILE only if it is a regular file (not a
