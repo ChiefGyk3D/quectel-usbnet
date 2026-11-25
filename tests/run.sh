@@ -704,8 +704,31 @@ cat >"$gbin/nft" <<'FAKE'
 echo "nft $*" >>"$GFAKE/calls"
 case "$*" in
   "list table inet quectel_modem_guard") [ -f "$GFAKE/table" ] ;;
-  "-f -") cat >"$GFAKE/table" ;;
-  "delete table inet quectel_modem_guard") rm -f "$GFAKE/table" ;;
+  "-f -")
+    if [ -f "$GFAKE/fail_load" ]; then
+      cat >/dev/null
+      echo "Error: load failed" >&2
+      exit 1
+    fi
+    cat >"$GFAKE/table"
+    ;;
+  "delete table inet quectel_modem_guard")
+    # fail_delete: always fails. fail_delete_once: fails the first time only.
+    if [ -f "$GFAKE/fail_delete" ]; then
+      echo "Error: netlink busy" >&2
+      exit 1
+    fi
+    if [ -f "$GFAKE/fail_delete_once" ]; then
+      rm -f "$GFAKE/fail_delete_once"
+      echo "Error: netlink busy" >&2
+      exit 1
+    fi
+    if [ ! -f "$GFAKE/table" ]; then
+      echo "Error: No such file or directory" >&2
+      exit 1
+    fi
+    rm -f "$GFAKE/table"
+    ;;
   *) exit 9 ;;
 esac
 FAKE
@@ -734,6 +757,8 @@ while [ $# -gt 0 ]; do
   shift
 done
 echo "ping $iface" >>"$GFAKE/calls"
+# ping_sleep: a ping that hangs far longer than any timeout it was given
+if [ -f "$GFAKE/ping_sleep" ]; then sleep "$(cat "$GFAKE/ping_sleep")"; fi
 [ "$(cat "$GFAKE/ping_$iface" 2>/dev/null)" = ok ]
 FAKE
 chmod +x "$gbin"/*
@@ -767,6 +792,9 @@ gscene() {
 # grun: one runner pass; prints the log line.
 grun() { cmd_guard_run "$@" 2>&1; }
 table_on() { [ -f "$gf/table" ]; }
+expect_absent() {
+  if [ -e "$1" ]; then fail "$2" "$1 exists"; else ok "$2"; fi
+}
 # expect_table on|off LABEL
 expect_table() {
   if table_on; then
@@ -788,7 +816,7 @@ expect_contains "ruleset lets neighbor discovery through" "$(cat "$gf/table")" "
 expect_contains "ruleset expires by itself if not refreshed" "$(cat "$gf/table")" "timeout 60s"
 expect_contains "ruleset uses its own inet table" "$(cat "$gf/table")" "table inet quectel_modem_guard"
 expect_contains "ruleset has its own priority" "$(cat "$gf/table")" "priority -5"
-if grep -qE 'flush ruleset|delete table inet (filter|ufw)|ip6? ' "$gf/table"; then
+if grep -qE 'flush ruleset|delete table inet (filter|ufw)' "$gf/table"; then
   fail "runner: ruleset only touches its own table"
 else
   ok "runner: ruleset only touches its own table"
@@ -944,14 +972,373 @@ set -e
 expect_eq "guard-install refuses when a needed tool is missing" "$code" 1
 expect_contains "guard-install names the missing tool" "$out2" "not found"
 expect_contains "guard-install says nothing was run" "$out" "Nothing has been run"
+expect_contains "guard-install prints the script's sha256" "$out" "$(sha256sum "$TOOL" | cut -d' ' -f1)"
+expect_contains "guard-install stages through a root-created temp file" "$out" 'sudo mktemp'
+expect_contains "guard-install renames atomically" "$out" 'sudo mv -T --'
+expect_contains "guard-install refuses a symlink destination" "$out" 'is a symlink'
 out=$("$TOOL" guard-uninstall)
-expect_contains "guard-uninstall removes the nft table" "$out" "sudo nft delete table inet quectel_modem_guard"
-expect_contains "guard-uninstall removes the units" "$out" "sudo rm -f /etc/systemd/system/quectel-modem-guard.timer"
+expect_contains "guard-uninstall removes the nft table" "$out" "delete table inet quectel_modem_guard"
+expect_contains "guard-uninstall checks the marker before deleting" "$out" "remove_ours"
 expect_contains "guard-uninstall leaves the resume hook's copy alone" "$out" "quectel-usbnet-guard"
+if [[ $out == *"rm -rf"* ]]; then
+  fail "guard-uninstall has no recursive delete"
+else
+  ok "guard-uninstall has no recursive delete"
+fi
 if [[ $out == *"/usr/local/libexec/quectel-usbnet "* ]] || [[ $out == *"/usr/local/libexec/quectel-usbnet$'\n'"* ]]; then
   fail "guard-uninstall never removes the resume hook's copy"
 else
   ok "guard-uninstall never removes the resume hook's copy"
+fi
+
+# --- fix round 1: hostile paths, safe install steps, uninstall ----------------
+# hostile NAME: a directory with that name holding copies of the four fake tools
+# and a copy of the script, so command -v and readlink -f keep the directory text.
+hostile() {
+  local d="$tmp/h/$1"
+  mkdir -p "$d"
+  cp "$gbin/nft" "$gbin/nmcli" "$gbin/ip" "$gbin/ping" "$TOOL" "$d/"
+  printf '%s' "$d"
+}
+mkdir -p "$tmp/h"
+# run guard-install from a copy of the script in dir $1, tools found in dir $2
+hrun() { PATH="$2:$PATH" "$BASH" "$1/quectel-usbnet" guard-install 2>&1; }
+
+d=$(hostile "it has space")
+set +e
+out=$(hrun "$d" "$d")
+code=$?
+set -e
+expect_eq "install: a space in the tool and script path is accepted" "$code" 0
+expect_contains "install: the unit quotes the tool path" "$out" "Environment=\"QUECTEL_GUARD_NFT=$d/nft\""
+expect_contains "install: the shell commands quote the script path" "$out" "$(printf '%q' "$d/quectel-usbnet")"
+d=$(hostile "it's quoted")
+set +e
+out=$(hrun "$d" "$d")
+code=$?
+set -e
+expect_eq "install: a single quote in the path is accepted" "$code" 0
+expect_contains "install: a single quote is shell-escaped" "$out" "$(printf '%q' "$d/quectel-usbnet")"
+for bad in 'per%cent' "dollar\$sign" 'back\slash' 'double"quote' $'new\nline' $'ctl\001char'; do
+  d=$(hostile "$bad")
+  set +e
+  out=$(hrun "$d" "$d")
+  code=$?
+  set -e
+  expect_eq "install: a tool path with $(printf '%q' "$bad") is refused" "$code" 1
+  expect_contains "install: the refusal says why ($(printf '%q' "$bad"))" "$out" "cannot go into a unit file"
+  if [[ $out == *"sudo "* ]]; then
+    fail "install: no steps are printed for $(printf '%q' "$bad")"
+  else
+    ok "install: no steps are printed for $(printf '%q' "$bad")"
+  fi
+done
+# a hostile script path (the tools are fine): control characters are refused,
+# % is only quoted because the path goes to the shell, never into a unit
+d=$(hostile $'src\nnewline')
+set +e
+out=$(hrun "$d" "$gbin")
+code=$?
+set -e
+expect_eq "install: a newline in the script path is refused" "$code" 1
+expect_contains "install: the script path refusal says why" "$out" "control character"
+d=$(hostile 'src%percent')
+set +e
+out=$(hrun "$d" "$gbin")
+code=$?
+set -e
+expect_eq "install: a % in the script path only needs shell quoting" "$code" 0
+expect_contains "install: that % is shell-quoted" "$out" "$(printf '%q' "$d/quectel-usbnet")"
+
+# Run the printed steps for real against temp directories, with a fake sudo
+# that runs the command as the current user (chown is a no-op).
+sb="$tmp/sudobin"
+mkdir -p "$sb"
+cat >"$sb/sudo" <<'FAKE'
+#!/usr/bin/env bash
+case "$1" in
+  -v | chown) exit 0 ;;
+esac
+exec "$@"
+FAKE
+cat >"$sb/systemctl" <<'FAKE'
+#!/usr/bin/env bash
+echo "systemctl $*" >>"$GFAKE/calls"
+FAKE
+chmod +x "$sb/sudo" "$sb/systemctl"
+inst="$tmp/inst"
+mkdir -p "$inst/src"
+cp "$TOOL" "$inst/src/quectel-usbnet"
+# envs NAME: the seams that point the install at a fresh temp tree
+guard_env() {
+  rm -rf "$inst/root"
+  mkdir -p "$inst/root/units" "$inst/root/libexec"
+  export QUECTEL_GUARD_UNIT_DIR="$inst/root/units" QUECTEL_GUARD_LIBEXEC_DIR="$inst/root/libexec"
+  export QUECTEL_GUARD_OVERRIDE_DIR="$inst/root/etc" QUECTEL_GUARD_STATE_DIR="$inst/root/run"
+}
+steps() { PATH="$sb:$gbin:$PATH" "$BASH" "$inst/src/quectel-usbnet" guard-"$1" >"$inst/$1.sh" 2>&1; }
+runsteps() { PATH="$sb:$gbin:$PATH" "$BASH" "$inst/$1.sh" >"$inst/$1.out" 2>&1; }
+
+guard_env
+: >"$gf/calls"
+steps install
+set +e
+runsteps install
+code=$?
+set -e
+expect_eq "install steps: a clean install succeeds" "$code" 0
+expect_eq "install steps: the unit is mode 0644" "$(stat -c %a "$inst/root/units/quectel-modem-guard.service")" 644
+expect_eq "install steps: the script copy is mode 0755" "$(stat -c %a "$inst/root/libexec/quectel-usbnet-guard")" 755
+expect_eq "install steps: the copy is byte for byte the script" \
+  "$(sha256sum <"$inst/root/libexec/quectel-usbnet-guard")" "$(sha256sum <"$inst/src/quectel-usbnet")"
+expect_contains "install steps: the timer is enabled" "$(cat "$gf/calls")" "systemctl enable --now quectel-modem-guard.timer"
+left=$(find "$inst/root/units" "$inst/root/libexec" -name '.*' | wc -l)
+expect_eq "install steps: no temp files are left behind" "$left" 0
+# a permissive unit written by an older install comes back 0644
+chmod 0666 "$inst/root/units/quectel-modem-guard.service"
+set +e
+runsteps install
+code=$?
+set -e
+expect_eq "install steps: a reinstall over our own files succeeds" "$code" 0
+expect_eq "install steps: a permissive unit is replaced by a 0644 one" "$(stat -c %a "$inst/root/units/quectel-modem-guard.service")" 644
+# a symlink at the destination is refused and its target is not written
+guard_env
+echo victim >"$inst/victim"
+ln -s "$inst/victim" "$inst/root/units/quectel-modem-guard.service"
+set +e
+runsteps install
+code=$?
+set -e
+expect_eq "install steps: a symlink destination is refused" "$code" 1
+expect_eq "install steps: the symlink target is untouched" "$(cat "$inst/victim")" victim
+if [ -L "$inst/root/units/quectel-modem-guard.service" ]; then
+  ok "install steps: the symlink is still a symlink"
+else
+  fail "install steps: the symlink is still a symlink"
+fi
+left=$(find "$inst/root/units" -name '.*' | wc -l)
+expect_eq "install steps: a refused install leaves no temp file" "$left" 0
+# a file that is not ours is refused
+guard_env
+echo "[Service] # an administrator's own unit" >"$inst/root/units/quectel-modem-guard.timer"
+set +e
+runsteps install
+code=$?
+set -e
+expect_eq "install steps: a foreign file at the destination is refused" "$code" 1
+expect_contains "install steps: the foreign file is left alone" "$(cat "$inst/root/units/quectel-modem-guard.timer")" "administrator's own"
+# the script changes between printing and running: nothing is installed
+guard_env
+steps install
+echo "# changed after review" >>"$inst/src/quectel-usbnet"
+set +e
+runsteps install
+code=$?
+set -e
+expect_eq "install steps: a script changed after printing is refused" "$code" 1
+expect_contains "install steps: the refusal explains" "$(cat "$inst/install.out")" "changed after guard-install printed"
+if [ -e "$inst/root/libexec/quectel-usbnet-guard" ]; then
+  fail "install steps: nothing is installed when the hash differs"
+else
+  ok "install steps: nothing is installed when the hash differs"
+fi
+cp "$TOOL" "$inst/src/quectel-usbnet"
+
+# Uninstall: only files that carry the marker are deleted.
+guard_env
+steps install
+runsteps install
+mkdir -p "$inst/root/etc" "$inst/root/run"
+echo off >"$inst/root/etc/guard-override"
+echo "up 0 0" >"$inst/root/run/ethernet"
+echo "up 0 0" >"$inst/root/run/wifi"
+echo precious >"$inst/root/run/other-state"
+echo "an admin edit" >"$inst/root/units/quectel-modem-guard.timer"
+steps uninstall
+set +e
+runsteps uninstall
+code=$?
+set -e
+expect_eq "uninstall steps: run cleanly" "$code" 0
+expect_absent "$inst/root/units/quectel-modem-guard.service" "uninstall steps: our unit is removed"
+expect_absent "$inst/root/libexec/quectel-usbnet-guard" "uninstall steps: our script copy is removed"
+expect_eq "uninstall steps: a unit without the marker is left alone" "$(cat "$inst/root/units/quectel-modem-guard.timer")" "an admin edit"
+expect_contains "uninstall steps: the left file is named" "$(cat "$inst/uninstall.out")" "left $inst/root/units/quectel-modem-guard.timer: not written by quectel-usbnet"
+expect_absent "$inst/root/etc" "uninstall steps: the override and its empty directory are removed"
+expect_absent "$inst/root/run/ethernet" "uninstall steps: the known state files are removed"
+expect_absent "$inst/root/run/wifi" "uninstall steps: the wifi state file is removed"
+expect_eq "uninstall steps: an unknown file in the state directory survives" "$(cat "$inst/root/run/other-state")" precious
+# a symlinked script copy is not followed
+guard_env
+steps install
+runsteps install
+rm -f "$inst/root/libexec/quectel-usbnet-guard"
+echo victim >"$inst/victim"
+ln -s "$inst/victim" "$inst/root/libexec/quectel-usbnet-guard"
+steps uninstall
+runsteps uninstall
+expect_eq "uninstall steps: a symlinked copy is left and its target survives" "$(cat "$inst/victim")" victim
+unset QUECTEL_GUARD_UNIT_DIR QUECTEL_GUARD_LIBEXEC_DIR QUECTEL_GUARD_OVERRIDE_DIR QUECTEL_GUARD_STATE_DIR
+
+# --- fix round 1: the off path fails open --------------------------------------
+# arm: two good rounds
+garm() {
+  gscene ok ok
+  grun >/dev/null
+  grun >/dev/null
+}
+# Both links dead and the delete fails: the decision is off, the run says so
+# loudly, retries once, exits non-zero, and still saves the link state.
+garm
+echo dead >"$gf/ping_eth0"
+echo dead >"$gf/ping_wlan0"
+grun >/dev/null
+: >"$gf/calls"
+: >"$gf/fail_delete"
+set +e
+out=$(grun)
+code=$?
+set -e
+expect_contains "off path: the decision is still off" "$out" "guard=off (failover)"
+expect_contains "off path: a failed delete is reported loudly" "$out" "ERROR: could not remove the nft table"
+expect_eq "off path: a failed delete exits non-zero" "$code" 1
+expect_eq "off path: the delete is tried twice" "$(grep -c '^nft delete' "$gf/calls")" 2
+expect_contains "off path: the link state is saved even so" "$(cat "$GUARD_STATE_DIR/wifi")" "down"
+# A state directory that cannot be written must not stop the guard from opening.
+garm
+echo dead >"$gf/ping_eth0"
+echo dead >"$gf/ping_wlan0"
+echo notadir >"$gf/blocker"
+set +e
+out=$(
+  GUARD_STATE_DIR="$gf/blocker/sub"
+  grun
+)
+code=$?
+set -e
+expect_contains "off path: an unwritable state directory is only a warning" "$out" "could not save the link state"
+expect_table off "off path: the guard still opens when the state cannot be saved"
+# One transient failure: the retry opens the guard.
+garm
+echo dead >"$gf/ping_eth0"
+echo dead >"$gf/ping_wlan0"
+grun >/dev/null
+: >"$gf/fail_delete_once"
+set +e
+out=$(grun)
+code=$?
+set -e
+expect_eq "off path: a single failed delete is retried and succeeds" "$code" 0
+expect_table off "off path: the retry removed the table"
+# A table that is already gone is success, not an error.
+gscene ok ok
+set +e
+out=$(grun)
+code=$?
+set -e
+expect_eq "off path: deleting a table that is not there is not an error" "$code" 0
+# A failed load removes the table instead of leaving the old one armed.
+garm
+: >"$gf/fail_load"
+: >"$gf/calls"
+set +e
+out=$(grun)
+code=$?
+set -e
+expect_eq "on path: a failed rule load exits non-zero" "$code" 1
+expect_contains "on path: a failed rule load is reported" "$out" "loading the rules failed"
+expect_table off "on path: a failed rule load fails open"
+
+# --- fix round 1: bounded work -------------------------------------------------
+# Ten Ethernet devices and a Wi-Fi, every ping hangs for far longer than the
+# deadline. At most 4 per type are probed, in parallel, and the run still ends.
+gscene dead ok
+for i in 1 2 3 4 5 6 7 8 9; do echo "eth$i:ethernet:connected" >>"$gf/devices"; done
+echo 4711 >"$gf/ping_sleep"
+: >"$gf/calls"
+GUARD_DEADLINE=3
+SECONDS=0
+set +e
+out=$(grun)
+code=$?
+set -e
+elapsed=$SECONDS
+GUARD_DEADLINE=12
+expect_eq "bounded: the run ends near the deadline, not after the hanging pings" "$((elapsed <= 6 ? 1 : 0))" 1
+expect_eq "bounded: the run still decides" "$code" 0
+expect_contains "bounded: hanging probes count as failures, so the guard opens" "$out" "guard=off"
+expect_eq "bounded: only 4 Ethernet devices and 1 Wi-Fi are probed" "$(grep -c '^ping' "$gf/calls")" 5
+leftover=0
+for f in /proc/[0-9]*/cmdline; do
+  if [ "$(tr '\0' ' ' <"$f" 2>/dev/null)" = "sleep 4711 " ]; then
+    leftover=$((leftover + 1))
+    pid=${f#/proc/}
+    kill "${pid%/cmdline}" 2>/dev/null || true
+  fi
+done
+expect_eq "bounded: the deadline kills the hanging pings" "$leftover" 0
+rm -f "$gf/ping_sleep"
+
+# --- fix round 1: settings are validated ---------------------------------------
+for pair in "GUARD_TTL=60s; flush ruleset" "GUARD_TTL=5" "GUARD_FAILS=0" "GUARD_OKS=abc" \
+  "GUARD_PING_TIMEOUT=999" "GUARD_DEADLINE=1" "GUARD_MAX_DEVICES=100" "GUARD_TTL="; do
+  garm
+  var=${pair%%=*}
+  val=${pair#*=}
+  set +e
+  out=$(
+    printf -v "$var" '%s' "$val"
+    grun
+  )
+  code=$?
+  set -e
+  expect_eq "config: $var=$val exits non-zero" "$code" 1
+  expect_contains "config: $var=$val names the setting" "$out" "QUECTEL_$var"
+  expect_contains "config: $var=$val forces the guard off" "$out" "guard forced off"
+  expect_table off "config: $var=$val removes an armed table"
+done
+garm
+expect_table on "config: the defaults are valid"
+
+# --- fix round 1: DHCP exceptions are narrow ------------------------------------
+rs=$(guard_ruleset wwan0)
+if [[ $rs == *"udp dport { 67, 547 }"* ]]; then
+  fail "ruleset: no accept for any UDP to a DHCP port"
+else
+  ok "ruleset: no accept for any UDP to a DHCP port"
+fi
+expect_contains "ruleset: DHCPv4 is client port 68 to server port 67, limited broadcast" "$rs" "ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"
+expect_contains "ruleset: DHCPv6 is 546 to 547, link-local or multicast only" "$rs" "ip6 daddr { fe80::/10, ff02::/16 } udp sport 546 udp dport 547 accept"
+
+# --- fix round 1: the real ruleset in a throwaway network namespace ------------
+# Skipped where unshare, nft, ip or python3 is missing or user namespaces are
+# not allowed. The namespace is private: nothing here touches the host network.
+if command -v unshare >/dev/null 2>&1 && command -v nft >/dev/null 2>&1 &&
+  command -v ip >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 &&
+  unshare -rn true >/dev/null 2>&1; then
+  set +e
+  nsout=$(unshare -rn "$BASH" "$HERE/ns_guard.sh" "$TOOL" 2>&1)
+  set -e
+  nsn=0
+  while IFS= read -r line; do
+    case $line in
+      "PASS "*)
+        ok "namespace: ${line#PASS }"
+        nsn=$((nsn + 1))
+        ;;
+      "FAIL "*)
+        fail "namespace: ${line#FAIL }"
+        nsn=$((nsn + 1))
+        ;;
+      "SKIP "*) echo "skip ${line#SKIP }" ;;
+    esac
+  done <<<"$nsout"
+  if [ "$nsn" -lt 10 ]; then
+    fail "namespace: the checks ran" "only $nsn results: $nsout"
+  fi
+else
+  echo "skip namespace tests: unshare, nft, ip, python3 or user namespaces are not available"
 fi
 
 # --- the command line -------------------------------------------------------

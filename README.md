@@ -158,11 +158,21 @@ The next run (within 15 seconds) removes the table. Remove the file to go back t
 
 ### What the rules allow
 
-Out of the modem interface, while the guard is on, these still pass: ICMPv6 neighbor and router discovery, and DHCP (UDP to port 67 and 547). Everything else is rejected. The modem's registration with the network and its data session live inside the modem, not in this traffic, which is why it stays connected. The table is `inet quectel_modem_guard`, at output hook priority -5, with only its own rules. It does not touch ufw, `/etc/nftables.conf` or any other table.
+Out of the modem interface, while the guard is on, only these still pass, and only in these shapes:
 
-The interface is held in a set with a 60 second timeout that every run refreshes. If the timer stops or the script crashes, the rules go inert by themselves within a minute. A dead guard cannot leave you without a fallback.
+- ICMPv6 neighbor and router discovery (solicit and advert types).
+- DHCPv4 from client port 68 to server port 67, to the limited broadcast address 255.255.255.255. A unicast renewal is not allowed; the client falls back to a broadcast.
+- DHCPv6 from port 546 to port 547, to a link-local (fe80::/10) or link-scope multicast (ff02::/16) destination.
 
-I loaded the ruleset in a throwaway network namespace on the development laptop (`unshare -rn`, a dummy interface, nothing on the real network): a TCP connect out of the interface timed out before the table, was refused at once with it, and timed out again after the table was deleted.
+Everything else is rejected, including any other UDP to ports 67 or 547, so those ports are not a channel out. The modem's registration with the network and its data session live inside the modem, not in this traffic, which is why it stays connected. The table is `inet quectel_modem_guard`, at output hook priority -5, with only its own rules. It does not touch ufw, `/etc/nftables.conf` or any other table.
+
+The interface is held in a set with a 60 second timeout that every run refreshes. If the timer stops or the script crashes, the rules go inert by themselves. The fail-open path is attempted first in every run: the decision to open the guard runs the table delete before any bookkeeping, retries it once if it fails, and if it still fails it logs an error and the service exits non-zero (check `systemctl status quectel-modem-guard.service`). In that one case, a delete that cannot be done, the modem stays blocked until the timeout expires, up to 60 seconds. That residual outage is real; the timeout bounds it, it does not remove it.
+
+The work in one run is bounded as well: at most 4 devices of each type are probed, all at the same time, with a 12 second internal deadline (the unit allows 30). Probes still running at the deadline are killed and count as failures, so a pile of dead interfaces cannot starve the delete.
+
+Every numeric setting (`QUECTEL_GUARD_TTL` 10 to 3600, `_FAILS` and `_OKS` 1 to 20, `_PING_TIMEOUT` 1 to 10, `_DEADLINE` 2 to 20, `_MAX_DEVICES` 1 to 8) is checked at start. A bad value forces the guard off, logs which setting, and exits non-zero.
+
+I loaded the ruleset in a throwaway network namespace on the development laptop (`unshare -rn`, a dummy interface, nothing on the real network). `tests/ns_guard.sh` repeats that on every test run where `unshare -rn` works: IPv4 and IPv6 UDP out of the interface is rejected with the table and leaves without it, the DHCP shapes above pass, the same ports in any other shape are rejected, the table can be deleted, and a table nothing refreshes goes inert after its timeout.
 
 ### Install and uninstall
 
@@ -173,7 +183,15 @@ quectel-usbnet guard-install
 quectel-usbnet guard-uninstall
 ```
 
-The install steps copy the script to a root-owned `/usr/local/libexec/quectel-usbnet-guard` (a different file from the resume hook's copy), write a service and a timer into `/etc/systemd/system`, and enable the timer. The absolute paths of `nft`, `nmcli`, `ip` and `ping` are resolved when you run `guard-install` and written into the unit, so the root service never looks anything up on a `PATH` (the same lesson as the resume hook). The uninstall steps stop the timer, delete the table, and remove every file the install wrote, which puts the machine back as it was.
+The install steps copy the script to a root-owned `/usr/local/libexec/quectel-usbnet-guard` (a different file from the resume hook's copy), write a service and a timer into `/etc/systemd/system`, and enable the timer. The absolute paths of `nft`, `nmcli`, `ip` and `ping` are resolved when you run `guard-install` and written into the unit, so the root service never looks anything up on a `PATH` (the same lesson as the resume hook).
+
+How the printed steps stay safe:
+
+- Every path is shell-quoted in the commands and double-quoted in the unit. A resolved tool path that contains a control character (a newline would start a new unit directive), `%`, `$`, a backslash or a double quote is refused with an error and nothing is printed. The path of the script itself must be free of control characters.
+- Each file is written to a root-created temp file in its destination directory, set to `root:root` and mode 0644 (0755 for the script), and moved into place with an atomic `mv -T`. A destination that is a symlink is refused, and so is an existing file that does not carry this tool's marker, so a pre-existing symlink is never written through and an old permissive mode is never kept.
+- The steps print the sha256 of the script and check the root-owned copy against it before the move. If the script changed after you read the steps, nothing is installed and you run `guard-install` again.
+
+The uninstall steps stop the timer, delete the table, and then remove the units and the script copy only if each carries the marker this tool wrote; a file without it, or a symlink, is left alone and named. The override file (which you wrote) is removed if it is a plain file, and the two state files and the empty directories go; there is no recursive delete, so anything else in those directories stays. That puts the machine back as it was.
 
 To see what it would decide without applying anything, run it from the checkout with the tool paths that `guard-install` printed (the example paths below are typical; use yours). It needs no root and writes nothing. With no saved history every link starts as down, so a first dry run reports `failover` until the real timer has seen two good rounds:
 
@@ -198,7 +216,8 @@ journalctl -u quectel-modem-guard.service -n 5
 - Failover is not instant: about 30 to 45 seconds after both links die (two failed rounds, 15 seconds apart, plus ping timeouts). Reverting is the same on the way back.
 - The probe sends a ping to the two resolver addresses every 15 seconds from each of Ethernet and Wi-Fi. If that is not acceptable, add `Environment=QUECTEL_GUARD_TARGETS="addr1 addr2"` to the service with `sudo systemctl edit quectel-modem-guard.service`.
 - Inbound traffic is not touched, only what the machine sends out of the modem interface.
-- Tested here only with fake `nft`, `nmcli`, `ip` and `ping` (the decision logic and the runner), plus the namespace check above. The install on a live machine, and the counters staying flat on a real Wi-Fi link, are for the person who runs the steps to confirm.
+- What the tests cover. With fake `nft`, `nmcli`, `ip` and `ping`: the decision logic, the runner, the install and uninstall steps (run for real against temp directories with a fake `sudo`), hostile paths, config validation, the failing-delete and failing-load paths, and the probe deadline. In a private network namespace with the real `nft`: the ruleset grammar, IPv4 and IPv6 rejection, the DHCP shapes, delete, and expiry. That namespace test skips itself where `unshare -rn`, `nft`, `ip` or `python3` is missing, so on such a machine only the fakes ran.
+- What the tests do not cover. The fakes do not check the real `ping`, `ip` and `nmcli` output formats beyond one hand-checked dry run, real option parsing, or terse-mode escaping. The namespace test does not exercise ICMPv6 neighbor discovery on the wire (the types are in the loaded ruleset, but nothing sends one), a real modem, systemd's sandbox options, or a real `sudo`. A real install, and the counters staying flat on a real Wi-Fi link, are for the person who runs the steps to confirm.
 
 ## What was going wrong
 
