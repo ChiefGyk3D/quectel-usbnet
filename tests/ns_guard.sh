@@ -42,14 +42,18 @@ check "the ruleset reloads over itself" "$?" 0
 
 check "armed: IPv4 is rejected" "$(probe 4 198.51.100.7 9000 -)" rejected
 check "armed: IPv6 is rejected" "$(probe 6 2001:db8:ffff::7 9000 -)" rejected
-check "armed: a UDP packet to port 67 from a random port is rejected" "$(probe 4 255.255.255.255 67 -)" rejected
-check "armed: a UDP packet to port 67 of a unicast host is rejected" "$(probe 4 192.0.2.1 67 68)" rejected
-check "armed: a UDP packet from port 68 to a wrong port is rejected" "$(probe 4 255.255.255.255 9000 68)" rejected
-check "armed: DHCPv4 shape (68 to 67, limited broadcast) passes" "$(probe 4 255.255.255.255 67 68)" passed
-check "armed: a UDP packet to port 547 from a random port is rejected" "$(probe 6 ff02::1:2 547 -)" rejected
-check "armed: a UDP packet 546 to 547 of a global host is rejected" "$(probe 6 2001:db8::5 547 546)" rejected
-check "armed: DHCPv6 shape (546 to 547, All_DHCP_Relay_Agents) passes" "$(probe 6 ff02::1:2 547 546)" passed
-check "armed: DHCPv6 shape to a link-local server passes" "$(probe 6 fe80::1 547 546)" passed
+# No DHCP exception: the interface is configured statically, so every UDP shape
+# on the DHCP ports is rejected, from either side, unicast or multicast.
+check "armed: UDP to port 67 from a random port is rejected" "$(probe 4 255.255.255.255 67 -)" rejected
+check "armed: UDP to port 67 of a unicast host is rejected" "$(probe 4 192.0.2.1 67 68)" rejected
+check "armed: UDP from 68 to 67 on the limited broadcast is rejected" "$(probe 4 255.255.255.255 67 68)" rejected
+check "armed: UDP from 68 to a wrong port is rejected" "$(probe 4 255.255.255.255 9000 68)" rejected
+check "armed: UDP to port 68 is rejected" "$(probe 4 192.0.2.1 68 67)" rejected
+check "armed: UDP to port 547 from a random port is rejected" "$(probe 6 ff02::1:2 547 -)" rejected
+check "armed: UDP from 546 to 547 on All_DHCP_Relay_Agents is rejected" "$(probe 6 ff02::1:2 547 546)" rejected
+check "armed: UDP from 546 to 547 on a link-local server is rejected" "$(probe 6 fe80::1 547 546)" rejected
+check "armed: UDP from 546 to 547 on a global server is rejected" "$(probe 6 2001:db8::5 547 546)" rejected
+check "armed: UDP to port 546 is rejected" "$(probe 6 fe80::1 546 547)" rejected
 
 # Delete opens the guard.
 nft delete table inet quectel_modem_guard

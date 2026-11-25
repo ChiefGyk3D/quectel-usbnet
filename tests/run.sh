@@ -734,7 +734,8 @@ esac
 FAKE
 cat >"$gbin/nmcli" <<'FAKE'
 #!/usr/bin/env bash
-echo "nmcli $*" >>"$GFAKE/calls"
+echo "nmcli LC_ALL=${LC_ALL:-unset} $*" >>"$GFAKE/calls"
+if [ "$1" = --escape ]; then shift 2; fi
 case "$1" in
   -t) cat "$GFAKE/devices" ;;
   -g) cat "$GFAKE/ipiface_${5}" 2>/dev/null ;;
@@ -942,13 +943,18 @@ echo "total garbage here" >"$GUARD_STATE_DIR/wifi"
 echo "up 9 9" >"$GUARD_STATE_DIR/ethernet"
 out=$(grun)
 expect_contains "runner: a corrupt state file does not crash the run" "$out" "guard="
+run_bare_nft() {
+  local GUARD_NFT=nft
+  cmd_guard_run 2>&1
+}
+run_bad_state() {
+  local GUARD_STATE_DIR="$gf/blocker/sub"
+  grun
+}
 
 # Tool paths must be absolute.
 set +e
-out=$(
-  GUARD_NFT=nft
-  cmd_guard_run 2>&1
-)
+out=$(run_bare_nft)
 code=$?
 set -e
 expect_eq "runner: a bare tool name is refused" "$code" 1
@@ -1216,10 +1222,7 @@ echo dead >"$gf/ping_eth0"
 echo dead >"$gf/ping_wlan0"
 echo notadir >"$gf/blocker"
 set +e
-out=$(
-  GUARD_STATE_DIR="$gf/blocker/sub"
-  grun
-)
+out=$(run_bad_state)
 code=$?
 set -e
 expect_contains "off path: an unwritable state directory is only a warning" "$out" "could not save the link state"
@@ -1307,15 +1310,212 @@ done
 garm
 expect_table on "config: the defaults are valid"
 
-# --- fix round 1: DHCP exceptions are narrow ------------------------------------
+# --- fix round 2: no DHCP exception (the interface is configured statically) ---
 rs=$(guard_ruleset wwan0)
-if [[ $rs == *"udp dport { 67, 547 }"* ]]; then
-  fail "ruleset: no accept for any UDP to a DHCP port"
+if [[ $rs == *"udp"* ]]; then
+  fail "ruleset: no UDP accept of any kind"
 else
-  ok "ruleset: no accept for any UDP to a DHCP port"
+  ok "ruleset: no UDP accept of any kind"
 fi
-expect_contains "ruleset: DHCPv4 is client port 68 to server port 67, limited broadcast" "$rs" "ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept"
-expect_contains "ruleset: DHCPv6 is 546 to 547, link-local or multicast only" "$rs" "ip6 daddr { fe80::/10, ff02::/16 } udp sport 546 udp dport 547 accept"
+expect_contains "ruleset: ICMPv6 neighbor and router discovery are kept" "$rs" "nd-router-advert"
+accepts=$(printf '%s\n' "$rs" | grep -c ' accept$')
+expect_eq "ruleset: exactly one accept rule" "$accepts" 1
+
+# --- fix round 2: a probe that ignores TERM cannot hold the run ----------------
+cat >"$gbin/ping" <<'FAKE'
+#!/usr/bin/env bash
+# ping -n -q -c 1 -W T -w T -I IFACE TARGET
+iface=""
+while [ $# -gt 0 ]; do
+  [ "$1" = -I ] && iface=$2
+  shift
+done
+echo "ping $iface" >>"$GFAKE/calls"
+# ping_deaf: ignores TERM and never ends (only KILL stops it)
+if [ -f "$GFAKE/ping_deaf" ]; then
+  trap '' TERM
+  while :; do sleep 1; done
+fi
+if [ -f "$GFAKE/ping_sleep" ]; then sleep "$(cat "$GFAKE/ping_sleep")"; fi
+[ "$(cat "$GFAKE/ping_$iface" 2>/dev/null)" = ok ]
+FAKE
+chmod +x "$gbin/ping"
+garm
+echo dead >"$gf/ping_eth0"
+echo dead >"$gf/ping_wlan0"
+: >"$gf/ping_deaf"
+GUARD_DEADLINE=2
+# the run goes to a file and a watchdog ends the test if it hangs, instead of the suite
+# watched: one run in a fresh shell under a 20 s timeout; prints ended or hung
+# shellcheck disable=SC2031,SC2016 # earlier subshell assignments are scoped on purpose; the -c script must stay literal
+watched() {
+  local rc=0
+  QUECTEL_GUARD_NFT=$GUARD_NFT QUECTEL_GUARD_NMCLI=$GUARD_NMCLI QUECTEL_GUARD_IP=$GUARD_IP \
+    QUECTEL_GUARD_PING=$GUARD_PING QUECTEL_GUARD_STATE_DIR=$GUARD_STATE_DIR \
+    QUECTEL_GUARD_OVERRIDE=$GUARD_OVERRIDE QUECTEL_GUARD_TARGETS=$GUARD_TARGETS \
+    QUECTEL_GUARD_DEADLINE=$GUARD_DEADLINE \
+    timeout 20 "$BASH" -c 'source "$1"; set +e; cmd_guard_run' _ "$TOOL" >"$tmp/deaf.out" 2>&1 || rc=$?
+  if [ "$rc" -eq 124 ]; then echo hung; else echo ended; fi
+}
+expect_eq "deaf probe: the run ends within the deadline plus the 1 s grace" "$(watched)" ended
+: >"$gf/calls"
+SECONDS=0
+grun >"$tmp/deaf.out" 2>&1 || true
+deaf_elapsed=$SECONDS
+expect_eq "deaf probe: a whole run takes at most deadline + grace + slack" "$((deaf_elapsed <= 6 ? 1 : 0))" 1
+expect_contains "deaf probe: the run still decides" "$(cat "$tmp/deaf.out")" "guard=off (failover)"
+expect_table off "deaf probe: the fail-open delete still ran"
+rm -f "$gf/ping_deaf"
+GUARD_DEADLINE=12
+
+# --- fix round 2: nmcli output is parsed in the C locale, unescaped -------------
+expect_eq "parse: a colon inside a device name is split from the right" \
+  "$(printf 'we:ird0:ethernet:connected\neth0:ethernet:connected\n' | guard_devices_of_type ethernet | tr '\n' ' ')" "we:ird0 eth0 "
+gscene ok ok
+echo "we:ird0:ethernet:connected" >>"$gf/devices"
+echo ok >"$gf/ping_we:ird0"
+: >"$gf/calls"
+out=$(LC_ALL=de_DE.UTF-8 LANG=de_DE.UTF-8 grun)
+expect_contains "nmcli: the device list is read with LC_ALL=C and --escape no" "$(cat "$gf/calls")" "nmcli LC_ALL=C --escape no -t -f DEVICE,TYPE,STATE device"
+expect_contains "nmcli: the modem interface is read with LC_ALL=C and --escape no" "$(cat "$gf/calls")" "nmcli LC_ALL=C --escape no -g GENERAL.IP-IFACE device show cdc-wdm0"
+expect_eq "nmcli: a device whose name holds a colon is never probed" "$(grep -c 'ping we' "$gf/calls")" 0
+expect_contains "nmcli: the ordinary devices are still read in a non-C locale" "$out" "ethernet="
+
+# --- fix round 2: the runner never takes a command from the caller's PATH ------
+ev="$tmp/evil"
+mkdir -p "$ev"
+for n in grep head tr mktemp mv rm rmdir install cat sed cut sleep; do
+  printf '#!/bin/sh\ntouch "%s/hit"\nexit 1\n' "$ev" >"$ev/$n"
+  chmod +x "$ev/$n"
+done
+gscene ok ok
+echo auto >"$GUARD_OVERRIDE"
+with_evil_path() {
+  local PATH="$ev:$PATH"
+  grun >/dev/null
+  grun >"$tmp/evil.out"
+}
+with_evil_path
+expect_absent "$ev/hit" "PATH: a hostile directory on the caller's PATH is never used"
+expect_contains "PATH: the run still works with that PATH" "$(cat "$tmp/evil.out")" "guard=on (healthy)"
+expect_contains "unit: PATH is exactly the two system directories" "$(guard_service_text /a /b /c /d)" 'Environment="PATH=/usr/sbin:/usr/bin"'
+
+# --- fix round 2: printed steps refuse symlinked directories and odd files -----
+runsteps_t() { PATH="$sb:$gbin:$PATH" timeout 20 "$BASH" "$inst/$1.sh" >"$inst/$1.out" 2>&1; }
+count_files() { find "$1" -mindepth 1 | wc -l; }
+# a symlinked unit directory
+guard_env
+mv "$inst/root/units" "$inst/root/realunits"
+ln -s realunits "$inst/root/units"
+steps install
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "install steps: a symlinked unit directory is refused" "$code" 1
+expect_contains "install steps: the refusal names the symlink" "$(cat "$inst/install.out")" "symlink"
+expect_eq "install steps: nothing was written through the symlinked unit directory" "$(count_files "$inst/root/realunits")" 0
+# a symlinked parent of the libexec directory
+guard_env
+mkdir -p "$inst/realparent/libexec"
+ln -s "$inst/realparent" "$inst/root/par"
+export QUECTEL_GUARD_LIBEXEC_DIR="$inst/root/par/libexec"
+steps install
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "install steps: a symlinked parent directory is refused" "$code" 1
+expect_eq "install steps: nothing was written through the symlinked parent" "$(count_files "$inst/realparent")" 1
+# a symlinked libexec directory
+guard_env
+mkdir -p "$inst/elsewhere"
+rmdir "$inst/root/libexec"
+ln -s "$inst/elsewhere" "$inst/root/libexec"
+steps install
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "install steps: a symlinked libexec directory is refused" "$code" 1
+expect_eq "install steps: nothing was written through the symlinked libexec directory" "$(count_files "$inst/elsewhere")" 0
+# a symlinked override directory
+guard_env
+ln -s "$inst/elsewhere" "$inst/root/etc"
+steps install
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "install steps: a symlinked override directory is refused" "$code" 1
+# the marker has to be the exact first line of a regular file
+guard_env
+steps install
+printf 'one\ntwo\n# written by quectel-usbnet guard-install\n' >"$inst/root/units/quectel-modem-guard.service"
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "install steps: a marker in the middle of a file is not ownership" "$code" 1
+expect_eq "install steps: that file is left as it was" "$(head -n 1 "$inst/root/units/quectel-modem-guard.service")" one
+guard_env
+steps install
+printf '# written by quectel-usbnet guard-install and then some\n' >"$inst/root/units/quectel-modem-guard.service"
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "install steps: a first line that only starts with the marker is refused" "$code" 1
+guard_env
+steps install
+mkfifo "$inst/root/units/quectel-modem-guard.timer"
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "install steps: a FIFO at the destination is refused, not opened" "$code" 1
+guard_env
+steps install
+printf '# written by quectel-usbnet guard-install\nold\n' >"$inst/root/units/quectel-modem-guard.service"
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "install steps: a file with the exact marker line is accepted" "$code" 0
+# uninstall: same rules
+guard_env
+steps install
+runsteps_t install
+mv "$inst/root/units" "$inst/root/realunits"
+ln -s realunits "$inst/root/units"
+steps uninstall
+runsteps_t uninstall
+if [ -e "$inst/root/realunits/quectel-modem-guard.service" ]; then
+  ok "uninstall steps: a unit behind a symlinked directory is left alone"
+else
+  fail "uninstall steps: a unit behind a symlinked directory is left alone"
+fi
+expect_contains "uninstall steps: the symlinked directory is named" "$(cat "$inst/uninstall.out")" "sits under, a symlink"
+guard_env
+steps install
+runsteps_t install
+printf 'one\ntwo\n# written by quectel-usbnet guard-install\n' >"$inst/root/units/quectel-modem-guard.service"
+rm -f "$inst/root/units/quectel-modem-guard.timer"
+mkfifo "$inst/root/units/quectel-modem-guard.timer"
+steps uninstall
+set +e
+runsteps_t uninstall
+code=$?
+set -e
+expect_eq "uninstall steps: a FIFO does not hang or fail the uninstall" "$code" 0
+expect_eq "uninstall steps: a marker in the middle is not ownership" "$(head -n 1 "$inst/root/units/quectel-modem-guard.service")" one
+if [ -p "$inst/root/units/quectel-modem-guard.timer" ]; then
+  ok "uninstall steps: the FIFO is left in place"
+else
+  fail "uninstall steps: the FIFO is left in place"
+fi
+unset QUECTEL_GUARD_UNIT_DIR QUECTEL_GUARD_LIBEXEC_DIR QUECTEL_GUARD_OVERRIDE_DIR QUECTEL_GUARD_STATE_DIR
+expect_eq "script: line 2 is the marker the installed copy is recognized by" "$(sed -n 2p "$TOOL")" "$GUARD_COPY_LINE"
 
 # --- fix round 1: the real ruleset in a throwaway network namespace ------------
 # Skipped where unshare, nft, ip or python3 is missing or user namespaces are

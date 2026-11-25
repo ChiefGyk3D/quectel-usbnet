@@ -1018,6 +1018,8 @@ GUARD_COPY="$GUARD_LIBEXEC_DIR/quectel-usbnet-guard"
 GUARD_UNIT_DIR=${QUECTEL_GUARD_UNIT_DIR:-/etc/systemd/system}
 GUARD_UNIT="quectel-modem-guard"
 GUARD_UNIT_MARK="# written by quectel-usbnet guard-install"
+# Line 2 of this script, which the installed copy carries too.
+GUARD_COPY_LINE="# quectel-usbnet: read or change the USB network mode of a Quectel modem."
 
 guard_log() {
   echo "quectel-modem-guard: $*"
@@ -1155,11 +1157,19 @@ guard_decide() {
   fi
 }
 
-# Reads `nmcli -t -f DEVICE,TYPE,STATE device` on stdin, prints the names of the
-# connected devices of type $1 (ethernet, wifi or gsm), one per line.
+# Reads `nmcli --escape no -t -f DEVICE,TYPE,STATE device` on stdin (run with
+# LC_ALL=C), prints the names of the connected devices of type $1 (ethernet,
+# wifi or gsm), one per line. Without escaping a device name could hold a colon,
+# so the line is split from the right: the last two fields are state and type,
+# whatever is left is the name (and then fails the interface-name check).
 guard_devices_of_type() {
-  local want=$1 dev type state
-  while IFS=: read -r dev type state _; do
+  local want=$1 line dev type state rest
+  while IFS= read -r line; do
+    [[ $line == *:*:* ]] || continue
+    state=${line##*:}
+    rest=${line%:*}
+    type=${rest##*:}
+    dev=${rest%:*}
     [ "$type" = "$want" ] || continue
     [ "$state" = connected ] || continue
     if [ -n "$dev" ]; then echo "$dev"; fi
@@ -1252,7 +1262,7 @@ guard_probe_many() {
       if guard_probe_iface "$iface"; then r=ok; else r=fail; fi
       echo "$r" >"$d/$i.tmp"
       mv "$d/$i.tmp" "$d/$i"
-    ) &
+    ) >/dev/null 2>&1 </dev/null &
     pids+=("$!")
     i=$((i + 1))
   done
@@ -1265,13 +1275,27 @@ guard_probe_many() {
     [ "$finished" -lt "$n" ] || break
     read -r -t 0.2 <> <(:) || true
   done
+  # Whatever is still running: TERM to its process group, one second of grace,
+  # then KILL. Nothing here waits on a process that was not just sent KILL, so a
+  # probe that ignores TERM cannot hold the run past the deadline.
+  local -a late=()
   i=0
   for pid in "${pids[@]}"; do
     if [ ! -s "$d/$i" ]; then
-      { kill -- "-$pid" && wait "$pid"; } 2>/dev/null || true
+      late+=("$pid")
+      kill -TERM -- "-$pid" 2>/dev/null || true
     fi
     i=$((i + 1))
   done
+  if [ "${#late[@]}" -gt 0 ]; then
+    read -r -t 1 <> <(:) || true
+    for pid in "${late[@]}"; do
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    done
+    for pid in "${late[@]}"; do
+      { wait "$pid"; } 2>/dev/null || true
+    done
+  fi
   set +m
   i=0
   for iface in "$@"; do
@@ -1304,7 +1328,7 @@ guard_modem_iface() {
   local nmdevs=$1 dev iface
   for dev in $(printf '%s\n' "$nmdevs" | guard_devices_of_type gsm); do
     guard_iface_ok "$dev" || continue
-    iface=$("$GUARD_NMCLI" -g GENERAL.IP-IFACE device show "$dev" 2>/dev/null | head -n 1) || iface=""
+    iface=$(LC_ALL=C "$GUARD_NMCLI" --escape no -g GENERAL.IP-IFACE device show "$dev" 2>/dev/null | head -n 1) || iface=""
     if guard_iface_ok "$iface"; then
       echo "$iface"
       return 0
@@ -1316,9 +1340,12 @@ guard_modem_iface() {
 # The nft ruleset for the guard, one atomic transaction that replaces the table.
 # $1 = modem interface. The interface sits in a set whose element expires after
 # GUARD_TTL, so the rules go inert if nothing refreshes them. Allowed through:
-# ICMPv6 neighbor and router discovery and DHCP, which the link needs to stay
-# usable. Everything else out of the modem interface is rejected, so clients
-# fail at once and fall back instead of hanging.
+# ICMPv6 neighbor and router discovery, which IPv6 on the link can use. There is
+# no DHCP exception: ModemManager configures the cellular interface statically
+# from the modem bearer (routes are proto static, the link is point to point and
+# NOARP, no DHCP client runs on it), so there is no lease to renew. Everything
+# else out of the modem interface is rejected, so clients fail at once and fall
+# back instead of hanging.
 guard_ruleset() {
   local iface=$1
   cat <<EOF
@@ -1333,8 +1360,6 @@ table inet $GUARD_TABLE {
   chain output {
     type filter hook output priority -5; policy accept;
     oifname @armed icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
-    oifname @armed ip daddr 255.255.255.255 udp sport 68 udp dport 67 accept
-    oifname @armed ip6 daddr { fe80::/10, ff02::/16 } udp sport 546 udp dport 547 accept
     oifname @armed reject
   }
 }
@@ -1399,6 +1424,10 @@ guard_step_saved() {
 
 # One evaluation: probe, update the link state, decide, apply.
 cmd_guard_run() {
+  # Every external command this runs (grep, head, tr, mktemp, mv, rm, rmdir,
+  # install, cat) comes from these two root-owned directories, never from the
+  # caller's PATH. The four tools that matter most are absolute as well.
+  local PATH=/usr/sbin:/usr/bin
   local dry=false devs modem_if="" override
   while [ $# -gt 0 ]; do
     case $1 in
@@ -1419,7 +1448,7 @@ cmd_guard_run() {
     if ! $dry; then guard_apply_off || true; fi
     return 1
   fi
-  devs=$("$GUARD_NMCLI" -t -f DEVICE,TYPE,STATE device 2>/dev/null) || devs=""
+  devs=$(LC_ALL=C "$GUARD_NMCLI" --escape no -t -f DEVICE,TYPE,STATE device 2>/dev/null) || devs=""
 
   local e_ifs w_ifs probes
   local -a all
@@ -1482,7 +1511,7 @@ Environment="QUECTEL_GUARD_NFT=$1"
 Environment="QUECTEL_GUARD_NMCLI=$2"
 Environment="QUECTEL_GUARD_IP=$3"
 Environment="QUECTEL_GUARD_PING=$4"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+Environment="PATH=/usr/sbin:/usr/bin"
 ExecStart=$GUARD_COPY guard-run
 TimeoutStartSec=30
 NoNewPrivileges=yes
@@ -1548,7 +1577,33 @@ sudo tee "$tmp" >/dev/null <<'UNIT'
 EOF
   cat
   printf 'UNIT\n'
-  printf 'place 0644 "%s" %s %q\n' "\$tmp" "$q" "$mark"
+  printf 'place 0644 "%s" %s 1 %q\n' "\$tmp" "$q" "$mark"
+}
+
+# Shell functions shared by the printed install and uninstall blocks.
+guard_helpers_text() {
+  cat <<'EOF'
+# safe_dir DIR: DIR and every parent that exists is a real directory, not a symlink
+safe_dir() {
+  local p=$1
+  case $p in /*) ;; *) echo "refusing: $p is not an absolute path" >&2; return 1 ;; esac
+  if [ "$(sudo readlink -f -- "$p")" != "$p" ]; then
+    echo "refusing: $p is, or sits under, a symlink" >&2
+    return 1
+  fi
+  while [ -n "$p" ]; do
+    if sudo test -L "$p"; then echo "refusing: $p is a symlink" >&2; return 1; fi
+    if sudo test -e "$p" && ! sudo test -d "$p"; then echo "refusing: $p is not a directory" >&2; return 1; fi
+    p=${p%/*}
+  done
+}
+# ours FILE LINE MARKER: a regular file (never a symlink, FIFO or device, and it is
+# not opened to find out) whose line number LINE is exactly MARKER
+ours() {
+  if sudo test -L "$1" || ! sudo test -f "$1"; then return 1; fi
+  [ "$(sudo sed -n "${2}p;${2}q" -- "$1")" = "$3" ]
+}
+EOF
 }
 
 # Prints the install steps. Runs nothing, installs nothing, never uses sudo.
@@ -1566,6 +1621,7 @@ cmd_guard_install() {
   for p in "$GUARD_UNIT_DIR" "$GUARD_LIBEXEC_DIR" "$GUARD_OVERRIDE_DIR"; do
     guard_path_ok "$p" shell || die "the install directory $(printf '%q' "$p") contains a control character"
   done
+  [ "$(sed -n 2p "$src")" = "$GUARD_COPY_LINE" ] || die "line 2 of $src is not the expected marker line; refusing to print install steps for an unrecognized script"
   hash=$(sha256sum -- "$src" | cut -d' ' -f1)
   qsrc=$(printf '%q' "$src")
   qcopy=$(printf '%q' "$GUARD_COPY")
@@ -1589,19 +1645,27 @@ trap 'for t in "\${tmps[@]}"; do sudo rm -f -- "\$t"; done' EXIT
 sudo -v
 # stage TEMPLATE: a root-created temp file in the destination directory
 stage() { tmp=\$(sudo mktemp "\$1"); tmps+=("\$tmp"); }
-# place MODE TMP DEST MARKER: root:root, refuse a symlink or a foreign file, rename
+$(guard_helpers_text)
+# place MODE TMP DEST LINE MARKER: root:root; an existing DEST must be our own
+# regular file (line LINE is exactly MARKER), otherwise refuse; then rename
 place() {
   sudo chown root:root "\$2"
   sudo chmod "\$1" "\$2"
-  if sudo test -L "\$3"; then echo "refusing: \$3 is a symlink" >&2; return 1; fi
-  if sudo test -e "\$3" && ! sudo grep -qF -- "\$4" "\$3"; then
-    echo "refusing: \$3 exists and was not written by quectel-usbnet" >&2
-    return 1
+  if sudo test -L "\$3" || sudo test -e "\$3"; then
+    ours "\$3" "\$4" "\$5" || {
+      echo "refusing: \$3 exists and is not a regular file written by quectel-usbnet (symlink, other type, or no marker line)" >&2
+      return 1
+    }
   fi
   sudo mv -T -- "\$2" "\$3"
 }
 
+safe_dir $qlib
+safe_dir $qover
+safe_dir $qunit
 sudo mkdir -p -m 0755 -- $qlib $qover
+safe_dir $qlib
+safe_dir $qover
 
 stage $qlib/.quectel-usbnet-guard.XXXXXX
 sudo cp -- $qsrc "\$tmp"
@@ -1609,7 +1673,7 @@ echo "$hash  \$tmp" | sudo sha256sum -c - >/dev/null || {
   echo "the script changed after guard-install printed these steps; nothing was installed. Run guard-install again." >&2
   exit 1
 }
-place 0755 "\$tmp" $qcopy $(printf '%q' "$COPY_MARK")
+place 0755 "\$tmp" $qcopy 2 $(printf '%q' "$GUARD_COPY_LINE")
 
 $(guard_service_text "$nft" "$nmcli" "$ip" "$ping" | guard_print_unit_step "$GUARD_UNIT_DIR/$GUARD_UNIT.service" "$GUARD_UNIT_MARK")
 
@@ -1641,30 +1705,36 @@ cmd_guard_uninstall() {
 # Only files carrying this tool's marker are deleted; anything else is left and named.
 
 bash <<'GUARD_UNINSTALL'
-# remove_ours FILE MARKER: delete FILE only if it is a regular file with MARKER
+$(guard_helpers_text)
+# remove_ours FILE LINE MARKER: delete FILE only if it is our own regular file
+# (line LINE is exactly MARKER) in a directory path with no symlink in it
 remove_ours() {
-  if sudo test -L "\$1"; then echo "left \$1: it is a symlink"; return 0; fi
-  sudo test -e "\$1" || return 0
-  if sudo grep -qF -- "\$2" "\$1"; then
+  if ! safe_dir "\${1%/*}" 2>/dev/null; then echo "left \$1: its directory is, or sits under, a symlink"; return 0; fi
+  if ! { sudo test -L "\$1" || sudo test -e "\$1"; }; then return 0; fi
+  if ours "\$1" "\$2" "\$3"; then
     sudo rm -f -- "\$1"
     echo "removed \$1"
   else
-    echo "left \$1: not written by quectel-usbnet"
+    echo "left \$1: not written by quectel-usbnet (symlink, other file type, or no marker line)"
   fi
 }
 sudo systemctl disable --now $GUARD_UNIT.timer || true
 sudo systemctl stop $GUARD_UNIT.service || true
 sudo $(printf '%q' "$nft") delete table inet $GUARD_TABLE || true   # an error saying the table does not exist is fine
-remove_ours $(printf '%q' "$GUARD_UNIT_DIR/$GUARD_UNIT.timer") $(printf '%q' "$GUARD_UNIT_MARK")
-remove_ours $(printf '%q' "$GUARD_UNIT_DIR/$GUARD_UNIT.service") $(printf '%q' "$GUARD_UNIT_MARK")
-remove_ours $(printf '%q' "$GUARD_COPY") $(printf '%q' "$COPY_MARK")
+remove_ours $(printf '%q' "$GUARD_UNIT_DIR/$GUARD_UNIT.timer") 1 $(printf '%q' "$GUARD_UNIT_MARK")
+remove_ours $(printf '%q' "$GUARD_UNIT_DIR/$GUARD_UNIT.service") 1 $(printf '%q' "$GUARD_UNIT_MARK")
+remove_ours $(printf '%q' "$GUARD_COPY") 2 $(printf '%q' "$GUARD_COPY_LINE")
 # the override file is written by you, so it carries no marker; remove it only if it is a plain file
-if sudo test -f $(printf '%q' "$GUARD_OVERRIDE") && ! sudo test -L $(printf '%q' "$GUARD_OVERRIDE"); then
-  sudo rm -f -- $(printf '%q' "$GUARD_OVERRIDE")
+if safe_dir $(printf '%q' "$GUARD_OVERRIDE_DIR") 2>/dev/null; then
+  if sudo test -f $(printf '%q' "$GUARD_OVERRIDE") && ! sudo test -L $(printf '%q' "$GUARD_OVERRIDE"); then
+    sudo rm -f -- $(printf '%q' "$GUARD_OVERRIDE")
+  fi
+  sudo rmdir -- $(printf '%q' "$GUARD_OVERRIDE_DIR") 2>/dev/null || true
 fi
-sudo rmdir -- $(printf '%q' "$GUARD_OVERRIDE_DIR") 2>/dev/null || true
-sudo rm -f -- $sd/ethernet $sd/wifi $sd/ethernet.new $sd/wifi.new
-sudo rmdir -- $sd 2>/dev/null || true
+if safe_dir $sd 2>/dev/null; then
+  sudo rm -f -- $sd/ethernet $sd/wifi $sd/ethernet.new $sd/wifi.new
+  sudo rmdir -- $sd 2>/dev/null || true
+fi
 sudo systemctl daemon-reload
 GUARD_UNINSTALL
 EOF
