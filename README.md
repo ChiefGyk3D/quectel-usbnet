@@ -120,37 +120,49 @@ They overlap in one respect: both can follow a suspend/resume, and both stop and
 Once the modem works, a second problem shows up: it works too well. With Wi-Fi up and healthy the modem still carried traffic. Two causes, both measured on one laptop:
 
 1. Wi-Fi had no IPv6, so the modem held the only IPv6 default route, and every client that prefers IPv6 used cellular.
-2. A zero-trust VPN client picks one default gateway and interface and binds its own sockets to it, ignoring route metrics. It bound everything to the modem while Wi-Fi was healthy.
+2. A zero-trust VPN client picks one default gateway and interface and binds its own sockets to it, ignoring route metrics. With Wi-Fi (metric 600) and cellular (1100) both holding default routes it bound everything to the modem.
 
-Route metrics cannot fix either, and a firewall that blocks the modem does not help an application that picked the modem on purpose (its tunnel and DNS just died). What did work: with `ipv4.never-default` and `ipv6.never-default` set on the modem profile, the modem stayed connected and kept its address but held no default route, and the VPN client moved every socket to Wi-Fi on its own.
+Route metrics cannot fix either, and a firewall that blocks the modem does not help an application that picked the modem on purpose (its tunnel and DNS just died). What did work: with `ipv4.never-default` and `ipv6.never-default` set on the modem profile and only Wi-Fi holding default routes, the VPN client bound to Wi-Fi and everything worked. The client's exact rule is not known, so the design does not depend on it: it keeps the situation simple wherever that matters.
 
-`quectel-usbnet uplink` turns that into a rule. The order is always Ethernet, then Wi-Fi, then cellular, and **only the best healthy link holds default routes**. Everything else is `never-default`. It runs as you, with no sudo, no root service, no firewall and no nftables, using `nmcli device modify`, which NetworkManager applies to the running connection with a reapply (a runtime change, not a profile change).
+### The design
+
+`quectel-usbnet uplink` runs as you. No sudo, no root service, no firewall. It uses `nmcli device modify`.
 
 ```
 quectel-usbnet uplink status [--json]    # what is going on; --json is the tray's contract
-quectel-usbnet uplink auto               # Ethernet, then Wi-Fi, then cellular (the default)
+quectel-usbnet uplink auto               # the default
 quectel-usbnet uplink cell-first [--for 2h]   # cellular first, then back to auto on its own
 quectel-usbnet uplink run [--dry-run]    # one evaluation; the timer calls this
+quectel-usbnet uplink restore            # put back every change the manager recorded
 quectel-usbnet uplink install            # prints the steps; runs nothing
 quectel-usbnet uplink uninstall          # prints the steps; runs nothing
 ```
 
-### How it decides
-
-- A link is healthy when a ping bound to its interface answers one of two public targets (2 s timeout each). Two failures in a row take an up link down, two successes bring a down one back. All probes run in parallel under one 12 s deadline, and one that hangs gets TERM, then KILL.
-- `auto`: the owner is Ethernet if healthy, else Wi-Fi if healthy, else cellular (the last resort, whether or not it can be measured).
-- `cell-first`: cellular owns the defaults and Ethernet and Wi-Fi are `never-default` (their connected subnet routes stay, so the local network still works). It expires after `--for` (`30m`, `2h`, `1d`, up to `30d`; `0` means never; the default is `2h`) so cellular data is not burned by accident. If cellular is not connected it refuses to start, and if the modem drops while it is active the normal order takes over, so asking for cellular can never strand the machine.
+- **`auto` touches only cellular.** The cellular profile is closed (`never-default` on both families, set once by the install steps), so after a boot, a reconnect or a crash it holds no default route and nothing is bound to it. Ethernet and Wi-Fi are never changed in `auto`: they keep their own NetworkManager defaults and metrics (Ethernet automatic 100, Wi-Fi 600). That is also what makes them measurable at any time, because each still holds a default route, so a ping bound to its interface reaches the real internet. Every link is judged by a real probe, never by whether its gateway answers.
+- **Failover.** When Ethernet and Wi-Fi have both been unhealthy for two rounds (two probes, 15 s apart), cellular is opened: `never-default` off and a route metric of 50 for the open period. Without the lower metric a dead Wi-Fi would keep winning on metric 600 against the modem's 1100. When either is healthy for two rounds, cellular is closed again, put back to exactly what it was.
+- **`cell-first`** is the one mode that demotes Ethernet and Wi-Fi (`never-default` at runtime; their connected subnet routes stay, so the local network still works), so cellular is the single, deterministic owner. It is for the emergency case: the LAN firewall is down, cellular is up, and a lab host must still be reachable. Order: open cellular, confirm its default route is in `ip route show default` and that the modem still has link, and only then demote Ethernet and Wi-Fi, one by one, reading the route table and the modem again before each one. If cellular's default disappears or the modem loses its link half way, everything is put back (Ethernet and Wi-Fi first, then cellular) and the run fails. It ends after `--for` (`30m`, `2h`, `1d`, up to `30d`; `0` means never; default `2h`), and when it ends (`auto`, expiry, the modem lost) the way back is the same make-before-break the other way: Ethernet and Wi-Fi first, confirmed, and only then cellular closes. It refuses to start without a connected modem.
+- A link is healthy when a ping bound to its interface answers one of two public targets (2 s timeout each). A link that holds only an IPv6 default route is probed with IPv6 targets (`QUECTEL_UPLINK_TARGETS6`), one that holds only IPv4 with IPv4 targets, a dual-stack one with both (any answer counts). Two failures in a row take an up link down, two successes bring a down one back; this counts rounds, so no clock is involved. All probes run in parallel under one 12 s deadline, and one that hangs gets TERM, then KILL.
+- With Ethernet and Wi-Fi both healthy, the VPN client may bind to either of them. It will not bind to cellular, because cellular holds no default route. That is the thing to check live.
 - Interface names come from NetworkManager device types (`ethernet`, `wifi`, `gsm`), never hard-coded, and every name is checked against a plain-name pattern before it reaches a command. NetworkManager is always read with `LC_ALL=C` and `--escape no`.
-- The first run after a login never demotes a working link: with no history, a link that holds a default route counts as up.
 
-How a change is made, so the machine is never left without a default route: the new owner's defaults are added first, and the route table is read back (`ip route show default`) to confirm they are there. Only then are the other links demoted, and the table is read again, with one retry. If it still is not right, everything is put back and the run exits non-zero. Default routes on interfaces it does not manage (a full-tunnel VPN, a bridge) are left alone.
+### Never without a default route, and what happens on bad input
 
-Fail safe: bad input, a missing tool, an `nmcli` or `ip` error, a malformed state file or an out-of-range setting makes `run` change nothing, log why and exit non-zero.
+- Cellular is opened before anything else moves, and confirmed in the route table. Cellular is closed only when another managed link holds a default route.
+- Bad input, a missing tool, an `nmcli` or `ip` error, an unreadable route table, a malformed state file or an out-of-range setting makes `run` change nothing, log why and exit non-zero. A link-history file or a ledger that is not exactly what this tool writes is "unknown": the run does not guess, it does nothing.
+- Default routes on interfaces the manager does not manage (a full-tunnel VPN, a bridge) are left alone.
+- No history for a link (first run, or after a logout): a link that holds a default route counts as up, and a modem counts as up, so a first run in `auto` never demotes anything (it does not touch Ethernet or Wi-Fi at all). The exception: if the ledger says cellular is open, Ethernet and Wi-Fi start as down and have to prove themselves twice before cellular closes.
 
-### Two things you should know it cannot do
+### The ledger: every change is recorded first
 
-- A link that holds no default route cannot reach the internet bound to itself. So a link this manager demoted (Ethernet or Wi-Fi) is probed through its own gateway (taken from the DHCP lease), which only proves the local link is alive. To keep a gateway that answers while the internet behind it is dead from making the owner flap, a link that failed a real probe has to stay down for 120 s before it can come back. If a demoted link has no known gateway, it cannot be measured and the manager stays where it is (look for the log line saying so).
-- The modem holds no default route while it is idle, so it is not measured then. It reads as healthy when it is connected, and it is measured as soon as it carries traffic.
+Before the manager changes a device at runtime (open cellular, demote Ethernet or Wi-Fi), it writes the device, its profile's UUID and the previous `never-default` and route-metric values to `~/.local/state/quectel-usbnet/ledger` (`$XDG_STATE_HOME` if set), then makes the change. Restoring puts exactly those values back, not an assumed policy. The ledger survives a logout, a crash and a kill.
+
+- **Self-heal.** Every `uplink run` and `uplink auto` reads the ledger first. Anything it lists that the current mode does not need is put back: after a kill, a logout, an expired `cell-first`, a lost modem. Ethernet and Wi-Fi go back before cellular closes.
+- **A re-activated device already lost its change.** NetworkManager resets runtime changes when a device is re-activated (a reconnect, a reboot, a resume), and then its profile UUID in the ledger no longer matches. The line is dropped, not applied to the new activation.
+- **Stopping.** The install writes a small service that runs `uplink restore` whenever the timer stops (stop, disable, logout, shutdown). `uplink restore` can also be run by hand. It restores Ethernet and Wi-Fi first and closes cellular last, and it will not close cellular if nothing else holds a default route (it says so, exits non-zero, and keeps the line).
+
+### What `nmcli device modify` does
+
+`man nmcli` (read on this machine, nmcli 1.52): `device modify` "modif[ies] the settings currently active on the device... temporary changes ... not preserved in the connection profile", with the caveat that "some properties can't be changed on an already connected device". `device reapply` is described as updating the device "with changes to the currently active connection made since it was last applied", so it is for profile edits. The manager therefore calls `device modify` and no separate `reapply`. Whether NetworkManager really applies `never-default` and the route metric to a connected device at once, on both families, is documented but not something the tests can prove (they use a fake `nmcli`), so it is an owner acceptance check below. To drop every runtime change at once by hand, `nmcli device reapply <device>` applies the profile again.
 
 ### Install (user level, nothing runs until you run it)
 
@@ -158,9 +170,17 @@ Fail safe: bad input, a missing tool, an `nmcli` or `ip` error, a malformed stat
 quectel-usbnet uplink install
 ```
 
-prints a block of steps for you to read and run. They do four things: set `ipv4.never-default yes` and `ipv6.never-default yes` on every `gsm` profile (found from NetworkManager by type, since the profile name differs per machine; this is stored in the profile and is the one change that outlives the manager), copy the script to `~/.local/libexec/quectel-usbnet-uplink`, write a `systemd --user` service and a timer that runs `uplink run` every 15 seconds, and run one evaluation. The unit carries absolute paths for `nmcli`, `ip`, `ping`, `flock` and `timeout`, resolved when you ran `install`, and a fixed `PATH=/usr/sbin:/usr/bin`. It refuses to overwrite a file it did not write.
+prints a block of steps for you to read and run. It checks everything that can refuse first (the units, the copy and the state directories are yours, real directories or plain files, no foreign or symlinked file in the way) and only then changes anything, in this order: set `ipv4.never-default yes` and `ipv6.never-default yes` on every `gsm` profile (found from NetworkManager by type, since the profile name differs per machine; stored in the profile, the one change that outlives the manager), copy the script to `~/.local/libexec/quectel-usbnet-uplink`, write the `systemd --user` units (the 15 s timer, the service it runs, the restore-on-stop service), and run one evaluation. The units carry absolute paths for `nmcli`, `ip`, `ping`, `flock` and `timeout`, resolved when you ran `install`, and a fixed `PATH=/usr/sbin:/usr/bin`. It refuses to overwrite a file it did not write.
 
 The mode (`auto` or `cell-first`, with its end time) is kept in `$XDG_RUNTIME_DIR/quectel-usbnet/`, so a reboot or logout always goes back to `auto`.
+
+### Uninstall
+
+`quectel-usbnet uplink uninstall` prints steps that stop the timer, run `uplink restore` (printing what it restored), and only if that finished remove the units, the copy and the state (only files carrying this tool's marker, exact names). If the restore did not finish, nothing is removed. The cellular profile stays closed on purpose.
+
+### Clocks
+
+Nothing that counts uses the wall clock. Link health counts rounds. `cell-first` records both clocks: it ends when the wall clock reaches the end time, when the wall clock is behind the time the request was made (it jumped backward, so the end time means nothing), or when the monotonic clock (`/proc/uptime`) says the duration has passed. `--for 0` has no expiry and so no clock check.
 
 ### `status --json`
 
@@ -170,18 +190,24 @@ The mode (`auto` or `cell-first`, with its end time) is kept in `$XDG_RUNTIME_DI
  "until":"<iso or null>","since":"<iso>"}
 ```
 
-`owner` is whoever holds a default route right now, read from the route table. `state` is NetworkManager's: `up` is connected, `down` is a device that exists but is not connected, `absent` is no such device. `since` is when the mode was set. It reads and prints, exit 0; if it cannot read NetworkManager or the routes it prints nothing on stdout and exits 1.
+`owner` is whoever carries traffic right now: the managed link whose default route has the lowest metric (IPv4 first, IPv6 if there is no IPv4 default). `state` is NetworkManager's: `up` is connected, `down` is a device that exists but is not connected, `absent` is no such device. `healthy` is the last measured result (a modem that is closed is not measured and reads healthy while connected). `since` is when the mode was set. It reads and prints, exit 0; if it cannot read NetworkManager, the routes or the state files, it prints nothing on stdout and exits 1.
 
-### If the manager stops
+### If the manager stops or is killed
 
-A stopped, crashed or uninstalled manager leaves the system usable: the modem profile stays closed (`never-default`), and every link keeps whatever it had at that moment. The one case to know: if it stopped while cellular was the owner (Wi-Fi had failed), cellular keeps its default routes and Wi-Fi stays without them until it reconnects. To return to a clean state, in this order:
+- **Stopped cleanly** (timer stopped, logout, shutdown, uninstall): the restore service runs `uplink restore`. Nothing is left changed.
+- **Killed, crashed, power cut:** the profile is still closed. Cellular may be left open (after a failover) or Ethernet and Wi-Fi demoted (after `cell-first`) until the next `uplink run` or `uplink auto`, which heals from the ledger, or until the device reconnects or the machine reboots (NetworkManager re-applies the profile).
+- **Exact recovery commands**, in this order:
 
 ```
-quectel-usbnet uplink auto                  # if the copy is still installed
-nmcli device reapply <each device>          # or: nmcli connection up <each profile>
+quectel-usbnet uplink restore          # from the ledger; prints what it restored
+quectel-usbnet uplink auto             # and back to the normal order
+nmcli device reapply <each device>     # without the manager: applies the profile again
+nmcli connection up <each profile>     # the heavier version, reconnects
 ```
 
-`uplink uninstall` prints the steps that stop the timer, run `uplink auto`, remove the units, the copy and the state files (only ones carrying this tool's marker), and say how to reopen the modem profile if you ever want that.
+### What this does not defend against
+
+A shell script cannot defend against a hostile process running as the same user. That process could write the mode, link history or ledger files, replace the lock, or run `nmcli` itself. The state directories being mode 0700, owned by you, not symlinks, and the lock file being opened without following a symlink, is the whole boundary. It keeps other users out and keeps accidents contained; it is not tamper resistance, and no part of this should be read as such.
 
 ### The modem guard it replaces
 
@@ -189,11 +215,17 @@ An earlier approach (#22) put an nftables guard on the modem interface. It kept 
 
 ### Settings
 
-All are environment variables with safe defaults, checked at start (a bad value changes nothing): `QUECTEL_UPLINK_TARGETS` (`"1.1.1.1 9.9.9.9"`), `QUECTEL_UPLINK_FAILS` (2), `QUECTEL_UPLINK_OKS` (2), `QUECTEL_UPLINK_HOLD` (120 s), `QUECTEL_UPLINK_PING_TIMEOUT` (2 s), `QUECTEL_UPLINK_DEADLINE` (12 s), `QUECTEL_UPLINK_MAX_DEVICES` (4 per link type). The unit sets only the tool paths.
+All are environment variables with safe defaults, checked at start (a bad value changes nothing): `QUECTEL_UPLINK_TARGETS` (`"1.1.1.1 9.9.9.9"`), `QUECTEL_UPLINK_TARGETS6` (`"2606:4700:4700::1111 2620:fe::fe"`), `QUECTEL_UPLINK_FAILS` (2), `QUECTEL_UPLINK_OKS` (2), `QUECTEL_UPLINK_PING_TIMEOUT` (2 s), `QUECTEL_UPLINK_DEADLINE` (12 s), `QUECTEL_UPLINK_MAX_DEVICES` (4 per link type), `QUECTEL_UPLINK_CELL_METRIC` (50, must be below Ethernet's 100). The units set only the tool paths.
 
 ### What I have and have not run
 
-The decision logic, the flapping hysteresis, the expiry, the malformed-input and tool-failure paths, the order of the `nmcli` calls and the printed steps are tested against fake `nmcli`, `ip` and `ping` (`tests/uplink.sh`), with a fake route table that the fake `nmcli` changes, so "never no default route" and "the old owner's routes are intact after a failure" are checked, not assumed. The read-only commands (`status`, `run --dry-run`) were run against a real NetworkManager. The real `nmcli device modify`/`reapply` changes, the timer, a Wi-Fi radio-off failover and the VPN client re-binding have not been run by the test suite; those are the live checks (modem counters flat with Wi-Fi up, failover within about 45 s, `cell-first` and back, lab and DNS reachable at every step).
+The decision logic, the flapping hysteresis, the cell-first order and its aborts, the expiry on both clocks, the ledger (including a kill, a re-activated device and a malformed file), the malformed-input and tool-failure paths, the order of the `nmcli` calls, the state-directory and lock refusals, and the printed install and uninstall steps (run for real against a temp HOME and a fake `systemctl`) are tested against fake `nmcli`, `ip` and `ping` (`tests/uplink.sh`), with a fake route table that the fake `nmcli` changes, so "never no default route" and "the old routes are intact after a failure" are checked, not assumed. The read-only commands (`status`, `run --dry-run`, the profile and link reads) were run against a real NetworkManager. What the suite cannot show, and the live checks are for:
+
+- `nmcli device modify` really changing `never-default` and the route metric of a connected device, both families, at once, without dropping the connection.
+- Modem counters flat with Ethernet or Wi-Fi up, and the VPN client bound to Wi-Fi (or Ethernet), never to cellular.
+- Wi-Fi radio off leads to cellular within about 45 s and the VPN re-binds; Wi-Fi back closes cellular again; Ethernet and Wi-Fi are never changed in all of that (`nmcli device modify` is only ever called on the modem).
+- `cell-first`, then `auto`, then `cell-first` and stop the timer: everything ends up as it was; lab hosts and DNS reachable at every step.
+- The restore-on-stop service on a real `systemctl --user stop`, and at logout.
 
 ## What was going wrong
 
