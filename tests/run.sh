@@ -603,6 +603,350 @@ expect_eq "device_wdm follows the symlinked device directory" \
 PATH=$OLD_PATH
 unset FAKE_QMI_SCENARIO FAKE_QMI_FAIL_OFF
 
+# --- the modem egress guard: pure decision logic ------------------------------
+GUARD_FAILS=2
+GUARD_OKS=2
+
+# guard_link_step PREV FAILS OKS PROBE -> "status fails oks"
+expect_eq "link: one failed ping does not flip an up link (flapping)" \
+  "$(guard_link_step up 0 0 fail)" "up 1 0"
+expect_eq "link: two failed pings in a row flip an up link down" \
+  "$(guard_link_step up 1 0 fail)" "down 2 0"
+expect_eq "link: a good ping between failures resets the streak" \
+  "$(guard_link_step up 1 0 ok)" "up 0 1"
+expect_eq "link: one good ping does not flip a down link up" \
+  "$(guard_link_step down 2 0 ok)" "down 0 1"
+expect_eq "link: two good pings in a row flip a down link up" \
+  "$(guard_link_step down 0 1 ok)" "up 0 2"
+expect_eq "link: a failure between good pings resets the streak" \
+  "$(guard_link_step down 0 1 fail)" "down 1 0"
+expect_eq "link: an absent device is down at once" \
+  "$(guard_link_step up 0 5 absent)" "down 2 0"
+expect_eq "link: a malformed previous state is down with no history" \
+  "$(guard_link_step bogus x y ok)" "down 0 1"
+expect_eq "link: an unknown probe result never counts as healthy" \
+  "$(guard_link_step down 0 1 weird)" "down 0 0"
+
+# guard_decide OVERRIDE ETH WIFI MODEM_METRIC WIFI_METRIC ETH_METRIC
+d() { guard_decide "$@" | cut -d' ' -f1; }
+r() { guard_decide "$@" | cut -d' ' -f2; }
+expect_eq "decide: both links healthy, modem behind -> on" "$(d auto up up 1100 600 100)" on
+expect_eq "decide: only Wi-Fi healthy -> on" "$(d auto down up 1100 600 100)" on
+expect_eq "decide: only Ethernet healthy -> on" "$(d auto up down 1100 600 100)" on
+expect_eq "decide: Ethernet and Wi-Fi both down -> off (failover)" "$(d auto down down 1100 600 100)" off
+expect_eq "decide: failover reason is named" "$(r auto down down 1100 600 100)" failover
+expect_eq "decide: modem metric below Wi-Fi's -> off (owner flipped)" "$(d auto up up 500 600 100)" off
+expect_eq "decide: flip reason is named" "$(r auto up up 500 600 100)" modem-first
+expect_eq "decide: modem metric equal to Wi-Fi's is not a flip" "$(d auto up up 600 600 100)" on
+expect_eq "decide: no Wi-Fi route, flip is judged against Ethernet" "$(d auto up down 50 '' 100)" off
+expect_eq "decide: no Wi-Fi route, modem behind Ethernet -> on" "$(d auto up down 1100 '' 100)" on
+expect_eq "decide: no modem route -> off" "$(d auto up up '' 600 100)" off
+expect_eq "decide: override off wins over healthy links" "$(d off up up 1100 600 100)" off
+expect_eq "decide: override off names its reason" "$(r off up up 1100 600 100)" override-off
+expect_eq "decide: override on holds even in failover" "$(d on down down 1100 600 100)" on
+expect_eq "decide: override on holds even when flipped" "$(d on up up 500 600 100)" on
+expect_eq "decide: an invalid override fails open" "$(d invalid up up 1100 600 100)" off
+expect_eq "decide: a malformed link status fails open" "$(d auto maybe up 1100 600 100)" off
+expect_eq "decide: a non-numeric modem metric fails open" "$(d auto up up abc 600 100)" off
+expect_eq "decide: a non-numeric Wi-Fi metric fails open" "$(d auto up up 1100 6x0 100)" off
+expect_eq "decide: a negative metric fails open" "$(d auto up up -1 600 100)" off
+expect_eq "decide: no arguments fails open" "$(d)" off
+
+# The override file.
+gt="$tmp/guard"
+mkdir -p "$gt"
+expect_eq "override: no file is auto" "$(guard_override_value "$gt/none")" auto
+printf 'off\n' >"$gt/ov"
+expect_eq "override: off" "$(guard_override_value "$gt/ov")" off
+printf '  ON \r\n' >"$gt/ov"
+expect_eq "override: on, case and whitespace ignored" "$(guard_override_value "$gt/ov")" on
+printf 'auto\n' >"$gt/ov"
+expect_eq "override: auto" "$(guard_override_value "$gt/ov")" auto
+printf 'maybe\n' >"$gt/ov"
+expect_eq "override: unknown text is invalid" "$(guard_override_value "$gt/ov")" invalid
+: >"$gt/ov"
+expect_eq "override: an empty file is invalid" "$(guard_override_value "$gt/ov")" invalid
+ln -sf "$gt/ov" "$gt/ovlink"
+expect_eq "override: a symlink is invalid" "$(guard_override_value "$gt/ovlink")" invalid
+
+# Parsers.
+nm_out=$'wlan0:wifi:connected\ncdc-wdm0:gsm:connected\nsdwan0:tun:connected\neth0:ethernet:unavailable\np2p-dev-wlan0:wifi-p2p:disconnected'
+expect_eq "devices: a connected wifi is found" "$(printf '%s\n' "$nm_out" | guard_devices_of_type wifi)" wlan0
+expect_eq "devices: an unavailable ethernet is not" "$(printf '%s\n' "$nm_out" | guard_devices_of_type ethernet)" ""
+expect_eq "devices: the gsm control port is found" "$(printf '%s\n' "$nm_out" | guard_devices_of_type gsm)" cdc-wdm0
+expect_eq "devices: wifi-p2p is not wifi" "$(printf 'p2p-dev-wlan0:wifi-p2p:connected\n' | guard_devices_of_type wifi)" ""
+expect_eq "devices: garbage gives nothing" "$(printf 'garbage\n::\n' | guard_devices_of_type wifi)" ""
+expect_eq "metric: lowest of two routes" \
+  "$(printf 'default via x dev a metric 700\ndefault dev a metric 600\n' | guard_min_metric)" 600
+expect_eq "metric: a route without a metric is 0" \
+  "$(printf 'default dev a proto static\n' | guard_min_metric)" 0
+expect_eq "metric: no default route gives nothing" \
+  "$(printf '10.0.0.0/24 dev a metric 5\n' | guard_min_metric)" ""
+expect_eq "metric: empty input gives nothing" "$(printf '' | guard_min_metric)" ""
+if guard_iface_ok 'wwan0; flush ruleset'; then
+  fail "iface: a name with shell or nft syntax is refused"
+else
+  ok "iface: a name with shell or nft syntax is refused"
+fi
+if guard_iface_ok 'wwp0s20f0u4i4' && guard_iface_ok 'wlan0'; then
+  ok "iface: ordinary names pass"
+else
+  fail "iface: ordinary names pass"
+fi
+
+# --- the guard runner, against fake nft, nmcli, ip and ping -------------------
+gf="$tmp/gfake"
+gbin="$tmp/gbin"
+mkdir -p "$gf" "$gbin"
+cat >"$gbin/nft" <<'FAKE'
+#!/usr/bin/env bash
+# fake nft: the table is the file $GFAKE/table; every call is logged.
+echo "nft $*" >>"$GFAKE/calls"
+case "$*" in
+  "list table inet quectel_modem_guard") [ -f "$GFAKE/table" ] ;;
+  "-f -") cat >"$GFAKE/table" ;;
+  "delete table inet quectel_modem_guard") rm -f "$GFAKE/table" ;;
+  *) exit 9 ;;
+esac
+FAKE
+cat >"$gbin/nmcli" <<'FAKE'
+#!/usr/bin/env bash
+echo "nmcli $*" >>"$GFAKE/calls"
+case "$1" in
+  -t) cat "$GFAKE/devices" ;;
+  -g) cat "$GFAKE/ipiface_${5}" 2>/dev/null ;;
+esac
+FAKE
+cat >"$gbin/ip" <<'FAKE'
+#!/usr/bin/env bash
+# ip -o -4|-6 route show default dev IFACE
+fam=${2#-}
+[ "$fam" = 4 ] && cat "$GFAKE/route4_${7}" 2>/dev/null
+[ "$fam" = 6 ] && cat "$GFAKE/route6_${7}" 2>/dev/null
+exit 0
+FAKE
+cat >"$gbin/ping" <<'FAKE'
+#!/usr/bin/env bash
+# ping -n -q -c 1 -W T -I IFACE TARGET
+iface=""
+while [ $# -gt 0 ]; do
+  [ "$1" = -I ] && iface=$2
+  shift
+done
+echo "ping $iface" >>"$GFAKE/calls"
+[ "$(cat "$GFAKE/ping_$iface" 2>/dev/null)" = ok ]
+FAKE
+chmod +x "$gbin"/*
+export GFAKE="$gf"
+GUARD_NFT="$gbin/nft"
+GUARD_NMCLI="$gbin/nmcli"
+GUARD_IP="$gbin/ip"
+GUARD_PING="$gbin/ping"
+GUARD_STATE_DIR="$tmp/gstate"
+GUARD_OVERRIDE="$tmp/goverride"
+GUARD_TARGETS="192.0.2.1 198.51.100.1"
+
+# gscene ETH_STATE WIFI_STATE: a laptop with ethernet, Wi-Fi and a modem.
+# State is "ok" or "dead" (pings fail) or "gone" (device not connected).
+gscene() {
+  rm -rf "$gf" "$GUARD_STATE_DIR" "$GUARD_OVERRIDE"
+  mkdir -p "$gf"
+  : >"$gf/devices"
+  [ "$1" = gone ] || echo "eth0:ethernet:connected" >>"$gf/devices"
+  [ "$2" = gone ] || echo "wlan0:wifi:connected" >>"$gf/devices"
+  echo "cdc-wdm0:gsm:connected" >>"$gf/devices"
+  echo "wwan0" >"$gf/ipiface_cdc-wdm0"
+  echo "default via 192.0.2.254 dev eth0 proto dhcp metric 100" >"$gf/route4_eth0"
+  echo "default via 192.0.2.254 dev wlan0 proto dhcp metric 600" >"$gf/route4_wlan0"
+  echo "default dev wwan0 proto static metric 1100" >"$gf/route4_wwan0"
+  echo "default dev wwan0 proto static metric 1100 pref medium" >"$gf/route6_wwan0"
+  [ "$1" = ok ] && echo ok >"$gf/ping_eth0"
+  [ "$2" = ok ] && echo ok >"$gf/ping_wlan0"
+  return 0
+}
+# grun: one runner pass; prints the log line.
+grun() { cmd_guard_run "$@" 2>&1; }
+table_on() { [ -f "$gf/table" ]; }
+# expect_table on|off LABEL
+expect_table() {
+  if table_on; then
+    if [ "$1" = on ]; then ok "$2"; else fail "$2" "the nft table exists"; fi
+  else
+    if [ "$1" = off ]; then ok "$2"; else fail "$2" "the nft table is missing"; fi
+  fi
+}
+
+gscene ok ok
+out=$(grun)
+expect_table off "runner: the first pass does not arm the guard (needs $GUARD_OKS good probes)"
+out=$(grun)
+expect_contains "runner: both links healthy, two passes -> guard on" "$out" "guard=on (healthy)"
+expect_table on "runner: the nft table exists"
+expect_contains "ruleset names the modem interface" "$(cat "$gf/table")" '"wwan0"'
+expect_contains "ruleset rejects egress on the armed interface" "$(cat "$gf/table")" "oifname @armed reject"
+expect_contains "ruleset lets neighbor discovery through" "$(cat "$gf/table")" "nd-neighbor-solicit"
+expect_contains "ruleset expires by itself if not refreshed" "$(cat "$gf/table")" "timeout 60s"
+expect_contains "ruleset uses its own inet table" "$(cat "$gf/table")" "table inet quectel_modem_guard"
+expect_contains "ruleset has its own priority" "$(cat "$gf/table")" "priority -5"
+if grep -qE 'flush ruleset|delete table inet (filter|ufw)|ip6? ' "$gf/table"; then
+  fail "runner: ruleset only touches its own table"
+else
+  ok "runner: ruleset only touches its own table"
+fi
+# only the guard's own table is named in any nft call
+if grep '^nft' "$gf/calls" | grep -v quectel_modem_guard | grep -qv -e '-f -'; then
+  fail "runner: nft is only asked about the guard's own table"
+else
+  ok "runner: nft is only asked about the guard's own table"
+fi
+
+# Failover: Wi-Fi and Ethernet die. One failed pass keeps the guard on (flapping),
+# the second opens it.
+echo dead >"$gf/ping_eth0"
+echo dead >"$gf/ping_wlan0"
+out=$(grun)
+expect_contains "runner: one failed round does not open the guard" "$out" "guard=on (healthy)"
+out=$(grun)
+expect_contains "runner: two failed rounds open the guard (failover)" "$out" "guard=off (failover)"
+expect_table off "runner: the table is removed on failover"
+# Links return: two good rounds to re-arm.
+echo ok >"$gf/ping_wlan0"
+out=$(grun)
+expect_contains "runner: one good round does not re-arm" "$out" "guard=off (failover)"
+out=$(grun)
+expect_contains "runner: two good rounds re-arm" "$out" "guard=on (healthy)"
+
+# Wi-Fi alone is enough.
+echo dead >"$gf/ping_eth0"
+for _ in 1 2 3; do out=$(grun); done
+expect_contains "runner: Ethernet down but Wi-Fi up keeps the guard on" "$out" "guard=on (healthy)"
+
+# Flip detection: the owner sets the modem metric below Wi-Fi's.
+echo "default dev wwan0 proto static metric 500" >"$gf/route4_wwan0"
+echo "default dev wwan0 proto static metric 500 pref medium" >"$gf/route6_wwan0"
+out=$(grun)
+expect_contains "runner: modem metric below Wi-Fi's turns the guard off at once" "$out" "guard=off (modem-first)"
+expect_table off "runner: flip removes the table"
+echo "default dev wwan0 proto static metric 1100" >"$gf/route4_wwan0"
+echo "default dev wwan0 proto static metric 1100 pref medium" >"$gf/route6_wwan0"
+out=$(grun)
+expect_contains "runner: flipping back turns the guard on" "$out" "guard=on (healthy)"
+
+# The IPv6 route alone can carry the flip.
+echo "default dev wwan0 proto static metric 500 pref medium" >"$gf/route6_wwan0"
+out=$(grun)
+expect_contains "runner: a lower IPv6 modem metric also counts as a flip" "$out" "guard=off (modem-first)"
+echo "default dev wwan0 proto static metric 1100 pref medium" >"$gf/route6_wwan0"
+
+# Override file.
+echo off >"$GUARD_OVERRIDE"
+out=$(grun)
+expect_contains "runner: override off opens the guard" "$out" "guard=off (override-off)"
+expect_table off "runner: override off removes the table"
+echo garbage >"$GUARD_OVERRIDE"
+out=$(grun)
+expect_contains "runner: a malformed override fails open" "$out" "guard=off (override-invalid)"
+rm -f "$GUARD_OVERRIDE"
+out=$(grun)
+expect_contains "runner: removing the override re-arms the guard" "$out" "guard=on (healthy)"
+
+# No modem connected: nothing to guard, and a stale table is removed.
+grep -v cdc-wdm0 "$gf/devices" >"$gf/devices.new"
+mv "$gf/devices.new" "$gf/devices"
+out=$(grun)
+expect_contains "runner: no modem device, guard off" "$out" "guard=off"
+expect_table off "runner: no modem device removes a stale table"
+
+# A device that is not connected is down at once (unplugged cable).
+gscene ok gone
+grun >/dev/null
+out=$(grun)
+expect_contains "runner: Ethernet alone is enough" "$out" "guard=on (healthy)"
+grep -v eth0 "$gf/devices" >"$gf/devices.tmp"
+mv "$gf/devices.tmp" "$gf/devices"
+out=$(grun)
+expect_contains "runner: an unplugged Ethernet is down at once, guard opens" "$out" "guard=off (failover)"
+
+# Dry run: decides, applies nothing, writes no state.
+gscene ok ok
+out=$(grun --dry-run)
+expect_contains "runner: --dry-run says nothing was applied" "$out" "dry run: nothing applied"
+if [ -d "$GUARD_STATE_DIR" ]; then
+  fail "runner: --dry-run writes no state"
+else
+  ok "runner: --dry-run writes no state"
+fi
+if grep -qE '^nft (-f|delete)' "$gf/calls"; then
+  fail "runner: --dry-run never changes nft"
+else
+  ok "runner: --dry-run never changes nft"
+fi
+# Armed guard, override says off: a dry run reports off but leaves the table.
+grun >/dev/null
+grun >/dev/null
+echo off >"$GUARD_OVERRIDE"
+out=$(grun --dry-run)
+expect_contains "runner: --dry-run reports the decision" "$out" "guard=off (override-off)"
+expect_table on "runner: --dry-run leaves an armed table alone"
+
+# Malformed inputs from the tools.
+gscene ok ok
+echo 'wwan0; flush ruleset' >"$gf/ipiface_cdc-wdm0"
+# give the hostile name real routes, so only the name check can stop it
+echo "default dev wwan0 proto static metric 1100" >"$gf/route4_wwan0; flush ruleset"
+grun >/dev/null
+out=$(grun)
+expect_contains "runner: a hostile interface name is never used" "$out" "guard=off"
+expect_table off "runner: a hostile interface name never reaches nft"
+gscene ok ok
+printf 'wlan0:wifi\n::::\n' >"$gf/devices"
+out=$(grun)
+expect_contains "runner: malformed nmcli output fails open" "$out" "guard=off"
+gscene ok ok
+echo "default dev wwan0 metric 99999999999999999999" >"$gf/route4_wwan0"
+echo "default dev wwan0 metric 99999999999999999999" >"$gf/route6_wwan0"
+grun >/dev/null
+out=$(grun)
+expect_contains "runner: an absurd modem metric reads as high, not a crash" "$out" "guard=on (healthy)"
+gscene ok ok
+mkdir -p "$GUARD_STATE_DIR"
+echo "total garbage here" >"$GUARD_STATE_DIR/wifi"
+echo "up 9 9" >"$GUARD_STATE_DIR/ethernet"
+out=$(grun)
+expect_contains "runner: a corrupt state file does not crash the run" "$out" "guard="
+
+# Tool paths must be absolute.
+set +e
+out=$(
+  GUARD_NFT=nft
+  cmd_guard_run 2>&1
+)
+code=$?
+set -e
+expect_eq "runner: a bare tool name is refused" "$code" 1
+expect_contains "runner: the refusal names the variable" "$out" "must be an absolute path"
+
+# The ruleset text and the printed steps.
+rs=$(guard_ruleset wwan0)
+expect_contains "ruleset: replaces the table in one transaction" "$rs" "delete table inet quectel_modem_guard"
+svc=$(guard_service_text /usr/sbin/nft /usr/bin/nmcli /usr/sbin/ip /usr/bin/ping)
+expect_contains "service: absolute nft path is baked in" "$svc" "QUECTEL_GUARD_NFT=/usr/sbin/nft"
+expect_contains "service: absolute ping path is baked in" "$svc" "QUECTEL_GUARD_PING=/usr/bin/ping"
+expect_contains "service: runs the root-owned copy" "$svc" "ExecStart=/usr/local/libexec/quectel-usbnet-guard guard-run"
+out=$("$TOOL" guard-install)
+expect_contains "guard-install prints sudo steps" "$out" "sudo systemctl enable --now quectel-modem-guard.timer"
+expect_contains "guard-install bakes in absolute tool paths" "$out" "QUECTEL_GUARD_NMCLI=/"
+expect_contains "guard-install says nothing was run" "$out" "Nothing has been run"
+out=$("$TOOL" guard-uninstall)
+expect_contains "guard-uninstall removes the nft table" "$out" "sudo nft delete table inet quectel_modem_guard"
+expect_contains "guard-uninstall removes the units" "$out" "sudo rm -f /etc/systemd/system/quectel-modem-guard.timer"
+expect_contains "guard-uninstall leaves the resume hook's copy alone" "$out" "quectel-usbnet-guard"
+if [[ $out == *"/usr/local/libexec/quectel-usbnet "* ]] || [[ $out == *"/usr/local/libexec/quectel-usbnet$'\n'"* ]]; then
+  fail "guard-uninstall never removes the resume hook's copy"
+else
+  ok "guard-uninstall never removes the resume hook's copy"
+fi
+
 # --- the command line -------------------------------------------------------
 out=$("$TOOL" set qmi --dry-run 2>&1)
 expect_contains "dry run names the AT command it would send" "$out" 'AT+QCFG="usbnet",0'

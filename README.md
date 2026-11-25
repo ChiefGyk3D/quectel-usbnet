@@ -115,6 +115,91 @@ The cause is not proven. See [docs/evidence.md](docs/evidence.md) for what was o
 They overlap in one respect: both can follow a suspend/resume, and both stop and start ModemManager. They fix different things and neither calls the other. `recover` is for a modem that is missing or unusable (no modem in `mmcli -L`, or the `cdc-wdm` device `unavailable` in NetworkManager). `sim-recover` is for a modem that is listed but failed with `sim-missing` because the USIM application is stuck in the QMI state `illegal`. If `recover` brings the modem back and `status` then shows an `illegal` SIM, run `sim-recover` next.
 
 
+## Keep the modem idle while Ethernet or Wi-Fi works: the modem guard
+
+The order I want is Ethernet, then Wi-Fi, then cellular, always. Pinning the modem's route metric (`nmcli connection modify <gsm-profile> ipv4.route-metric 1100 ipv6.route-metric 1100`, then `ip route show default`) is the first step, and it is not enough. On my laptop, with Wi-Fi up and the metric at 1100, the modem still carried most of the traffic, for two reasons I measured: Wi-Fi had no IPv6, so the modem held the only IPv6 default route and every client that prefers IPv6 used it; and a zero-trust VPN client bound its sockets to the modem device itself, which ignores metrics.
+
+Taking the modem down is not the fix, because the modem has to stay connected as the fallback. The guard leaves it connected and rejects traffic leaving on its interface while a better link has working internet. Clients get an immediate "connection refused" and fall back, instead of hanging.
+
+### What it does
+
+A systemd timer runs `quectel-usbnet guard-run` as root every 15 seconds. Each run:
+
+1. Asks NetworkManager for the connected devices of type `ethernet`, `wifi` and `gsm`. No interface name is configured or hard-coded; the modem's IP interface (for example `wwan0`) is read from the gsm device.
+2. Pings from each link, bound to the interface (`ping -I`, 2 second timeout, two public resolver addresses, either one answering is a pass). A link flips to down after 2 failed rounds in a row and back to up after 2 good rounds in a row, so one lost ping changes nothing. A link whose device is not connected at all (cable pulled) is down at once.
+3. Reads the modem's and Wi-Fi's default route metrics from `ip route`, both address families.
+4. Decides, and applies it: guard on means an nftables table that rejects egress on the modem interface; guard off means that table is removed.
+
+The guard is ON only while Ethernet or Wi-Fi is up, the owner has not flipped modem-first, and no override says otherwise. Anything it cannot read or parse turns it OFF. A guard that fails closed would cut off the fallback, so every doubt fails open.
+
+### The order, and the maintenance flip
+
+Ethernet and Wi-Fi are both "better than cellular", so either one being healthy keeps the guard on. When both are down for two rounds (about 30 to 45 seconds), the guard opens and the modem carries traffic.
+
+Flip detection: if the modem's default route metric is lower than Wi-Fi's (Ethernet's, when Wi-Fi has no default route), you have put the modem first for maintenance, and the guard turns itself off on the next run. Put the metric back to 1100 and it turns back on. The comparison uses the metrics in the routing table, so it works whether the profile metric is pinned or automatic.
+
+### Override
+
+One file, `/etc/quectel-usbnet/guard-override`, first line only:
+
+```
+off     the guard stays off whatever the links do
+on      the guard stays on, even in failover (testing only; it can cut off your only link)
+auto    the default, same as no file
+```
+
+Anything else in the file, an empty file, or a symlink counts as `off`. To turn the guard off now:
+
+```
+echo off | sudo tee /etc/quectel-usbnet/guard-override
+```
+
+The next run (within 15 seconds) removes the table. Remove the file to go back to automatic.
+
+### What the rules allow
+
+Out of the modem interface, while the guard is on, these still pass: ICMPv6 neighbor and router discovery, and DHCP (UDP to port 67 and 547). Everything else is rejected. The modem's registration with the network and its data session live inside the modem, not in this traffic, which is why it stays connected. The table is `inet quectel_modem_guard`, at output hook priority -5, with only its own rules. It does not touch ufw, `/etc/nftables.conf` or any other table.
+
+The interface is held in a set with a 60 second timeout that every run refreshes. If the timer stops or the script crashes, the rules go inert by themselves within a minute. A dead guard cannot leave you without a fallback.
+
+I loaded the ruleset in a throwaway network namespace on the development laptop (`unshare -rn`, a dummy interface, nothing on the real network): a TCP connect out of the interface timed out before the table, was refused at once with it, and timed out again after the table was deleted.
+
+### Install and uninstall
+
+Neither command runs anything. They print the sudo steps for you to read and run:
+
+```
+quectel-usbnet guard-install
+quectel-usbnet guard-uninstall
+```
+
+The install steps copy the script to a root-owned `/usr/local/libexec/quectel-usbnet-guard` (a different file from the resume hook's copy), write a service and a timer into `/etc/systemd/system`, and enable the timer. The absolute paths of `nft`, `nmcli`, `ip` and `ping` are resolved when you run `guard-install` and written into the unit, so the root service never looks anything up on a `PATH` (the same lesson as the resume hook). The uninstall steps stop the timer, delete the table, and remove every file the install wrote, which puts the machine back as it was.
+
+To see what it would decide without applying anything, run it from the checkout with the tool paths that `guard-install` printed (the example paths below are typical; use yours). It needs no root and writes nothing. With no saved history every link starts as down, so a first dry run reports `failover` until the real timer has seen two good rounds:
+
+```
+QUECTEL_GUARD_NFT=/usr/sbin/nft QUECTEL_GUARD_NMCLI=/usr/bin/nmcli \
+  QUECTEL_GUARD_IP=/usr/bin/ip QUECTEL_GUARD_PING=/usr/bin/ping \
+  ./quectel-usbnet guard-run --dry-run
+```
+
+To watch it work, the byte counters of the modem interface should stay flat while Wi-Fi is up:
+
+```
+ip -s link show wwan0
+journalctl -u quectel-modem-guard.service -n 5
+```
+
+### Limits
+
+- It acts on egress only. Traffic that is already established is rejected on its next outgoing packet, so a long-lived connection breaks (and then reconnects over the better link) rather than moving cleanly.
+- The guard only blocks what leaves the modem interface. A program that pins itself to the modem gets an error, not a transparent fallback. That is the point, and it also means that program will not work while the guard is on.
+- A Wi-Fi network that answers pings but has no working internet for your traffic looks healthy. The probe is two ICMP echoes to public addresses, not a test of your destination.
+- Failover is not instant: about 30 to 45 seconds after both links die (two failed rounds, 15 seconds apart, plus ping timeouts). Reverting is the same on the way back.
+- The probe sends a ping to the two resolver addresses every 15 seconds from each of Ethernet and Wi-Fi. If that is not acceptable, add `Environment=QUECTEL_GUARD_TARGETS="addr1 addr2"` to the service with `sudo systemctl edit quectel-modem-guard.service`.
+- Inbound traffic is not touched, only what the machine sends out of the modem interface.
+- Tested here only with fake `nft`, `nmcli`, `ip` and `ping` (the decision logic and the runner), plus the namespace check above. The install on a live machine, and the counters staying flat on a real Wi-Fi link, are for the person who runs the steps to confirm.
+
 ## What was going wrong
 
 I turned ModemManager's logging up to debug (`mmcli -G DEBUG`) and read what it sent. It gets through MBIM setup normally for twenty transactions (device caps, SIM slots, UICC access), then sends a request on the `qdu` service, and the modem never answers it. Every retry gets silence, ten timeouts at about twenty seconds each, and ModemManager marks the modem invalid and does not try again.

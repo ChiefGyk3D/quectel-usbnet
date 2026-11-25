@@ -12,6 +12,8 @@
 #   quectel-usbnet install-resume-hook [--dry-run] [--tool PATH]
 #   quectel-usbnet uninstall-resume-hook
 #   quectel-usbnet sim-recover [--device /dev/cdc-wdmN]
+#   quectel-usbnet guard-run [--dry-run]
+#   quectel-usbnet guard-install | guard-uninstall
 #
 # `status` only reads sysfs, ModemManager, the journal and the SIM state.
 # `set` stops ModemManager, talks AT to the modem, resets it, and starts
@@ -62,6 +64,9 @@ usage:
   quectel-usbnet uninstall-resume-hook
       ;;
   quectel-usbnet sim-recover [--device /dev/cdc-wdmN]
+  quectel-usbnet guard-run [--dry-run]
+  quectel-usbnet guard-install
+  quectel-usbnet guard-uninstall
   quectel-usbnet --version
 
 MODE is one of: qmi (usbnet 0), ecm (1), mbim (2), rndis (3).
@@ -89,6 +94,12 @@ install-resume-hook
          it. Needs root.
 uninstall-resume-hook
          Removes the hook and the copy, only if quectel-usbnet wrote them.
+guard-run
+         The modem egress guard, one evaluation (a systemd timer runs it as
+         root). --dry-run probes and prints the decision, applies nothing.
+guard-install, guard-uninstall
+         Only PRINT the sudo steps to install or remove the guard. They run
+         nothing. See the README.
 EOF
   exit 2
 }
@@ -970,6 +981,473 @@ cmd_sim_recover() {
   sim_result recovered
 }
 
+# --- the modem egress guard ---------------------------------------------------
+#
+# Keeps the cellular fallback idle while Ethernet or Wi-Fi has working internet.
+# Route metrics cannot do that alone: an IPv6 default route that only the modem
+# holds, and sockets bound to the modem device, ignore them. So an nftables
+# table rejects egress on the modem interface while a better link is healthy,
+# and is removed (guard off) when both are down or the owner flips modem-first.
+# The modem itself is never touched: it stays connected as the fallback.
+
+GUARD_TABLE="quectel_modem_guard"
+GUARD_STATE_DIR=${QUECTEL_GUARD_STATE_DIR:-/run/quectel-usbnet}
+GUARD_OVERRIDE=${QUECTEL_GUARD_OVERRIDE:-/etc/quectel-usbnet/guard-override}
+GUARD_TARGETS=${QUECTEL_GUARD_TARGETS:-"1.1.1.1 9.9.9.9"}
+GUARD_FAILS=${QUECTEL_GUARD_FAILS:-2}
+GUARD_OKS=${QUECTEL_GUARD_OKS:-2}
+GUARD_PING_TIMEOUT=${QUECTEL_GUARD_PING_TIMEOUT:-2}
+# The rules carry a timeout: if the runner stops refreshing them (crash, timer
+# disabled), the guard goes inert by itself after this many seconds.
+GUARD_TTL=${QUECTEL_GUARD_TTL:-60}
+# Absolute paths only; the install bakes them into the systemd unit (#17).
+GUARD_NFT=${QUECTEL_GUARD_NFT:-}
+GUARD_NMCLI=${QUECTEL_GUARD_NMCLI:-}
+GUARD_IP=${QUECTEL_GUARD_IP:-}
+GUARD_PING=${QUECTEL_GUARD_PING:-}
+# Not the resume hook's copy (/usr/local/libexec/quectel-usbnet): removing the
+# guard must never remove that.
+GUARD_COPY="/usr/local/libexec/quectel-usbnet-guard"
+GUARD_UNIT_DIR="/etc/systemd/system"
+GUARD_UNIT="quectel-modem-guard"
+GUARD_OVERRIDE_DIR="/etc/quectel-usbnet"
+
+guard_log() {
+  echo "quectel-modem-guard: $*"
+}
+
+# Link health with hysteresis. Pure: $1 = previous status (up|down), $2 = failures
+# in a row, $3 = successes in a row, $4 = this probe (ok|fail|absent). Prints
+# "status fails oks". `absent` (no connected device) goes down at once; a
+# failed probe needs GUARD_FAILS in a row to take an up link down, a good one
+# GUARD_OKS in a row to bring a down link up. A malformed previous state is
+# down with no history (fail open).
+guard_link_step() {
+  local status=${1:-} fails=${2:-} oks=${3:-} probe=${4:-}
+  case $status in up | down) ;; *) status=down ;; esac
+  [[ $fails =~ ^[0-9]{1,9}$ ]] || fails=0
+  [[ $oks =~ ^[0-9]{1,9}$ ]] || oks=0
+  case $probe in
+    absent)
+      status=down
+      fails=$GUARD_FAILS
+      oks=0
+      ;;
+    ok)
+      fails=0
+      oks=$((10#$oks + 1))
+      if [ "$status" = down ] && [ "$oks" -ge "$GUARD_OKS" ]; then status=up; fi
+      ;;
+    fail)
+      oks=0
+      fails=$((10#$fails + 1))
+      if [ "$status" = up ] && [ "$fails" -ge "$GUARD_FAILS" ]; then status=down; fi
+      ;;
+    *)
+      # An unknown probe result never counts as healthy.
+      oks=0
+      ;;
+  esac
+  echo "$status $fails $oks"
+}
+
+# Reads the override file. Prints auto (no file, or "auto"), on, off, or invalid.
+# Anything unreadable or unrecognized is "invalid", which guard_decide treats as
+# off: a guard that cannot read its own switch must not block the fallback.
+guard_override_value() {
+  local file=$1 line=""
+  if [ ! -e "$file" ] && [ ! -L "$file" ]; then
+    echo auto
+    return 0
+  fi
+  if [ ! -f "$file" ] || [ -L "$file" ] || [ ! -r "$file" ]; then
+    echo invalid
+    return 0
+  fi
+  IFS= read -r line <"$file" || true
+  line=$(printf '%s' "$line" | tr -d '[:space:]')
+  case ${line,,} in
+    auto) echo auto ;;
+    on) echo on ;;
+    off) echo off ;;
+    *) echo invalid ;;
+  esac
+}
+
+# The decision. Pure. Arguments: override (auto|on|off|invalid), Ethernet status
+# (up|down), Wi-Fi status (up|down), modem default-route metric, Wi-Fi metric,
+# Ethernet metric (each empty when there is no default route, else a number).
+# Prints "on REASON" or "off REASON". Anything malformed is off (fail open).
+#
+# Flip detection: the owner is modem-first when the modem's route metric is
+# lower than Wi-Fi's (Ethernet's when Wi-Fi has no default route).
+guard_decide() {
+  local override=${1:-} eth=${2:-} wifi=${3:-} modem=${4:-} wifim=${5:-} ethm=${6:-} ref m
+  case $override in
+    off)
+      echo "off override-off"
+      return 0
+      ;;
+    on)
+      echo "on override-on"
+      return 0
+      ;;
+    auto) ;;
+    *)
+      echo "off override-invalid"
+      return 0
+      ;;
+  esac
+  case $eth in up | down) ;; *)
+    echo "off bad-input"
+    return 0
+    ;;
+  esac
+  case $wifi in up | down) ;; *)
+    echo "off bad-input"
+    return 0
+    ;;
+  esac
+  for m in "$modem" "$wifim" "$ethm"; do
+    if [ -n "$m" ] && ! [[ $m =~ ^[0-9]{1,9}$ ]]; then
+      echo "off bad-input"
+      return 0
+    fi
+  done
+  if [ -z "$modem" ]; then
+    echo "off no-modem-route"
+    return 0
+  fi
+  ref=${wifim:-$ethm}
+  if [ -n "$ref" ] && [ "$((10#$modem))" -lt "$((10#$ref))" ]; then
+    echo "off modem-first"
+    return 0
+  fi
+  if [ "$eth" = up ] || [ "$wifi" = up ]; then
+    echo "on healthy"
+  else
+    echo "off failover"
+  fi
+}
+
+# Reads `nmcli -t -f DEVICE,TYPE,STATE device` on stdin, prints the names of the
+# connected devices of type $1 (ethernet, wifi or gsm), one per line.
+guard_devices_of_type() {
+  local want=$1 dev type state
+  while IFS=: read -r dev type state _; do
+    [ "$type" = "$want" ] || continue
+    [ "$state" = connected ] || continue
+    if [ -n "$dev" ]; then echo "$dev"; fi
+  done
+}
+
+# Interface names go into an nft script, so only plain names pass.
+guard_iface_ok() {
+  [[ $1 =~ ^[A-Za-z0-9_.@-]{1,15}$ ]]
+}
+
+# Reads `ip -o route show default` output on stdin, prints the lowest metric,
+# or nothing when there is no default route. A route without a metric is 0. A
+# metric too long to be a real one is clamped to 999999999, so it still reads
+# as a (high) number.
+guard_min_metric() {
+  local line best="" m
+  while IFS= read -r line; do
+    [[ $line == default* ]] || continue
+    if [[ $line =~ [[:space:]]metric[[:space:]]+([0-9]+) ]]; then
+      m=${BASH_REMATCH[1]}
+      [ "${#m}" -le 9 ] || m=999999999
+      m=$((10#$m))
+    else
+      m=0
+    fi
+    if [ -z "$best" ] || [ "$m" -lt "$best" ]; then best=$m; fi
+  done
+  if [ -n "$best" ]; then echo "$best"; fi
+  return 0
+}
+
+# Lowest default-route metric of an interface over both families, or nothing.
+guard_iface_metric() {
+  local iface=$1 a b
+  a=$("$GUARD_IP" -o -4 route show default dev "$iface" 2>/dev/null | guard_min_metric) || a=""
+  b=$("$GUARD_IP" -o -6 route show default dev "$iface" 2>/dev/null | guard_min_metric) || b=""
+  if [ -z "$a" ]; then
+    echo "$b"
+  elif [ -z "$b" ] || [ "$a" -le "$b" ]; then
+    echo "$a"
+  else
+    echo "$b"
+  fi
+}
+
+# A link is healthy when a ping bound to it reaches any target. Targets are
+# checked to be plain addresses so none can be read as an option.
+guard_probe_iface() {
+  local iface=$1 t
+  for t in $GUARD_TARGETS; do
+    [[ $t =~ ^[0-9A-Fa-f][0-9A-Fa-f:.]*$ ]] || continue
+    if "$GUARD_PING" -n -q -c 1 -W "$GUARD_PING_TIMEOUT" -I "$iface" "$t" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Probes every connected device of one type ($1 = the nmcli device list, $2 =
+# the type). Prints "probe metric": probe is ok (any answered), fail, or absent
+# (no connected device); metric is the lowest default-route metric among them.
+guard_probe_type() {
+  local nmdevs=$1 type=$2 iface probe=absent metric="" m any=false
+  for iface in $(printf '%s\n' "$nmdevs" | guard_devices_of_type "$type"); do
+    guard_iface_ok "$iface" || continue
+    if [ "$probe" = absent ]; then probe=fail; fi
+    if guard_probe_iface "$iface"; then any=true; fi
+    m=$(guard_iface_metric "$iface")
+    if [ -n "$m" ] && { [ -z "$metric" ] || [ "$m" -lt "$metric" ]; }; then metric=$m; fi
+  done
+  if $any; then probe=ok; fi
+  echo "$probe $metric"
+}
+
+# The IP interface of the connected gsm device. NetworkManager's device is the
+# control port (for example cdc-wdm0); the traffic leaves on another name.
+guard_modem_iface() {
+  local nmdevs=$1 dev iface
+  for dev in $(printf '%s\n' "$nmdevs" | guard_devices_of_type gsm); do
+    guard_iface_ok "$dev" || continue
+    iface=$("$GUARD_NMCLI" -g GENERAL.IP-IFACE device show "$dev" 2>/dev/null | head -n 1) || iface=""
+    if guard_iface_ok "$iface"; then
+      echo "$iface"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# The nft ruleset for the guard, one atomic transaction that replaces the table.
+# $1 = modem interface. The interface sits in a set whose element expires after
+# GUARD_TTL, so the rules go inert if nothing refreshes them. Allowed through:
+# ICMPv6 neighbor and router discovery and DHCP, which the link needs to stay
+# usable. Everything else out of the modem interface is rejected, so clients
+# fail at once and fall back instead of hanging.
+guard_ruleset() {
+  local iface=$1
+  cat <<EOF
+add table inet $GUARD_TABLE
+delete table inet $GUARD_TABLE
+table inet $GUARD_TABLE {
+  set armed {
+    type ifname
+    flags timeout
+    elements = { "$iface" timeout ${GUARD_TTL}s }
+  }
+  chain output {
+    type filter hook output priority -5; policy accept;
+    oifname @armed icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
+    oifname @armed udp dport { 67, 547 } accept
+    oifname @armed reject
+  }
+}
+EOF
+}
+
+guard_table_present() {
+  "$GUARD_NFT" list table inet "$GUARD_TABLE" >/dev/null 2>&1
+}
+
+guard_apply_on() {
+  guard_ruleset "$1" | "$GUARD_NFT" -f -
+}
+
+guard_apply_off() {
+  if guard_table_present; then
+    "$GUARD_NFT" delete table inet "$GUARD_TABLE"
+  fi
+}
+
+guard_read_state() {
+  local file=$1 line=""
+  if [ -f "$file" ] && [ ! -L "$file" ]; then
+    IFS= read -r line <"$file" || true
+  fi
+  echo "${line:-down 0 0}"
+}
+
+guard_write_state() {
+  local file=$1
+  shift
+  printf '%s\n' "$*" >"$file.new"
+  mv -f "$file.new" "$file"
+}
+
+guard_need_tools() {
+  local v
+  for v in GUARD_NFT GUARD_NMCLI GUARD_IP GUARD_PING; do
+    case ${!v} in
+      /*) [ -x "${!v}" ] || die "$v is ${!v}, which is not executable" ;;
+      *) die "$v must be an absolute path (QUECTEL_$v); the install sets it" ;;
+    esac
+  done
+}
+
+# Runs guard_link_step on a saved "status fails oks" line ($1) and a probe ($2).
+guard_step_saved() {
+  local -a prev
+  read -r -a prev <<<"$1"
+  guard_link_step "${prev[0]:-}" "${prev[1]:-}" "${prev[2]:-}" "$2"
+}
+
+# One evaluation: probe, update the link state, decide, apply.
+cmd_guard_run() {
+  local dry=false devs modem_if="" override
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dry-run)
+        dry=true
+        shift
+        ;;
+      *) usage ;;
+    esac
+  done
+  guard_need_tools
+  local dir=$GUARD_STATE_DIR
+  if ! $dry && [ ! -d "$dir" ]; then install -d -m 0755 "$dir"; fi
+  devs=$("$GUARD_NMCLI" -t -f DEVICE,TYPE,STATE device 2>/dev/null) || devs=""
+
+  local e_probe e_metric w_probe w_metric
+  read -r e_probe e_metric <<<"$(guard_probe_type "$devs" ethernet)"
+  read -r w_probe w_metric <<<"$(guard_probe_type "$devs" wifi)"
+
+  local e_new w_new
+  e_new=$(guard_step_saved "$(guard_read_state "$dir/ethernet")" "$e_probe")
+  w_new=$(guard_step_saved "$(guard_read_state "$dir/wifi")" "$w_probe")
+  if ! $dry; then
+    guard_write_state "$dir/ethernet" "$e_new"
+    guard_write_state "$dir/wifi" "$w_new"
+  fi
+
+  local m_metric="" decision reason
+  if modem_if=$(guard_modem_iface "$devs"); then
+    m_metric=$(guard_iface_metric "$modem_if")
+  fi
+  override=$(guard_override_value "$GUARD_OVERRIDE")
+  decision=$(guard_decide "$override" "${e_new%% *}" "${w_new%% *}" "$m_metric" "$w_metric" "$e_metric")
+  reason=${decision#* }
+  decision=${decision%% *}
+  # No modem interface means there is nothing to guard, whatever was decided.
+  if [ -z "$modem_if" ]; then decision=off; fi
+  guard_log "ethernet=${e_new%% *} wifi=${w_new%% *} modem-metric=${m_metric:-none} guard=$decision ($reason)"
+  if $dry; then
+    guard_log "dry run: nothing applied, no state written"
+    return 0
+  fi
+  if [ "$decision" = on ]; then
+    guard_apply_on "$modem_if"
+  else
+    guard_apply_off
+  fi
+}
+
+guard_service_text() {
+  cat <<EOF
+# written by quectel-usbnet guard-install
+[Unit]
+Description=Reject egress on the cellular modem while Ethernet or Wi-Fi is healthy
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+Environment=QUECTEL_GUARD_NFT=$1
+Environment=QUECTEL_GUARD_NMCLI=$2
+Environment=QUECTEL_GUARD_IP=$3
+Environment=QUECTEL_GUARD_PING=$4
+ExecStart=$GUARD_COPY guard-run
+TimeoutStartSec=30
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RuntimeDirectory=quectel-usbnet
+RuntimeDirectoryPreserve=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+EOF
+}
+
+guard_timer_text() {
+  cat <<EOF
+# written by quectel-usbnet guard-install
+[Unit]
+Description=Evaluate the modem egress guard every 15 seconds
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Prints the install steps. Runs nothing, installs nothing, never uses sudo.
+cmd_guard_install() {
+  local src nft nmcli ip ping p
+  [ $# -eq 0 ] || usage
+  src=$(readlink -f "${BASH_SOURCE[0]}")
+  for p in nft nmcli ip ping; do
+    command -v "$p" >/dev/null 2>&1 || die "$p not found; the guard needs it"
+  done
+  nft=$(readlink -f "$(command -v nft)")
+  nmcli=$(readlink -f "$(command -v nmcli)")
+  ip=$(readlink -f "$(command -v ip)")
+  ping=$(readlink -f "$(command -v ping)")
+  cat <<EOF
+# Modem guard: install steps. Nothing has been run; read them, then run them.
+# Absolute tool paths, resolved now, are baked into the unit (#17):
+#   nft=$nft nmcli=$nmcli ip=$ip ping=$ping
+# It uses its own nftables table (inet $GUARD_TABLE). ufw and /etc/nftables.conf are not touched.
+
+sudo install -d -m 0755 -o root -g root /usr/local/libexec
+sudo install -m 0755 -o root -g root $src $GUARD_COPY
+sudo install -d -m 0755 -o root -g root $GUARD_OVERRIDE_DIR
+
+sudo tee $GUARD_UNIT_DIR/$GUARD_UNIT.service >/dev/null <<'UNIT'
+$(guard_service_text "$nft" "$nmcli" "$ip" "$ping")
+UNIT
+
+sudo tee $GUARD_UNIT_DIR/$GUARD_UNIT.timer >/dev/null <<'UNIT'
+$(guard_timer_text)
+UNIT
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now $GUARD_UNIT.timer
+
+# Afterwards:
+#   systemctl list-timers $GUARD_UNIT.timer
+#   journalctl -u $GUARD_UNIT.service -n 5
+#   sudo nft list table inet $GUARD_TABLE
+EOF
+}
+
+# Prints the steps that put the machine back the way it was. Runs nothing.
+cmd_guard_uninstall() {
+  [ $# -eq 0 ] || usage
+  cat <<EOF
+# Modem guard: uninstall steps. Nothing has been run; read them, then run them.
+
+sudo systemctl disable --now $GUARD_UNIT.timer
+sudo systemctl stop $GUARD_UNIT.service
+sudo nft delete table inet $GUARD_TABLE    # an error saying the table does not exist is fine
+sudo rm -f $GUARD_UNIT_DIR/$GUARD_UNIT.timer $GUARD_UNIT_DIR/$GUARD_UNIT.service
+sudo rm -f $GUARD_COPY $GUARD_OVERRIDE_DIR/guard-override
+sudo rmdir --ignore-fail-on-non-empty $GUARD_OVERRIDE_DIR
+sudo rm -rf /run/quectel-usbnet
+sudo systemctl daemon-reload
+EOF
+}
+
 main() {
   [ $# -ge 1 ] || usage
   case $1 in
@@ -993,6 +1471,18 @@ main() {
     sim-recover)
       shift
       cmd_sim_recover "$@"
+      ;;
+    guard-run)
+      shift
+      cmd_guard_run "$@"
+      ;;
+    guard-install)
+      shift
+      cmd_guard_install "$@"
+      ;;
+    guard-uninstall)
+      shift
+      cmd_guard_uninstall "$@"
       ;;
     --version) echo "quectel-usbnet $VERSION" ;;
     *) usage ;;
