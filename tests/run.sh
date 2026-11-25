@@ -1104,14 +1104,14 @@ expect_eq "install steps: a reinstall over our own files succeeds" "$code" 0
 expect_eq "install steps: a permissive unit is replaced by a 0644 one" "$(stat -c %a "$inst/root/units/quectel-modem-guard.service")" 644
 # a symlink at the destination is refused and its target is not written
 guard_env
-echo victim >"$inst/victim"
+printf "# written by quectel-usbnet guard-install\nvictim\n" >"$inst/victim"
 ln -s "$inst/victim" "$inst/root/units/quectel-modem-guard.service"
 set +e
 runsteps install
 code=$?
 set -e
 expect_eq "install steps: a symlink destination is refused" "$code" 1
-expect_eq "install steps: the symlink target is untouched" "$(cat "$inst/victim")" victim
+expect_eq "install steps: the symlink target is untouched" "$(tail -n 1 "$inst/victim")" victim
 if [ -L "$inst/root/units/quectel-modem-guard.service" ]; then
   ok "install steps: the symlink is still a symlink"
 else
@@ -1174,11 +1174,16 @@ guard_env
 steps install
 runsteps install
 rm -f "$inst/root/libexec/quectel-usbnet-guard"
-echo victim >"$inst/victim"
+printf "quectel-usbnet: read or change the USB network mode\nvictim\n" >"$inst/victim"
 ln -s "$inst/victim" "$inst/root/libexec/quectel-usbnet-guard"
 steps uninstall
 runsteps uninstall
-expect_eq "uninstall steps: a symlinked copy is left and its target survives" "$(cat "$inst/victim")" victim
+expect_eq "uninstall steps: a symlinked copy's target survives" "$(tail -n 1 "$inst/victim")" victim
+if [ -L "$inst/root/libexec/quectel-usbnet-guard" ]; then
+  ok "uninstall steps: a symlinked copy is left in place, not followed or removed"
+else
+  fail "uninstall steps: a symlinked copy is left in place, not followed or removed"
+fi
 unset QUECTEL_GUARD_UNIT_DIR QUECTEL_GUARD_LIBEXEC_DIR QUECTEL_GUARD_OVERRIDE_DIR QUECTEL_GUARD_STATE_DIR
 
 # --- fix round 1: the off path fails open --------------------------------------
@@ -1255,7 +1260,8 @@ expect_table off "on path: a failed rule load fails open"
 # deadline. At most 4 per type are probed, in parallel, and the run still ends.
 gscene dead ok
 for i in 1 2 3 4 5 6 7 8 9; do echo "eth$i:ethernet:connected" >>"$gf/devices"; done
-echo 4711 >"$gf/ping_sleep"
+hang=$((40000 + $$ % 20000))
+echo "$hang" >"$gf/ping_sleep"
 : >"$gf/calls"
 GUARD_DEADLINE=3
 SECONDS=0
@@ -1271,7 +1277,7 @@ expect_contains "bounded: hanging probes count as failures, so the guard opens" 
 expect_eq "bounded: only 4 Ethernet devices and 1 Wi-Fi are probed" "$(grep -c '^ping' "$gf/calls")" 5
 leftover=0
 for f in /proc/[0-9]*/cmdline; do
-  if [ "$(tr '\0' ' ' <"$f" 2>/dev/null)" = "sleep 4711 " ]; then
+  if [ "$(tr '\0' ' ' <"$f" 2>/dev/null)" = "sleep $hang " ]; then
     leftover=$((leftover + 1))
     pid=${f#/proc/}
     kill "${pid%/cmdline}" 2>/dev/null || true
