@@ -1365,6 +1365,17 @@ deaf_elapsed=$SECONDS
 expect_eq "deaf probe: a whole run takes at most deadline + grace + slack" "$((deaf_elapsed <= 6 ? 1 : 0))" 1
 expect_contains "deaf probe: the run still decides" "$(cat "$tmp/deaf.out")" "guard=off (failover)"
 expect_table off "deaf probe: the fail-open delete still ran"
+deaf_left=0
+for f in /proc/[0-9]*/cmdline; do
+  case "$(tr '\0' ' ' <"$f" 2>/dev/null)" in
+    *"$gbin/ping "*)
+      deaf_left=$((deaf_left + 1))
+      pid=${f#/proc/}
+      kill -9 "${pid%/cmdline}" 2>/dev/null || true
+      ;;
+  esac
+done
+expect_eq "deaf probe: KILL leaves no probe process behind" "$deaf_left" 0
 rm -f "$gf/ping_deaf"
 GUARD_DEADLINE=12
 
