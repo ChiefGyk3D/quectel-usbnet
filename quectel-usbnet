@@ -1395,10 +1395,10 @@ EOF
 cmd_guard_install() {
   local src nft nmcli ip ping p
   [ $# -eq 0 ] || usage
-  src=$(readlink -f "${BASH_SOURCE[0]}")
   for p in nft nmcli ip ping; do
     command -v "$p" >/dev/null 2>&1 || die "$p not found; the guard needs it"
   done
+  src=$(readlink -f "${BASH_SOURCE[0]}")
   nft=$(readlink -f "$(command -v nft)")
   nmcli=$(readlink -f "$(command -v nmcli)")
   ip=$(readlink -f "$(command -v ip)")

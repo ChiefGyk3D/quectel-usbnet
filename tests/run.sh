@@ -933,9 +933,16 @@ svc=$(guard_service_text /usr/sbin/nft /usr/bin/nmcli /usr/sbin/ip /usr/bin/ping
 expect_contains "service: absolute nft path is baked in" "$svc" "QUECTEL_GUARD_NFT=/usr/sbin/nft"
 expect_contains "service: absolute ping path is baked in" "$svc" "QUECTEL_GUARD_PING=/usr/bin/ping"
 expect_contains "service: runs the root-owned copy" "$svc" "ExecStart=/usr/local/libexec/quectel-usbnet-guard guard-run"
-out=$("$TOOL" guard-install)
+# The fakes stand in for the real tools on PATH, so this works where NetworkManager is absent.
+out=$(PATH="$gbin:$PATH" "$TOOL" guard-install)
 expect_contains "guard-install prints sudo steps" "$out" "sudo systemctl enable --now quectel-modem-guard.timer"
-expect_contains "guard-install bakes in absolute tool paths" "$out" "QUECTEL_GUARD_NMCLI=/"
+expect_contains "guard-install bakes in absolute tool paths" "$out" "QUECTEL_GUARD_NMCLI=$gbin/nmcli"
+set +e
+out2=$(PATH="$gf" "$BASH" "$TOOL" guard-install 2>&1)
+code=$?
+set -e
+expect_eq "guard-install refuses when a needed tool is missing" "$code" 1
+expect_contains "guard-install names the missing tool" "$out2" "not found"
 expect_contains "guard-install says nothing was run" "$out" "Nothing has been run"
 out=$("$TOOL" guard-uninstall)
 expect_contains "guard-uninstall removes the nft table" "$out" "sudo nft delete table inet quectel_modem_guard"
