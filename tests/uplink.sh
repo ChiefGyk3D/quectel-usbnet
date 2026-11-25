@@ -106,6 +106,11 @@ if [ -f "$UW/ping_deaf" ]; then
   trap '' TERM
   while :; do sleep 1; done
 fi
+if [ -f "$UW/ping_term" ]; then
+  trap 'echo "ping got TERM" >>"$UW/calls"; exit 1' TERM
+  sleep 100 &
+  wait
+fi
 if [ -f "$UW/ping_sleep" ]; then sleep "$(cat "$UW/ping_sleep")"; fi
 if [ "$target" = "$(cat "$UW/gwaddr_$iface" 2>/dev/null)" ]; then
   [ "$(cat "$UW/gwok_$iface" 2>/dev/null)" = ok ]
@@ -405,7 +410,15 @@ for f in /proc/[0-9]*/cmdline; do
   esac
 done
 expect_eq "deaf probe: KILL leaves no probe behind" "$deaf_left" 0
+expect_contains "deaf probe: one that was killed counts as a failure" "$ucli_t" "wifi=up/up(fail)"
 rm -f "$UW/ping_deaf"
+
+# a probe that handles TERM is sent TERM first (a graceful stop), then KILL if it lingers
+uscene gone ok ok
+: >"$UW/ping_term"
+ucli_t=$(QUECTEL_UPLINK_DEADLINE=2 timeout 30 "$TOOL" uplink run 2>&1 || true)
+expect_contains "term probe: TERM reaches a hung probe before KILL" "$(ucalls)" "ping got TERM"
+expect_contains "term probe: a probe that had to be stopped counts as a failure" "$ucli_t" "wifi=up/up(fail)"
 
 # Many devices: only the first UP_MAX_DEVICES of a type are used.
 uscene none ok ok
@@ -497,6 +510,48 @@ ucli_out=$(QUECTEL_UPLINK_IF_INET6=$tmp/no_such_file "$TOOL" uplink run 2>&1) ||
 expect_eq "ip v6 fails on a machine without IPv6: tolerated" "$ucli_rc" 0
 rm -f "$UW/fail_ip6"
 
+# A modem that holds only an IPv6 default route is seen, and demoted
+uscene gone ok ok
+cp "$UW/tpl6_wwan0" "$UW/rt6_wwan0"
+ucli run
+expect_eq "ipv6 only: the modem's IPv6 default is found and removed" "$(umods)" "cdc-wdm0 yes;"
+expect_eq "ipv6 only: only Wi-Fi holds defaults afterwards" "$(uholders)" "wlan0"
+
+# An interface whose name starts like a managed one is not the same interface
+uscene ok ok ok
+ucli run
+echo "default dev wlan01 scope link metric 50" >"$UW/rt4_wlan01"
+unow 15
+ucli run
+unow 30
+ucli run
+unow 45
+ucli run
+ucli status --json
+expect_contains "name prefix: wlan01 holding a route does not make wlan0 look like an owner" "$ucli_out" '"wifi":{"state":"up","healthy":true}'
+expect_eq "name prefix: wlan01 is left alone" "$(ucalls | grep -c 'modify wlan01' || true)" 0
+expect_eq "name prefix: the runs exit 0" "$ucli_rc" 0
+expect_eq "name prefix: nothing is changed after the first run" "$(umods)" "wlan0 yes;"
+
+# The gateway of a demoted link
+gw_check() {
+  uplink_init
+  uplink_gateway "$1"
+}
+uscene gone ok ok
+expect_eq "gateway: the DHCP router, not requested_routers" "$(gw_check wlan0)" "192.0.2.253"
+printf 'DHCP4.OPTION[26]:routers = 192.0.2.7 192.0.2.8\n' >"$UW/dhcp_wlan0"
+expect_eq "gateway: the first of several routers" "$(gw_check wlan0)" "192.0.2.7"
+rm -f "$UW/dhcp_wlan0"
+echo "192.0.2.99" >"$UW/gw_wlan0"
+expect_eq "gateway: falls back to the gateway property" "$(gw_check wlan0)" "192.0.2.99"
+echo "not-an-address" >"$UW/gw_wlan0"
+expect_eq "gateway: a malformed gateway is ignored" "$(gw_check wlan0)" ""
+rm -f "$UW/gw_wlan0"
+expect_eq "gateway: none known is empty" "$(gw_check wlan0)" ""
+printf 'DHCP4.OPTION[26]:routers = 192.0.2.7;reboot\n' >"$UW/dhcp_wlan0"
+expect_eq "gateway: text after the address cannot be smuggled in" "$(gw_check wlan0)" "192.0.2.7"
+
 # The new owner cannot be promoted
 fail_start
 touch "$UW/fail_modify_cdc-wdm0"
@@ -573,6 +628,7 @@ ucli_rc=0
 ucli_out=$(QUECTEL_UPLINK_NMCLI=/nonexistent/nmcli "$TOOL" uplink run 2>&1) || ucli_rc=$?
 expect_eq "missing nmcli: exit 1" "$ucli_rc" 1
 expect_eq "missing nmcli: nothing was called" "$(ucalls)" ""
+expect_contains "missing nmcli: names the tool and the reason" "$ucli_out" "nmcli is /nonexistent/nmcli, which is not an executable file"
 ucli_rc=0
 ucli_out=$(QUECTEL_UPLINK_IP=relative/ip "$TOOL" uplink run 2>&1) || ucli_rc=$?
 expect_eq "a relative tool path is refused" "$ucli_rc" 1
@@ -618,7 +674,8 @@ done
 checks=$((checks + 1))
 echo "ok   every malformed mode line is refused"
 rm -f "$UST/mode"
-ln -s /etc/hostname "$UST/mode"
+echo "auto 5" >"$tmp/real_mode"
+ln -s "$tmp/real_mode" "$UST/mode"
 ucli run
 expect_eq "a symlinked mode file is refused" "$ucli_rc" 1
 rm -f "$UST/mode"
@@ -785,6 +842,12 @@ ucli run
 ucli status --json
 expect_contains "status: ethernet owner, and it is healthy" "$ucli_out" '"owner":"ethernet","links":{"ethernet":{"state":"up","healthy":true}'
 expect_contains "status: a demoted Wi-Fi is still up and healthy (measured through its gateway)" "$ucli_out" '"wifi":{"state":"up","healthy":true}'
+uscene ok ok ok
+ucli run
+sed -i 's/^eth0:ethernet:connected/eth0:ethernet:unavailable/' "$UW/devices"
+rm -f "$UW/rt4_eth0"
+ucli status --json
+expect_contains "status: an ethernet unplugged after a good run is down, not healthy" "$ucli_out" '"ethernet":{"state":"down","healthy":false}'
 uscene gone ok ok
 ucli status --json
 expect_contains "status: an unplugged ethernet is down, not healthy" "$ucli_out" '"ethernet":{"state":"down","healthy":false}'
@@ -993,6 +1056,28 @@ else
   ok "install: a symlinked copy is not followed"
 fi
 expect_eq "install: the symlinked copy's target is intact" "$(cat "$tmp/target_dir/victim")" victim
+
+# a symlink that points at a file carrying our own marker is still refused, and stays a symlink
+rm -rf "$inst_home"
+mkdir -p "$unit_dir"
+printf '%s\n' "# written by quectel-usbnet uplink install" "[Unit]" >"$tmp/target_dir/marked.service"
+ln -s "$tmp/target_dir/marked.service" "$unit_dir/quectel-uplink.service"
+if out=$(run_install); then
+  fail "install: a symlinked unit with our marker behind it is not followed"
+else
+  ok "install: a symlinked unit with our marker behind it is not followed"
+fi
+expect_eq "install: that unit is still a symlink" "$([ -L "$unit_dir/quectel-uplink.service" ] && echo link || echo replaced)" link
+rm -rf "$inst_home"
+mkdir -p "$inst_home/.local/libexec"
+cp "$TOOL" "$tmp/target_dir/copy"
+ln -s "$tmp/target_dir/copy" "$inst_home/.local/libexec/quectel-usbnet-uplink"
+if out=$(run_install); then
+  fail "install: a symlinked copy of the script is not followed"
+else
+  ok "install: a symlinked copy of the script is not followed"
+fi
+expect_eq "install: that copy is still a symlink" "$([ -L "$inst_home/.local/libexec/quectel-usbnet-uplink" ] && echo link || echo replaced)" link
 
 # a tool whose path would break a unit file is refused
 mkdir -p "$tmp/odd dir"
