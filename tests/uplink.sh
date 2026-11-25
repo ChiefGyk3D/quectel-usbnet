@@ -95,6 +95,24 @@ case "$1 $2 $3 $4" in
   "-g connection.id connection show")
     [ ! -f "$UW/fail_conname_$6" ] || { echo "Error: no such profile" >&2; exit 1; }
     if [ -f "$UW/name_$6" ]; then cat "$UW/name_$6"; else echo "Profile $6"; fi
+    if [ -f "$UW/droppair_after_read_$6" ]; then
+      rm -f "$UW/droppair_after_read_$6"
+      grep -v " $6\$" "$XDG_STATE_HOME/quectel-usbnet/profiles" >"$XDG_STATE_HOME/quectel-usbnet/profiles.new" || true
+      cat "$XDG_STATE_HOME/quectel-usbnet/profiles.new" >"$XDG_STATE_HOME/quectel-usbnet/profiles"
+      rm -f "$XDG_STATE_HOME/quectel-usbnet/profiles.new"
+    fi
+    if [ -f "$UW/badpairs_after_read_$6" ]; then
+      rm -f "$UW/badpairs_after_read_$6"
+      echo "garbage" >"$XDG_STATE_HOME/quectel-usbnet/profiles"
+    fi
+    if [ -f "$UW/failname_after_read_$6" ]; then
+      rm -f "$UW/failname_after_read_$6"
+      touch "$UW/fail_conname_$6"
+    fi
+    if [ -f "$UW/rename_after_read_$6" ]; then
+      rm -f "$UW/rename_after_read_$6"
+      echo "Important VPN" >"$UW/name_$6"
+    fi
     ;;
   "-g connection.uuid connection show")
     # connection show id NAME
@@ -142,12 +160,17 @@ case "$1 $2 $3 $4" in
     echo "$new:$5" >>"$UW/connnames"
     ;;
   "connection delete uuid "*)
-    [ ! -f "$UW/fail_condel_$4" ] || { echo "Error: delete failed" >&2; exit 1; }
+    if [ -f "$UW/fail_condel_$4" ]; then
+      [ ! -f "$UW/condel_breaks_list" ] || touch "$UW/fail_conlist"
+      echo "Error: delete failed" >&2
+      exit 1
+    fi
     grep -v "^$4:" "$UW/connections" >"$UW/connections.new" || true
     mv "$UW/connections.new" "$UW/connections"
     grep -v "^$4:" "$UW/connnames" >"$UW/connnames.new" || true
     mv "$UW/connnames.new" "$UW/connnames"
     rm -f "$UW/name_$4" "$UW/prof_$4" "$UW/ac_$4"
+    [ ! -f "$UW/condel_gone_$4" ] || { echo "Error: timeout after delete" >&2; exit 1; }
     ;;
   "connection delete id "*)
     [ ! -f "$UW/fail_condel_id" ] || { echo "Error: delete failed" >&2; exit 1; }
@@ -2140,7 +2163,7 @@ case "$*" in
     [ ! -f "$UW/fail_sc_isenabled" ] || exit 5
     if [ -f "$UW/sc_isenabled_raw" ]; then
       cat "$UW/sc_isenabled_raw"
-      exit 1
+      exit "$(cat "$UW/sc_isenabled_rc" 2>/dev/null || echo 1)"
     fi
     if [ -f "$UW/sc_enabled" ]; then
       echo enabled
@@ -2577,6 +2600,19 @@ if out=$(run_install); then fail "timer: a masked timer is refused"; else ok "ti
 rm -f "$UW/sc_isenabled_raw"
 expect_contains "timer: a masked timer: says what systemctl answered" "$out" "systemctl --user is-enabled says 'masked' (exit 1)"
 expect_eq "timer: a masked timer: no profile was touched" "$(ucalls | grep -c -e 'connection modify' -e 'connection clone' || true)" 0
+# not-found is only "not installed yet" with exit 4; any other status refuses
+fresh_home
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+echo not-found >"$UW/sc_isenabled_raw"
+echo 5 >"$UW/sc_isenabled_rc"
+: >"$UW/calls"
+if out=$(run_install); then fail "timer: not-found with exit 5 is refused"; else ok "timer: not-found with exit 5 is refused"; fi
+expect_contains "timer: not-found with exit 5: says what systemctl answered" "$out" "is-enabled says 'not-found' (exit 5)"
+expect_eq "timer: not-found with exit 5: no profile was touched" "$(ucalls | grep -c -e 'connection modify' -e 'connection clone' || true)" 0
+echo 4 >"$UW/sc_isenabled_rc"
+if out=$(run_install); then ok "timer: not-found with exit 4 is a timer that is not installed yet"; else fail "timer: not-found with exit 4 is a timer that is not installed yet" "$out"; fi
+rm -f "$UW/sc_isenabled_raw" "$UW/sc_isenabled_rc"
 # a daemon-reload that fails in the undo: retried once, on the repair list, and the old
 # timer is not started on units systemd could not load
 fresh_home
@@ -2825,6 +2861,52 @@ expect_eq "uninstall: the second delete failed: the pairs file is kept" "$([ -e 
 out=$(run_uninstall) || fail "uninstall: a re-run after a partial delete" "$out"
 expect_contains "uninstall: the re-run says the first is already gone" "$out" "failover profile aaaaaaaa-0000 is already gone"
 expect_eq "uninstall: the re-run deletes only the second" "$(ucalls | grep -c 'connection delete uuid bbbbbbbb-0000' || true)" 1
+# the profile is read again right before its delete
+two_pairs
+touch "$UW/rename_after_read_bbbbbbbb-0000"
+if out=$(run_uninstall); then fail "uninstall: a profile renamed between the phases stops the steps"; else ok "uninstall: a profile renamed between the phases stops the steps"; fi
+expect_eq "uninstall: renamed between the phases: the renamed one is not deleted" "$(ucalls | grep -c 'connection delete uuid bbbbbbbb-0000' || true)" 0
+expect_eq "uninstall: renamed between the phases: the first one was deleted" "$(ucalls | grep -c 'connection delete uuid aaaaaaaa-0000' || true)" 1
+expect_contains "uninstall: renamed between the phases: says why it was skipped" "$out" "skipped: its name changed"
+expect_contains "uninstall: renamed between the phases: says what is deleted" "$out" "already deleted: aaaaaaaa-0000"
+expect_eq "uninstall: renamed between the phases: the pairs file is kept" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo kept || echo removed)" kept
+# a delete that reports failure after the profile is gone counts as deleted
+# a profile that cannot be read again right before its delete is not deleted
+two_pairs
+touch "$UW/failname_after_read_bbbbbbbb-0000"
+if out=$(run_uninstall); then fail "uninstall: a profile unreadable at the second read stops the steps"; else ok "uninstall: a profile unreadable at the second read stops the steps"; fi
+rm -f "$UW/fail_conname_bbbbbbbb-0000" "$UW/failname_after_read_bbbbbbbb-0000"
+expect_eq "uninstall: unreadable at the second read: it is not deleted" "$(ucalls | grep -c 'connection delete uuid bbbbbbbb-0000' || true)" 0
+expect_contains "uninstall: unreadable at the second read: says why" "$out" "cannot be read again"
+expect_contains "uninstall: unreadable at the second read: gives the command" "$out" "  nmcli connection delete uuid bbbbbbbb-0000"
+# a profile that is no longer in the pairs file is not deleted: the pairs file is rewritten between the phases
+two_pairs
+touch "$UW/droppair_after_read_bbbbbbbb-0000"
+if out=$(run_uninstall); then fail "uninstall: a pair dropped between the phases stops the steps"; else ok "uninstall: a pair dropped between the phases stops the steps"; fi
+rm -f "$UW/droppair_after_read_bbbbbbbb-0000"
+expect_eq "uninstall: a pair dropped between the phases: it is not deleted" "$(ucalls | grep -c 'connection delete uuid bbbbbbbb-0000' || true)" 0
+expect_contains "uninstall: a pair dropped between the phases: says why" "$out" "no longer in the pairs file"
+# a pairs file that cannot be read again is not guessed at
+two_pairs
+touch "$UW/badpairs_after_read_bbbbbbbb-0000"
+if out=$(run_uninstall); then fail "uninstall: a pairs file unreadable at the second read stops the steps"; else ok "uninstall: a pairs file unreadable at the second read stops the steps"; fi
+rm -f "$UW/badpairs_after_read_bbbbbbbb-0000"
+expect_eq "uninstall: a pairs file unreadable at the second read: it is not deleted" "$(ucalls | grep -c 'connection delete uuid bbbbbbbb-0000' || true)" 0
+expect_contains "uninstall: a pairs file unreadable at the second read: says why" "$out" "the pairs file cannot be read again"
+two_pairs
+touch "$UW/condel_gone_bbbbbbbb-0000"
+if out=$(run_uninstall); then ok "uninstall: a delete that failed after the profile went is counted as deleted"; else fail "uninstall: a delete that failed after the profile went is counted as deleted" "$out"; fi
+rm -f "$UW/condel_gone_bbbbbbbb-0000"
+expect_contains "uninstall: gone after a reported failure: says so" "$out" "reported failure but the profile is gone"
+expect_eq "uninstall: gone after a reported failure: the pairs file is removed" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo kept || echo removed)" removed
+# a failed delete whose re-read also fails: the state is unknown
+two_pairs
+touch "$UW/fail_condel_bbbbbbbb-0000" "$UW/condel_breaks_list"
+if out=$(run_uninstall); then fail "uninstall: a failed delete with an unreadable list stops the steps"; else ok "uninstall: a failed delete with an unreadable list stops the steps"; fi
+rm -f "$UW/fail_condel_bbbbbbbb-0000" "$UW/condel_breaks_list" "$UW/fail_conlist"
+expect_contains "uninstall: unreadable list after a failed delete: the state is unknown" "$out" "its state is unknown"
+expect_contains "uninstall: unreadable list after a failed delete: gives the command" "$out" "  nmcli connection delete uuid bbbbbbbb-0000"
+expect_contains "uninstall: unreadable list after a failed delete: the first is reported deleted" "$out" "already deleted: aaaaaaaa-0000"
 # a failover profile that is listed but cannot be read is not "nothing to delete"
 fresh_home
 uscene ok ok ok

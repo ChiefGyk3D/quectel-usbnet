@@ -3151,7 +3151,7 @@ was_enabled=\$(systemctl --user is-enabled $UPLINK_UNIT.timer 2>/dev/null) && en
 was_active=\$(systemctl --user is-active $UPLINK_UNIT.timer 2>/dev/null) && ac_rc=0 || ac_rc=\$?
 case "\$was_enabled:\$en_rc" in
   enabled:0 | enabled-runtime:0 | disabled:[1-9]*) ;;
-  not-found:*) was_enabled=disabled ;; # not installed yet: undone like "disabled"
+  not-found:4) was_enabled=disabled ;; # no such unit (exit 4 for is-enabled): undone like "disabled"
   *) fail0 "refusing: systemctl --user is-enabled says '\$was_enabled' (exit \$en_rc) for $UPLINK_UNIT.timer, which this install cannot put back exactly" ;;
 esac
 case "\$was_active:\$ac_rc" in
@@ -3441,20 +3441,42 @@ for i in "\${!pair_f[@]}"; do
     *) echo "left profile \$pf: its name is not a failover name" ;;
   esac
 done
-# Phase 2: delete, in order. A delete that fails cannot be undone for the ones already
-# gone, so it says exactly which are gone and which are not, and stops.
+# Phase 2: delete, in order. Just before each delete the profile is read again: if it no
+# longer has the failover name, or is no longer in the pairs file, it is not deleted. A
+# delete that fails cannot be undone for the ones already gone, so every stop says exactly
+# which are gone and which are not.
 deleted=()
+stopdel() {
+  echo "\$1" >&2
+  echo "the pairs file and the manager are kept, and these steps can be run again (a profile that is already gone counts as gone)." >&2
+  echo "already deleted: \${deleted[*]:-none}" >&2
+  echo "not deleted, check each and delete it by hand if you do not re-run:" >&2
+  for ((k = i; k < \${#todel[@]}; k++)); do echo "  nmcli connection delete uuid \${todel[\$k]}" >&2; done
+  exit 1
+}
 for i in "\${!todel[@]}"; do
   pf=\${todel[\$i]}
+  pairs_load "\$statedir/profiles" || stopdel "failover profile \$pf skipped: the pairs file cannot be read again"
+  inpair=0
+  for j in "\${!pair_f[@]}"; do [ "\${pair_f[\$j]}" = "\$pf" ] && inpair=1; done
+  [ "\$inpair" = 1 ] || stopdel "failover profile \$pf skipped: it is no longer in the pairs file"
+  pname=\$(LC_ALL=C $qnm --escape no -g connection.id connection show uuid "\$pf") ||
+    stopdel "failover profile \$pf skipped: it cannot be read again (it may have changed)"
+  case \$pname in
+    *"\$fosuffix") ;;
+    *) stopdel "failover profile \$pf skipped: its name changed and is no longer a failover name" ;;
+  esac
   if LC_ALL=C $qnm connection delete uuid "\$pf"; then
     deleted+=("\$pf")
     echo "deleted failover profile \$pf"
+  elif left=\$(LC_ALL=C $qnm --escape no -t -f UUID,NAME connection show); then
+    if printf '%s\n' "\$left" | grep -q "^\$pf:"; then
+      stopdel "could not delete failover profile \$pf: it is still there"
+    fi
+    deleted+=("\$pf")
+    echo "failover profile \$pf: the delete command reported failure but the profile is gone; counted as deleted"
   else
-    echo "could not delete failover profile \$pf. Stopped; the pairs file and the manager are kept, and these steps can be run again (a profile that is already gone counts as gone)." >&2
-    echo "already deleted: \${deleted[*]:-none}" >&2
-    echo "not deleted, delete each by hand if you do not re-run:" >&2
-    for ((k = i; k < \${#todel[@]}; k++)); do echo "  nmcli connection delete uuid \${todel[\$k]}" >&2; done
-    exit 1
+    stopdel "could not delete failover profile \$pf, and the profile list cannot be read to check: its state is unknown"
   fi
 done
 rm -f -- "\$statedir/profiles"
