@@ -99,10 +99,14 @@ case "$1 $2 $3 $4" in
     fi
     printf '%s\n%s\n%s\n%s\n' "$2" "$4" "$6" "$8" >"$UW/props_$dev"
     "$UBIN/apply" "$dev" "$2" "$4" "$6" "$8"
-    # hook: right after this device is changed to this value, the modem drops
-    if [ -f "$UW/hook_after_modify" ] && [ "$(cat "$UW/hook_after_modify")" = "$dev $2" ]; then
-      rm -f "$UW/rt4_wwan0" "$UW/rt6_wwan0"
-      touch "$UW/nolink_cdc-wdm0"
+    # hook: right after this device is changed to this value, the modem loses its
+    # route, its link, or both (the file holds "DEVICE VALUE [route|link|both]")
+    if [ -f "$UW/hook_after_modify" ]; then
+      read -r hd hv hm <"$UW/hook_after_modify"
+      if [ "$hd $hv" = "$dev $2" ]; then
+        case ${hm:-both} in route | both) rm -f "$UW/rt4_wwan0" "$UW/rt6_wwan0" ;; esac
+        case ${hm:-both} in link | both) touch "$UW/nolink_cdc-wdm0" ;; esac
+      fi
     fi
     echo "routes=$(nroutes) after modify $dev $2" >>"$UW/calls"
     ;;
@@ -153,7 +157,16 @@ if [[ $target == *:* ]]; then
   [ "$(cat "$UW/ping6_$iface" 2>/dev/null)" = ok ]
 else
   [ -s "$UW/rt4_$iface" ] || exit 1
-  [ "$(cat "$UW/ping_$iface" 2>/dev/null)" = ok ]
+  [ "$(cat "$UW/ping_$iface" 2>/dev/null)" = ok ] || exit 1
+  # ping_dropsroute_IF holds N: the Nth answer is the last; the route is gone right after
+  if [ -f "$UW/ping_dropsroute_$iface" ]; then
+    n=$(cat "$UW/ping_dropsroute_$iface")
+    if [ "$n" -le 1 ]; then
+      rm -f "$UW/rt4_$iface" "$UW/ping_dropsroute_$iface"
+    else
+      echo $((n - 1)) >"$UW/ping_dropsroute_$iface"
+    fi
+  fi
 fi
 FAKE
 chmod +x "$ubin"/*
@@ -344,8 +357,8 @@ cf="cell-first 1000 4600 500 3600"
 expect_eq "mode: no file is auto" "$(mode_check "" 1000 500)" "auto false 0"
 expect_eq "mode: an auto line" "$(mode_check "auto 900" 1000 500)" "auto false 0"
 expect_eq "mode: a live cell-first" "$(mode_check "$cf" 2000 1500)" "cell-first false 4600"
-expect_eq "mode: it ends when the wall clock reaches the end" "$(mode_check "$cf" 4600 4100)" "auto true 0"
-expect_eq "mode: one second before, it is live" "$(mode_check "$cf" 4599 4099)" "cell-first false 4600"
+expect_eq "mode: it ends when the wall clock reaches the end" "$(mode_check "$cf" 4600 1500)" "auto true 0"
+expect_eq "mode: one second before, it is live" "$(mode_check "$cf" 4599 1500)" "cell-first false 4600"
 expect_eq "mode: a forward wall clock jump past the end ends it" "$(mode_check "$cf" 90000 1500)" "auto true 0"
 expect_eq "mode: a backward wall clock jump ends it at once" "$(mode_check "$cf" 999 1500)" "auto true 0"
 expect_eq "mode: a large backward jump ends it too" "$(mode_check "$cf" 1 1500)" "auto true 0"
@@ -353,7 +366,10 @@ expect_eq "mode: the monotonic clock ends it even if the wall clock stands still
 expect_eq "mode: one second of monotonic time before the end it is live" "$(mode_check "$cf" 2000 4099)" "cell-first false 4600"
 expect_eq "mode: a monotonic clock behind its start (a reboot) ends it" "$(mode_check "$cf" 2000 100)" "auto true 0"
 expect_eq "mode: no expiry means no clock check, even after a backward jump" "$(mode_check "cell-first 1000 0 500 0" 1 100)" "cell-first false 0"
-for bad in "cell-first 1000 4600" "cell-first 1000 4600 500" "cell-first 1000 4600 500 3600 7" "cell-first a b c d" "AUTO 5" "auto 5 6" "auto" "" " " "cell-first 1 2 3 99999999999"; do
+up_now=$(cut -d. -f1 /proc/uptime)
+up_got=$(QUECTEL_UPLINK_MONO="" uplink_mono)
+expect_eq "mono: the real monotonic clock is /proc/uptime, not the wall clock" "$((up_got >= up_now && up_got <= up_now + 3 ? 1 : 0))" 1
+for bad in "cell-first 1000 4600" "cell-first 1000 4600 500""cell-first 1000 4600 500 3600 7" "cell-first a b c d" "AUTO 5" "auto 5 6" "auto" "" " " "cell-first 1 2 3 99999999999"; do
   r=$(mode_check "$bad" 2000 1500)
   if [ -n "$bad" ] || [ ! -e "$tmp/modecheck/mode" ]; then
     [ "$r" = invalid ] || [ -z "$bad" ] || fail "mode: '$bad' is refused" "got $r"
@@ -383,7 +399,8 @@ expect_eq "history: every malformed line makes the whole file unknown" "$hist_ba
 expect_eq "history: a repeated link is unknown" "$(hist_check 'wifi up 0 0\nwifi down 1 0\n')" invalid
 UP_DIR="$tmp/histcheck"
 rm -f "$UP_DIR/links"
-ln -s /etc/hostname "$UP_DIR/links"
+printf "wifi up 0 0\n" >"$tmp/real_links"
+ln -s "$tmp/real_links" "$UP_DIR/links"
 expect_eq "history: a symlinked file is unknown" "$(uplink_load_links 2>/dev/null && echo valid || echo invalid)" invalid
 rm -f "$UP_DIR/links"
 UP_DIR=""
@@ -536,6 +553,49 @@ unow 30
 ucli run
 expect_contains "ethernet dead: wifi owns" "$ucli_out" "owner=wifi"
 expect_eq "ethernet dead: nothing was changed" "$(umods)" ""
+
+# A connected Wi-Fi with no default route at all cannot reach the internet: it fails.
+uscene gone ok ok
+rm -f "$UW/rt4_wlan0"
+ucli run
+expect_contains "no default route: the link counts as failed, not ok" "$ucli_out" "wifi=up/down(fail)"
+unow 15
+ucli run
+expect_contains "no default route: two rounds and cellular opens" "$ucli_out" "owner=cell"
+
+# Closing cellular is refused when the link that was healthy has lost its route by then.
+uscene gone ok ok
+ucli run
+rm -f "$UW/ping_wlan0"
+unow 15
+ucli run
+unow 30
+ucli run
+echo ok >"$UW/ping_wlan0"
+echo 2 >"$UW/ping_dropsroute_wlan0"
+unow 45
+ucli run
+unow 60
+: >"$UW/calls"
+ucli run
+expect_eq "close guard: cellular is not closed when nothing else holds a default route" "$ucli_rc" 1
+expect_contains "close guard: says why" "$ucli_out" "not closing cellular: nothing else holds a default route"
+expect_eq "close guard: nothing was modified" "$(umods)" ""
+expect_eq "close guard: cellular still holds its default" "$(uholders)" "wwan0"
+rm -f "$UW/ping_dropsroute_wlan0"
+
+# A profile with values that are not what nmcli prints is not trusted
+uscene gone ok ok
+printf 'maybe\nyes\n1100\n1100\n' >"$UW/prof_00000003-0000-0000-0000-000000000000"
+rm -f "$UW/ping_wlan0"
+ucli run
+unow 15
+ucli run
+unow 30
+ucli run
+expect_eq "garbage profile values: cellular is not opened" "$ucli_rc" 1
+expect_contains "garbage profile values: says why" "$ucli_out" "cannot read the current settings of cdc-wdm0"
+expect_eq "garbage profile values: nothing modified" "$(umods)" ""
 
 # IPv6: a link with only an IPv6 default route is judged on IPv6.
 uscene gone ok ok
@@ -781,6 +841,16 @@ expect_eq "mid-demotion loss: the ledger is empty" "$([ -e "$ULD/ledger" ] && ec
 expect_eq "mid-demotion loss: no mode was left behind" "$([ -e "$UST/mode" ] && echo yes || echo no)" no
 expect_eq "mid-demotion loss: never without a default route" "$(ucalls | grep -c 'routes=0 ' || true)" 0
 
+# the same, but only the route goes (the link stays), and only the link goes (the route stays)
+for variant in route link; do
+  uscene ok ok ok
+  echo "eth0 yes $variant" >"$UW/hook_after_modify"
+  ucli cell-first
+  expect_eq "mid-demotion $variant loss: exit 1" "$ucli_rc" 1
+  expect_eq "mid-demotion $variant loss: Wi-Fi was never demoted" "$(ucalls | grep -c 'modify wlan0' || true)" 0
+  expect_eq "mid-demotion $variant loss: Ethernet and Wi-Fi hold their defaults" "$(uholders)" "eth0 wlan0"
+done
+
 # cellular's route never shows after opening it: nothing is demoted, cellular goes back
 uscene gone ok ok
 echo "cdc-wdm0 no" >"$UW/hook_after_modify"
@@ -916,6 +986,20 @@ echo "ok   every malformed ledger line makes a run change nothing and fail"
 expect_contains "malformed ledger: says to put things back by hand" "$ucli_out" "nmcli device reapply"
 ucli restore
 expect_eq "malformed ledger: restore refuses too" "$ucli_rc" 1
+# two lines for one device are unknown too
+printf '%s\n%s\n' "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 yes yes 1100 1100" "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 yes yes 1100 1100" >"$ULD/ledger"
+: >"$UW/calls"
+ucli run
+expect_eq "a ledger that repeats a device: exit 1" "$ucli_rc" 1
+expect_contains "a ledger that repeats a device: says so" "$ucli_out" "repeats cdc-wdm0"
+# a symlinked ledger file is not followed, even to valid content
+rm -f "$ULD/ledger"
+printf '%s\n' "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 yes yes 1100 1100" >"$tmp/real_ledger"
+ln -s "$tmp/real_ledger" "$ULD/ledger"
+ucli run
+expect_eq "a symlinked ledger file: exit 1" "$ucli_rc" 1
+expect_contains "a symlinked ledger file: says it is not a plain file" "$ucli_out" "is not a plain file"
+expect_eq "a symlinked ledger file: nothing modified" "$(umods)" ""
 rm -f "$ULD/ledger"
 
 # --- fail safe ----------------------------------------------------------------------------------
@@ -991,6 +1075,56 @@ expect_eq "open is a no-op: Wi-Fi keeps its routes" "$(uholders)" "wlan0"
 expect_eq "open is a no-op: it is put back" "$(umods)" "cdc-wdm0 no 50;cdc-wdm0 yes 1100;"
 expect_eq "open is a no-op: the ledger is empty again" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
 rm -f "$UW/noop_modify"
+
+# an interface whose name only starts like cellular's is not cellular
+fail_start
+touch "$UW/noop_modify"
+echo "default dev wwan00 scope link metric 50" >"$UW/rt4_wwan00"
+ucli run
+expect_eq "name prefix: a default route on wwan00 is not one on wwan0" "$ucli_rc" 1
+expect_contains "name prefix: so cellular is still found not open" "$ucli_out" "cellular did not get a default route"
+rm -f "$UW/noop_modify"
+
+# the first attempt to open cellular fails, the put-back works: the ledger is empty again
+fail_start
+cat >"$ubin/nmcli.failopen" <<'FAKE'
+#!/usr/bin/env bash
+# the first attempt to open the modem fails
+if [[ "$*" == *"device modify cdc-wdm0 ipv4.never-default no"* ]] && [ ! -f "$UW/failed_once" ]; then
+  touch "$UW/failed_once"
+  echo "nmcli LC_ALL=${LC_ALL:-unset} $*" >>"$UW/calls"
+  echo "Error: no" >&2
+  exit 1
+fi
+exec "$UBIN/nmcli" "$@"
+FAKE
+chmod +x "$ubin/nmcli.failopen"
+ucli_rc=0
+ucli_out=$(QUECTEL_UPLINK_NMCLI="$ubin/nmcli.failopen" "$TOOL" uplink run 2>&1) || ucli_rc=$?
+expect_eq "failed open: exit 1" "$ucli_rc" 1
+expect_eq "failed open: what was recorded is taken back out of the ledger" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
+
+# closing cellular is not taken on trust: if its route is still there afterwards, the run fails
+fail_start
+ucli run >/dev/null # cellular is open now
+echo ok >"$UW/ping_wlan0"
+unow 45
+ucli run >/dev/null
+cat >"$ubin/nmcli.stayopen" <<'FAKE'
+#!/usr/bin/env bash
+# closing the modem is silently lost
+if [[ "$*" == *"device modify cdc-wdm0 ipv4.never-default yes"* ]]; then
+  echo "nmcli LC_ALL=${LC_ALL:-unset} $*" >>"$UW/calls"
+  exit 0
+fi
+exec "$UBIN/nmcli" "$@"
+FAKE
+chmod +x "$ubin/nmcli.stayopen"
+unow 60
+ucli_rc=0
+ucli_out=$(QUECTEL_UPLINK_NMCLI="$ubin/nmcli.stayopen" "$TOOL" uplink run 2>&1) || ucli_rc=$?
+expect_eq "close is lost: exit 1" "$ucli_rc" 1
+expect_contains "close is lost: says the route is still there" "$ucli_out" "still holds a default route after closing it"
 
 # one demotion in cell-first fails: everything goes back
 uscene ok ok ok
@@ -1096,9 +1230,11 @@ expect_eq "no place for the ledger: exit 1, nothing changed" "$ucli_rc" 1
 fail_start
 rm -rf "$UST"
 mkdir -p "$tmp/elsewhere"
+chmod 700 "$tmp/elsewhere"
 ln -s "$tmp/elsewhere" "$UST"
 ucli run
 expect_eq "a symlinked state directory is refused" "$ucli_rc" 1
+expect_contains "a symlinked state directory: and says why" "$ucli_out" "is a symlink"
 expect_eq "a symlinked state directory: nothing written there" "$(find "$tmp/elsewhere" -mindepth 1 | wc -l)" 0
 rm -f "$UST"
 mkdir -p "$UST"
@@ -1193,6 +1329,27 @@ printf 'ethernet up 0 0\nwifi up 0 0\ncell up 0 0\nextra\n' >"$UST/links"
 ucli run
 expect_eq "malformed history: an extra line is unknown too" "$ucli_rc" 1
 rm -f "$UST/links"
+printf 'ethernet up 0 0\nwifi up 0 0\ncell up 0 0\n' >"$tmp/real_links2"
+ln -s "$tmp/real_links2" "$UST/links"
+ucli run
+expect_eq "a symlinked link history is not followed, even to valid content" "$ucli_rc" 1
+expect_contains "a symlinked link history: says it is not a plain file" "$ucli_out" "is not a plain file"
+rm -f "$UST/links"
+
+# a lock file that is not a plain file (here a FIFO with a reader, so opening it does not hang) is refused
+fail_start
+rm -f "$UST/lock"
+mkfifo "$UST/lock"
+cat "$UST/lock" >/dev/null &
+fifo_reader=$!
+ucli_rc=0
+ucli_out=$(timeout 20 "$TOOL" uplink run 2>&1) || ucli_rc=$?
+kill "$fifo_reader" 2>/dev/null || true
+wait "$fifo_reader" 2>/dev/null || true
+expect_eq "a lock file that is not a plain file: exit 1" "$ucli_rc" 1
+expect_contains "a lock file that is not a plain file: says so" "$ucli_out" "is not a plain file"
+expect_eq "a lock file that is not a plain file: nothing modified" "$(umods)" ""
+rm -f "$UST/lock"
 
 # A second instance: the timer run waits one second for the lock, then skips and exits 0
 fail_start
@@ -1221,6 +1378,14 @@ expect_eq "dry run: nothing modified" "$(umods)" ""
 expect_eq "dry run: the link state is not advanced" "$(cat "$UST/links")" "$links_before"
 expect_eq "dry run: no mode written" "$([ -e "$UST/mode" ] && echo yes || echo no)" no
 expect_eq "dry run: no ledger written" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
+# a dry run does not heal from the ledger either
+uscene ok ok ok
+ucli cell-first
+rm -f "$UST/mode"
+: >"$UW/calls"
+ucli run --dry-run
+expect_eq "dry run: does not put back what the ledger lists" "$(umods)" ""
+expect_eq "dry run: leaves the ledger alone" "$(uledger)" "cdc-wdm0 eth0 wlan0"
 
 # --- status --json: the contract the tray builds against --------------------------------------------------
 uscene none ok ok
@@ -1460,6 +1625,12 @@ ln -s "$tmp/target_dir/unitdir" "$unit_dir"
 conflict "a symlinked unit directory"
 expect_eq "install conflict: nothing was written through the symlinked unit directory" "$(find "$tmp/target_dir/unitdir" -mindepth 1 | wc -l)" 0
 fresh_home
+rm -rf "$inst_home/.local/libexec"
+mkdir -p "$tmp/target_dir/libexec"
+ln -s "$tmp/target_dir/libexec" "$inst_home/.local/libexec"
+conflict "a symlinked libexec directory"
+expect_eq "install conflict: nothing was written through the symlinked libexec directory" "$(find "$tmp/target_dir/libexec" -mindepth 1 | wc -l)" 0
+fresh_home
 mkdir -p "$inst_home/state/quectel-usbnet"
 chmod 755 "$inst_home/state/quectel-usbnet"
 conflict "a state directory with mode 755"
@@ -1546,6 +1717,25 @@ mkdir -p "$tmp/xdg_u/quectel-usbnet"
 touch "$tmp/xdg_u/quectel-usbnet/mode" "$tmp/xdg_u/quectel-usbnet/links" "$tmp/xdg_u/quectel-usbnet/lock" "$tmp/xdg_u/quectel-usbnet/keepme"
 out=$(run_uninstall) || true
 expect_eq "uninstall: the state files are removed" "$(find "$tmp/xdg_u/quectel-usbnet" -mindepth 1 | tr '\n' ' ')" "$tmp/xdg_u/quectel-usbnet/keepme "
+# the leftovers of an interrupted ledger write go too, and the empty state directory with them
+mkdir -p "$inst_home/state/quectel-usbnet"
+chmod 700 "$inst_home/state/quectel-usbnet"
+touch "$inst_home/state/quectel-usbnet/ledger.new"
+out=$(run_uninstall) || true
+expect_eq "uninstall: a leftover ledger.new and the empty state directory are removed" "$([ -e "$inst_home/state/quectel-usbnet" ] && echo kept || echo removed)" removed
+# a ledger left with no copy to restore it: stop, remove nothing, say what to do
+mkdir -p "$inst_home/state/quectel-usbnet"
+chmod 700 "$inst_home/state/quectel-usbnet"
+echo "cdc-wdm0 cell 00000003-0000-0000-0000-000000000000 yes yes 1100 1100" >"$inst_home/state/quectel-usbnet/ledger"
+if out=$(run_uninstall); then
+  fail "uninstall: a ledger with no copy to restore it stops the steps"
+else
+  ok "uninstall: a ledger with no copy to restore it stops the steps"
+fi
+expect_contains "uninstall: says what to do" "$out" "the copy is gone but a ledger is left"
+expect_eq "uninstall: that ledger is kept" "$([ -e "$inst_home/state/quectel-usbnet/ledger" ] && echo kept || echo removed)" kept
+rm -f "$inst_home/state/quectel-usbnet/ledger"
+rmdir "$inst_home/state/quectel-usbnet"
 expect_contains "uninstall: the printed block is valid bash" "$(bash -n "$tmp/uninstall_block.sh" 2>&1 && echo syntax-ok)" syntax-ok
 
 # guard-uninstall: printed only, marker-checked, and valid bash
