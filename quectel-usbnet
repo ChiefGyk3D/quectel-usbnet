@@ -1251,9 +1251,28 @@ uplink_unlock() {
   exec 9>&-
 }
 
+# Atomic write of a file: $1 = file, the content on standard input. The temp file
+# is FILE.new in the same directory. A symlink or any non-plain file under that
+# name is refused (never written through); a stale plain file is removed; the new
+# one is created with noclobber (it must not exist) and then renamed over FILE.
+uplink_put() {
+  local f=$1 t=$1.new
+  if [ -L "$t" ] || { [ -e "$t" ] && [ ! -f "$t" ]; }; then
+    uplink_log "ERROR: $t is not a plain file; refusing to write through it"
+    return 1
+  fi
+  rm -f -- "$t"
+  (set -C && cat >"$t") || {
+    rm -f -- "$t"
+    uplink_log "ERROR: cannot create $t"
+    return 1
+  }
+  mv -f -- "$t" "$f"
+}
+
 # Atomic write of one line: $1 = file, $2 = the line.
 uplink_write_line() {
-  printf '%s\n' "$2" >"$1.new" && mv -f -- "$1.new" "$1"
+  printf '%s\n' "$2" | uplink_put "$1"
 }
 
 # --- the mode --------------------------------------------------------------
@@ -1272,9 +1291,23 @@ uplink_read_mode_line() {
   if [ ! -f "$f" ] || [ -L "$f" ]; then
     return 1
   fi
-  IFS= read -r line <"$f" || true
-  if [[ $line =~ ^auto\ [0-9]{1,12}$ ]] ||
-    [[ $line =~ ^cell-first\ [0-9]{1,12}\ [0-9]{1,12}\ [0-9]{1,12}\ [0-9]{1,9}$ ]]; then
+  local extra="" un du
+  {
+    IFS= read -r line || true
+    # exactly one line: anything after it, even an empty line, is malformed
+    if IFS= read -r extra || [ -n "$extra" ]; then return 1; fi
+  } <"$f"
+  if [[ $line =~ ^auto\ [0-9]{1,12}$ ]]; then
+    echo "$line"
+    return 0
+  fi
+  if [[ $line =~ ^cell-first\ [0-9]{1,12}\ ([0-9]{1,12})\ [0-9]{1,12}\ ([0-9]{1,9})$ ]]; then
+    un=$((10#${BASH_REMATCH[1]}))
+    du=$((10#${BASH_REMATCH[2]}))
+    # no expiry (UNTIL 0) and no duration (DURATION 0) go together, or neither is 0
+    if { [ "$un" -eq 0 ] && [ "$du" -ne 0 ]; } || { [ "$un" -ne 0 ] && [ "$du" -eq 0 ]; }; then
+      return 1
+    fi
     echo "$line"
     return 0
   fi
@@ -1846,11 +1879,9 @@ uplink_ledger_save() {
     rm -f -- "$f" "$f.new"
     return 0
   fi
-  : >"$f.new" || return 1
   for dev in $(uplink_led_devs); do
-    printf '%s %s\n' "$dev" "${UP_LED[$dev]}" >>"$f.new" || return 1
-  done
-  mv -f -- "$f.new" "$f"
+    printf '%s %s\n' "$dev" "${UP_LED[$dev]}"
+  done | uplink_put "$f"
 }
 
 # $1 = device. Prints "UUID ND4 ND6 RM4 RM6" of its active profile, as NetworkManager
@@ -1906,6 +1937,41 @@ uplink_ledger_record() {
   UP_FRESH=true
 }
 
+# What NetworkManager says about a device and its activation, for a ledger line.
+# $1 = device, $2 = the profile UUID in the ledger line. Sets UP_ACTIVE to "gone"
+# (the device list was read and the device is not in it), "re-activated" (it has
+# no active profile, or another one) or "same". Fails, with UP_ACTIVE empty, when
+# anything could not be read or is not what nmcli prints: that is not proof of
+# anything, and the caller must keep the ledger line.
+uplink_active_state() {
+  local dev=$1 want=$2 devs now
+  UP_ACTIVE=""
+  devs=$(uplink_nm -t -f DEVICE device) || {
+    uplink_log "ERROR: cannot read the device list; the ledger keeps $dev"
+    return 1
+  }
+  [[ $devs == *[![:space:]]* ]] || {
+    uplink_log "ERROR: nmcli printed an empty device list; the ledger keeps $dev"
+    return 1
+  }
+  if ! printf '%s\n' "$devs" | grep -qxF -- "$dev"; then
+    UP_ACTIVE=gone
+    return 0
+  fi
+  now=$(uplink_nm -g GENERAL.CON-UUID device show "$dev" | head -n 1) || {
+    uplink_log "ERROR: cannot read the active profile of $dev; the ledger keeps it"
+    return 1
+  }
+  if [ -z "$now" ]; then
+    UP_ACTIVE=re-activated
+  elif [[ $now =~ ^[0-9A-Fa-f-]{8,40}$ ]]; then
+    if [ "$now" = "$want" ]; then UP_ACTIVE=same; else UP_ACTIVE=re-activated; fi
+  else
+    uplink_log "ERROR: nmcli printed an unexpected profile UUID for $dev; the ledger keeps it"
+    return 1
+  fi
+}
+
 # Puts a device back to the values in its ledger line and drops the line. A device
 # that is gone, or re-activated since (another profile UUID), already lost the
 # runtime change: the line is dropped. $1 = device. Sets UP_OUT to what it did.
@@ -1915,9 +1981,9 @@ uplink_restore_dev() {
   line=${UP_LED[$dev]:-}
   [ -n "$line" ] || return 0
   read -r link uuid a b c d <<<"$line"
-  cur=$(uplink_cur_values "$dev" 2>/dev/null) || cur=""
-  if [ -z "$cur" ] || [ "${cur%% *}" != "$uuid" ]; then
-    UP_OUT="dropped $dev: gone or re-activated, NetworkManager already reset it"
+  uplink_active_state "$dev" "$uuid" || return 1
+  if [ "$UP_ACTIVE" != same ]; then
+    UP_OUT="dropped $dev: $UP_ACTIVE, NetworkManager already reset it"
     unset "UP_LED[$dev]"
     uplink_ledger_save || return 1
     return 0
@@ -2001,13 +2067,20 @@ uplink_heal_demotions() {
   return "$rc"
 }
 
+# Puts back the modems an open that failed half way had already changed. $1 =
+# devices, space separated.
+uplink_open_rollback() {
+  local d
+  for d in $1; do uplink_restore_say "$d" || true; done
+}
+
 # Opens cellular: never-default off and a route metric below Ethernet's and Wi-Fi's,
 # so it carries traffic while it is open (a dead Ethernet or Wi-Fi keeps its own
 # default route and would otherwise win on metric). The change is in the ledger
 # first, and confirmed in the route table; if it does not show, it is put back.
 # Uses the last scan. Fails if cellular did not open.
 uplink_open_cell() {
-  local i opened="" ifs="" d
+  local i opened="" ifs=""
   uplink_link_devs cell
   [ "${#UP_L_DEVS[@]}" -gt 0 ] || {
     uplink_log "ERROR: no usable modem device; routes left as they are"
@@ -2017,17 +2090,21 @@ uplink_open_cell() {
   for i in "${!devs[@]}"; do
     ifs+="${ipfs[$i]} "
     if [ -n "${UP_LED[${devs[$i]}]:-}" ] && uplink_holds "$UP_HOLD" "${ipfs[$i]}"; then continue; fi
-    uplink_ledger_record "${devs[$i]}" cell || return 1
+    if ! uplink_ledger_record "${devs[$i]}" cell; then
+      uplink_open_rollback "$opened"
+      return 1
+    fi
     if ! uplink_modify "${devs[$i]}" no no "$UP_CELL_METRIC" "$UP_CELL_METRIC"; then
       uplink_log "ERROR: nmcli could not open ${devs[$i]}"
-      if $UP_FRESH; then uplink_restore_say "${devs[$i]}" || true; fi
+      if $UP_FRESH; then opened+="${devs[$i]} "; fi
+      uplink_open_rollback "$opened"
       return 1
     fi
     opened+="${devs[$i]} "
   done
   if ! uplink_wait_route "$ifs" present; then
     uplink_log "ERROR: cellular did not get a default route; putting it back"
-    for d in $opened; do uplink_restore_say "$d" || true; done
+    uplink_open_rollback "$opened"
     return 1
   fi
 }
@@ -2101,6 +2178,13 @@ uplink_cellfirst_abort() {
   uplink_log "reverting: restoring Ethernet and Wi-Fi first, then cellular"
   for d in $1; do uplink_restore_say "$d" || true; done
   # cellular goes last, and only if something else carries a default route
+  local left=false
+  for d in $2; do
+    if [ -n "${UP_LED[$d]:-}" ]; then left=true; fi
+  done
+  if ! $left; then
+    return 0
+  fi
   if uplink_routes_read && uplink_other_default; then
     for d in $2; do uplink_restore_say "$d" || true; done
   else
@@ -2114,12 +2198,15 @@ uplink_cellfirst_abort() {
 # the run fails.
 uplink_apply_cellfirst() {
   local i d cif="" cdevs="" changed="" ok ipf link dev attempt rc
-  uplink_open_cell || return 1
   uplink_link_devs cell
   for i in "${!UP_L_IFS[@]}"; do
     cif+="${UP_L_IFS[$i]} "
     cdevs+="${UP_L_DEVS[$i]} "
   done
+  if ! uplink_open_cell; then
+    uplink_cellfirst_abort "" "$cdevs"
+    return 1
+  fi
   local -a ndevs=() nifs=() nlinks=()
   while read -r link dev ipf; do
     [ -n "$link" ] && [ "$link" != cell ] || continue
@@ -2257,8 +2344,7 @@ uplink_evaluate() {
 }
 
 uplink_save_links() {
-  printf 'ethernet %s\nwifi %s\ncell %s\n' "$1" "$2" "$3" >"$UP_DIR/links.new" &&
-    mv -f -- "$UP_DIR/links.new" "$UP_DIR/links"
+  printf 'ethernet %s\nwifi %s\ncell %s\n' "$1" "$2" "$3" | uplink_put "$UP_DIR/links"
 }
 
 # --- commands ----------------------------------------------------------------------------
@@ -2664,16 +2750,52 @@ if [ -L "\$dest" ] || { [ -e "\$dest" ] && { [ ! -f "\$dest" ] || [ "\$(sed -n 2
 fi
 echo "checks passed"
 
-# 1. Close the cellular profile(s). They are found from NetworkManager by type;
-#    the profile name differs from machine to machine.
-found=0
+# 1. Close the cellular profile(s), all of them or none. They are found from
+#    NetworkManager by type; the profile name differs from machine to machine.
+#    The list and the previous values are read first, so nothing is changed if
+#    that fails; if a change fails, the ones already made are put back.
+list=\$(LC_ALL=C $qnm --escape no -t -f UUID,TYPE connection show) || {
+  echo "cannot list the connection profiles; nothing was changed" >&2
+  exit 1
+}
+gsm=()
+prev=()
 while IFS=: read -r uuid ptype; do
   [ "\$ptype" = gsm ] || continue
-  found=1
-  LC_ALL=C $qnm connection modify uuid "\$uuid" ipv4.never-default yes ipv6.never-default yes
-  echo "closed profile \$uuid"
-done < <(LC_ALL=C $qnm --escape no -t -f UUID,TYPE connection show)
-[ "\$found" = 1 ] || echo "no gsm profile found; set never-default on it yourself once it exists"
+  case \$uuid in
+    "" | *[!0-9A-Fa-f-]*)
+      echo "refusing: an odd profile id; nothing was changed" >&2
+      exit 1
+      ;;
+  esac
+  old=\$(LC_ALL=C $qnm --escape no -g ipv4.never-default,ipv6.never-default connection show uuid "\$uuid") || {
+    echo "cannot read profile \$uuid; nothing was changed" >&2
+    exit 1
+  }
+  old=\${old//\$'\n'/ }
+  case \$old in
+    "yes yes" | "yes no" | "no yes" | "no no") ;;
+    *)
+      echo "unexpected values for profile \$uuid; nothing was changed" >&2
+      exit 1
+      ;;
+  esac
+  gsm+=("\$uuid")
+  prev+=("\$old")
+done <<<"\$list"
+for i in "\${!gsm[@]}"; do
+  if LC_ALL=C $qnm connection modify uuid "\${gsm[\$i]}" ipv4.never-default yes ipv6.never-default yes; then
+    echo "closed profile \${gsm[\$i]}"
+  else
+    echo "could not close profile \${gsm[\$i]}; putting back the ones already closed" >&2
+    for ((j = 0; j < i; j++)); do
+      set -- \${prev[\$j]}
+      LC_ALL=C $qnm connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" || echo "could not put back profile \${gsm[\$j]}" >&2
+    done
+    exit 1
+  fi
+done
+[ "\${#gsm[@]}" -gt 0 ] || echo "no gsm profile found; set never-default on it yourself once it exists"
 
 # 2. The copy.
 mkdir -p -m 0700 -- "\$dir"

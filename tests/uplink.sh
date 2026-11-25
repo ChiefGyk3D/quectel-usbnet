@@ -64,9 +64,24 @@ case "$1 $2 $3 $4" in
     if [ -f "$UW/garbage_list" ]; then echo "this is not a device list"; exit 0; fi
     cat "$UW/devices"
     ;;
-  "-t -f UUID,TYPE connection") cat "$UW/connections" ;;
+  "-t -f DEVICE device")
+    [ ! -f "$UW/fail_devs" ] || { echo "Error: boom" >&2; exit 1; }
+    cut -d: -f1 "$UW/devices"
+    ;;
+  "-t -f UUID,TYPE connection")
+    [ ! -f "$UW/fail_conlist" ] || { echo "Error: boom" >&2; exit 1; }
+    cat "$UW/connections"
+    ;;
+  "-g ipv4.never-default,ipv6.never-default connection show")
+    [ ! -f "$UW/fail_conread_$6" ] || { echo "Error: no such profile" >&2; exit 1; }
+    if [ -f "$UW/prof_$6" ]; then head -n 2 "$UW/prof_$6"; else printf 'no\nno\n'; fi
+    ;;
   "-g GENERAL.IP-IFACE device show") cat "$UW/ipif_$5" 2>/dev/null || true ;;
-  "-g GENERAL.CON-UUID device show") cat "$UW/uuid_$5" 2>/dev/null || true ;;
+  "-g GENERAL.CON-UUID device show")
+    # fail_cur: the active connection of any device cannot be read
+    [ ! -f "$UW/fail_cur" ] || { echo "Error: boom" >&2; exit 1; }
+    cat "$UW/uuid_$5" 2>/dev/null || true
+    ;;
   "-g GENERAL.STATE device show")
     if [ -f "$UW/nolink_$5" ]; then echo "30 (disconnected)"; else echo "100 (connected)"; fi
     ;;
@@ -75,6 +90,7 @@ case "$1 $2 $3 $4" in
     cat "$UW/prof_$6"
     ;;
   "connection modify uuid "*)
+    [ ! -f "$UW/fail_conmod_$4" ] || { echo "Error: modify failed" >&2; exit 1; }
     # the profile changes: never-default is rewritten in the fake profile, when it has one
     if [ -f "$UW/prof_$4" ]; then
       { echo "$6"; echo "$8"; tail -n 2 "$UW/prof_$4"; } >"$UW/prof_$4.new"
@@ -345,7 +361,7 @@ mode_check() {
   UP_DIR="$tmp/modecheck"
   rm -rf "$UP_DIR"
   mkdir -p "$UP_DIR"
-  if [ -n "$1" ]; then printf '%s\n' "$1" >"$UP_DIR/mode"; fi
+  if [ -n "$1" ]; then printf '%b\n' "$1" >"$UP_DIR/mode"; fi
   uplink_load_mode "$2" "$3" || {
     echo invalid
     return 0
@@ -1387,6 +1403,175 @@ ucli run --dry-run
 expect_eq "dry run: does not put back what the ledger lists" "$(umods)" ""
 expect_eq "dry run: leaves the ledger alone" "$(uledger)" "cdc-wdm0 eth0 wlan0"
 
+# --- round 2: a read error is not proof; multi-modem rollback; the mode file; temp files ------------------------
+# usecond: a second modem, connected, closed, with its own profile and routes
+usecond() {
+  echo "cdc-wdm1:gsm:connected" >>"$UW/devices"
+  echo wwan1 >"$UW/ipif_cdc-wdm1"
+  echo "default dev wwan1 proto static metric 1100" >"$UW/tpl4_wwan1"
+  echo "default dev wwan1 proto static metric 1100 pref medium" >"$UW/tpl6_wwan1"
+  echo 00000004-0000-0000-0000-000000000000 >"$UW/uuid_cdc-wdm1"
+  printf 'yes\nyes\n1100\n1100\n' >"$UW/prof_00000004-0000-0000-0000-000000000000"
+  echo ok >"$UW/ping_wwan1"
+}
+
+# H1: a profile read that fails during a restore keeps every ledger line
+for seam in fail_cur fail_devs; do
+  uscene ok ok ok
+  ucli cell-first
+  expect_eq "read error ($seam): setup, three lines in the ledger" "$(uledger)" "cdc-wdm0 eth0 wlan0"
+  touch "$UW/$seam"
+  : >"$UW/calls"
+  ucli restore
+  expect_eq "read error ($seam): restore exits non-zero" "$ucli_rc" 1
+  expect_eq "read error ($seam): every ledger line is kept" "$(uledger)" "cdc-wdm0 eth0 wlan0"
+  expect_eq "read error ($seam): nothing is modified" "$(umods)" ""
+  expect_eq "read error ($seam): nothing is reported as restored or dropped" "$(printf '%s' "$ucli_out" | grep -c -e '^restored' -e '^dropped' || true)" 0
+  expect_eq "read error ($seam): the links stay as they were" "$(uholders)" "wwan0"
+  rm -f "$UW/$seam"
+  : >"$UW/calls"
+  ucli restore
+  expect_eq "read error ($seam): a later restore succeeds" "$ucli_rc" 0
+  expect_eq "read error ($seam): and puts everything back, Ethernet and Wi-Fi first" "$(umods)" "eth0 no -1;wlan0 no -1;cdc-wdm0 yes 1100;"
+  expect_eq "read error ($seam): the ledger is empty" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
+done
+# the same on the self-heal path of a run
+uscene ok ok ok
+ucli cell-first
+rm -f "$UST/mode"
+touch "$UW/fail_cur"
+: >"$UW/calls"
+ucli run
+expect_eq "read error: a run does not heal on a guess: exit 1" "$ucli_rc" 1
+expect_eq "read error: and keeps the ledger" "$(uledger)" "cdc-wdm0 eth0 wlan0"
+expect_eq "read error: and modifies nothing" "$(umods)" ""
+rm -f "$UW/fail_cur"
+ucli run
+expect_eq "read error: the next run heals" "$(uholders)" "eth0 wlan0"
+# an unexpected UUID text is not "re-activated" either
+uscene ok ok ok
+ucli cell-first
+echo "not a uuid!" >"$UW/uuid_wlan0"
+ucli restore
+expect_eq "unexpected profile text: that line is kept, exit 1" "$ucli_rc" 1
+expect_contains "unexpected profile text: the ledger still lists Wi-Fi" "$(uledger)" "wlan0"
+# and what IS proof still drops the line: a device that is not listed at all
+uscene ok ok ok
+ucli cell-first
+sed -i '/^wlan0:/d' "$UW/devices"
+rm -f "$UW/rt4_wlan0"
+ucli restore
+expect_contains "device not listed: dropped as gone" "$ucli_out" "dropped wlan0: gone"
+expect_eq "device not listed: the others are restored" "$(uholders)" "eth0"
+
+# M1: a second modem fails to open: the first is put back
+uscene ok ok ok
+usecond
+touch "$UW/fail_modify_cdc-wdm1"
+ucli cell-first
+expect_eq "two modems, the second fails (cell-first): exit 1" "$ucli_rc" 1
+expect_contains "two modems, the second fails (cell-first): the cell-first revert path ran" "$ucli_out" "reverting: restoring Ethernet and Wi-Fi first"
+expect_eq "two modems, the second fails (cell-first): the first is closed again" "$(uholders)" "eth0 wlan0"
+expect_eq "two modems, the second fails (cell-first): only the second (its put-back fails too, it never changed) is left in the ledger" "$(uledger)" "cdc-wdm1"
+expect_eq "two modems, the second fails (cell-first): Ethernet and Wi-Fi were never touched" "$(ucalls | grep -c -e 'modify eth0' -e 'modify wlan0' || true)" 0
+expect_eq "two modems, the second fails (cell-first): the first was opened, then put back" "$(umods | cut -d';' -f1,3)" "cdc-wdm0 no 50;cdc-wdm0 yes 1100"
+uscene gone ok ok
+usecond
+ucli run
+rm -f "$UW/ping_wlan0"
+touch "$UW/fail_modify_cdc-wdm1"
+unow 15
+ucli run
+unow 30
+ucli run
+expect_eq "two modems, the second fails (failover): exit 1" "$ucli_rc" 1
+expect_eq "two modems, the second fails (failover): the first is closed again" "$(uholders)" "wlan0"
+expect_eq "two modems, the second fails (failover): only the second (it never changed) is left in the ledger" "$(uledger)" "cdc-wdm1"
+# the second modem's profile cannot be read (no active connection): the first is put back
+uscene gone ok ok
+usecond
+rm -f "$UW/uuid_cdc-wdm1"
+rm -f "$UW/ping_wlan0"
+ucli run
+unow 15
+ucli run
+unow 30
+ucli run
+expect_eq "two modems, the second unreadable: exit 1" "$ucli_rc" 1
+expect_eq "two modems, the second unreadable: the first is closed again" "$(uholders)" "wlan0"
+expect_eq "two modems, the second unreadable: the ledger is empty" "$([ -e "$ULD/ledger" ] && echo yes || echo no)" no
+# both open fine: both are recorded and both close together
+uscene gone ok ok
+usecond
+rm -f "$UW/ping_wlan0"
+ucli run
+unow 15
+ucli run
+unow 30
+ucli run
+expect_eq "two modems: both are opened" "$(uholders)" "wlan0 wwan0 wwan1"
+expect_eq "two modems: both are in the ledger" "$(uledger)" "cdc-wdm0 cdc-wdm1"
+ucli restore
+expect_eq "two modems: restore closes both" "$(uholders)" "wlan0"
+
+# M2: the mode file is exactly one line, with consistent fields
+fail_start
+mkdir -p "$UST"
+for bad in "auto 1\ngarbage\n" "auto 1\n\n" "auto 1\n \n" "cell-first 1000 4600 500 3600\nauto 5\n" "cell-first 1000 0 500 7200\n" "cell-first 1000 4600 500 0\n"; do
+  printf '%b' "$bad" >"$UST/mode"
+  : >"$UW/calls"
+  ucli run
+  [ "$ucli_rc" -eq 1 ] && [ -z "$(umods)" ] || fail "mode file '$bad' is refused and changes nothing" "rc=$ucli_rc"
+done
+checks=$((checks + 1))
+echo "ok   a mode file with trailing lines or inconsistent fields is refused and changes nothing"
+printf 'cell-first 1000 0 500 7200\n' >"$UST/mode"
+ucli status --json
+expect_eq "inconsistent mode (no end, a duration): status exits 1" "$ucli_rc" 1
+printf 'auto 1\n' >"$UST/mode"
+ucli run
+expect_eq "a plain one-line mode is still fine" "$ucli_rc" 0
+printf 'cell-first 1000 0 500 0\n' >"$UST/mode"
+ucli status --json
+expect_eq "no end and no duration is still fine" "$ucli_rc" 0
+rm -f "$UST/mode"
+expect_eq "mode: trailing lines (pure)" "$(mode_check 'auto 1\ngarbage' 1000 500)" invalid
+expect_eq "mode: an empty trailing line (pure)" "$(mode_check 'auto 1\n' 1000 500)" invalid
+expect_eq "mode: no end with a duration (pure)" "$(mode_check 'cell-first 1000 0 500 7200' 1000 500)" invalid
+expect_eq "mode: an end with no duration (pure)" "$(mode_check 'cell-first 1000 4600 500 0' 1000 500)" invalid
+
+# L1: the .new temp files are never written through
+for target in mode links; do
+  uscene gone ok ok
+  ucli run
+  echo "keep me" >"$tmp/new_target"
+  rm -f "$UST/$target.new"
+  ln -s "$tmp/new_target" "$UST/$target.new"
+  if [ "$target" = mode ]; then ucli auto; else ucli run; fi
+  expect_eq "$target.new is a symlink: the target is untouched" "$(cat "$tmp/new_target")" "keep me"
+  expect_contains "$target.new is a symlink: says it will not write through it" "$ucli_out" "refusing to write through it"
+  rm -f "$UST/$target.new"
+done
+fail_start
+echo "keep me" >"$tmp/new_target"
+ln -s "$tmp/new_target" "$ULD/ledger.new"
+ucli run
+expect_eq "ledger.new is a symlink: the target is untouched" "$(cat "$tmp/new_target")" "keep me"
+expect_eq "ledger.new is a symlink: nothing is changed without a ledger" "$(umods)" ""
+expect_eq "ledger.new is a symlink: the run fails" "$ucli_rc" 1
+rm -f "$ULD/ledger.new"
+mkdir "$ULD/ledger.new"
+ucli run
+expect_eq "ledger.new is a directory: refused, nothing modified" "$(umods)" ""
+expect_contains "ledger.new is a directory: says it is not a plain file" "$ucli_out" "is not a plain file"
+rmdir "$ULD/ledger.new"
+# a stale plain file under that name is replaced
+echo "stale" >"$ULD/ledger.new"
+ucli run
+expect_eq "a stale plain ledger.new is replaced, the run works" "$ucli_rc" 0
+expect_eq "a stale plain ledger.new: gone afterwards" "$([ -e "$ULD/ledger.new" ] && echo yes || echo no)" no
+expect_eq "a stale plain ledger.new: the ledger is written" "$(uledger)" "cdc-wdm0"
+
 # --- status --json: the contract the tray builds against --------------------------------------------------
 uscene none ok ok
 ucli run
@@ -1644,6 +1829,62 @@ chmod 700 "$inst_home/state/quectel-usbnet"
 : >"$UW/calls"
 out=$(run_install) || fail "install: a private state directory is accepted" "$out"
 expect_eq "install: with everything in order, the profiles are closed" "$(ucalls | grep -c 'connection modify' || true)" 2
+
+# M3: closing the profiles is all or nothing, and nothing is installed after a failure
+printf 'bbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+nothing_installed() {
+  [ ! -e "$inst_home/.local/libexec/quectel-usbnet-uplink" ] && [ ! -e "$unit_dir/quectel-uplink.service" ] && [ ! -e "$unit_dir/quectel-uplink.timer" ] && [ ! -e "$unit_dir/quectel-uplink-restore.service" ]
+}
+fresh_home
+touch "$UW/fail_conlist"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a failed profile listing stops the steps"; else ok "install: a failed profile listing stops the steps"; fi
+expect_contains "install: a failed profile listing says nothing was changed" "$out" "cannot list the connection profiles; nothing was changed"
+expect_eq "install: a failed profile listing: no profile is modified" "$(ucalls | grep -c 'connection modify' || true)" 0
+expect_eq "install: a failed profile listing: nothing is installed" "$(nothing_installed && echo yes || echo no)" yes
+expect_eq "install: a failed profile listing does not read as 'no gsm profile found'" "$(printf '%s' "$out" | grep -c 'no gsm profile found' || true)" 0
+rm -f "$UW/fail_conlist"
+fresh_home
+touch "$UW/fail_conread_dddd-4444"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: an unreadable profile stops the steps"; else ok "install: an unreadable profile stops the steps"; fi
+expect_eq "install: an unreadable profile: no profile is modified, not even the first" "$(ucalls | grep -c 'connection modify' || true)" 0
+expect_eq "install: an unreadable profile: nothing is installed" "$(nothing_installed && echo yes || echo no)" yes
+rm -f "$UW/fail_conread_dddd-4444"
+fresh_home
+printf 'bbbb-2222:gsm\nab;reboot:gsm\n' >"$UW/connections"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: an odd profile id stops the steps"; else ok "install: an odd profile id stops the steps"; fi
+expect_contains "install: an odd profile id is named" "$out" "an odd profile id; nothing was changed"
+expect_eq "install: an odd profile id: nothing modified, not even the first" "$(ucalls | grep -c 'connection modify' || true)" 0
+printf 'bbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
+fresh_home
+printf 'maybe\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: odd previous values stop the steps"; else ok "install: odd previous values stop the steps"; fi
+expect_contains "install: odd previous values are named" "$out" "unexpected values for profile dddd-4444; nothing was changed"
+expect_eq "install: odd previous values: nothing modified, not even the first" "$(ucalls | grep -c 'connection modify' || true)" 0
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+fresh_home
+touch "$UW/fail_conmod_dddd-4444"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a failure on the second profile stops the steps"; else ok "install: a failure on the second profile stops the steps"; fi
+expect_contains "install: a failure on the second profile says it puts the first back" "$out" "putting back the ones already closed"
+expect_eq "install: the profile calls are close one, close two (fails), put one back" \
+  "$(ucalls | grep 'connection modify' | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" \
+  "connection modify uuid bbbb-2222 ipv4.never-default yes ipv6.never-default yes;connection modify uuid dddd-4444 ipv4.never-default yes ipv6.never-default yes;connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes;"
+expect_eq "install: the first profile has exactly its old values again" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
+expect_eq "install: the second profile was never changed" "$(head -n 2 "$UW/prof_dddd-4444" | tr '\n' ' ')" "yes no "
+expect_eq "install: nothing is installed after the failure" "$(nothing_installed && echo yes || echo no)" yes
+rm -f "$UW/fail_conmod_dddd-4444"
+fresh_home
+: >"$UW/calls"
+out=$(run_install) || fail "install: with nothing failing, both profiles are closed and it installs" "$out"
+expect_eq "install: both profiles are closed" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')$(head -n 2 "$UW/prof_dddd-4444" | tr '\n' ' ')" "yes yes yes yes "
+expect_eq "install: and it is installed" "$(nothing_installed && echo no || echo yes)" yes
+printf 'aaaa-1111:802-3-ethernet\nbbbb-2222:gsm\ncccc-3333:802-11-wireless\ndddd-4444:gsm\n' >"$UW/connections"
 
 # a tool whose path would break a unit file is refused
 mkdir -p "$tmp/odd dir"
