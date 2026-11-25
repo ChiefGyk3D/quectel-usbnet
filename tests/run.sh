@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests for quectel-usbnet. No hardware needed: the AT conversation runs against
 # a fake modem on a pty (tests/fake_modem.py), and everything that would touch
-# sysfs, ModemManager or the journal is only checked on its refusal paths.
+# sysfs, ModemManager or the journal is only checked on its refusal paths. The
+# uplink manager is tested in tests/uplink.sh against fake nmcli, ip and ping.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -602,6 +603,10 @@ expect_eq "device_wdm follows the symlinked device directory" \
 
 PATH=$OLD_PATH
 unset FAKE_QMI_SCENARIO FAKE_QMI_FAIL_OFF
+
+# --- uplink: one owner of the default routes (#25) ---------------------------
+# shellcheck source=tests/uplink.sh
+source "$HERE/uplink.sh"
 
 # --- the command line -------------------------------------------------------
 out=$("$TOOL" set qmi --dry-run 2>&1)

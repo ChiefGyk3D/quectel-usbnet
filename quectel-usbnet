@@ -12,6 +12,12 @@
 #   quectel-usbnet install-resume-hook [--dry-run] [--tool PATH]
 #   quectel-usbnet uninstall-resume-hook
 #   quectel-usbnet sim-recover [--device /dev/cdc-wdmN]
+#   quectel-usbnet uplink status [--json] | auto | cell-first [--for D] | run
+#   quectel-usbnet uplink install | uninstall
+#   quectel-usbnet guard-uninstall
+#
+# `uplink` keeps one owner of the default routes (Ethernet, Wi-Fi, then
+# cellular) as the logged-in user, without sudo; see the README.
 #
 # `status` only reads sysfs, ModemManager, the journal and the SIM state.
 # `set` stops ModemManager, talks AT to the modem, resets it, and starts
@@ -60,8 +66,13 @@ usage:
   quectel-usbnet recover [--dry-run] [--yes]
   quectel-usbnet install-resume-hook [--dry-run] [--tool PATH]
   quectel-usbnet uninstall-resume-hook
-      ;;
   quectel-usbnet sim-recover [--device /dev/cdc-wdmN]
+  quectel-usbnet uplink status [--json]
+  quectel-usbnet uplink auto
+  quectel-usbnet uplink cell-first [--for DURATION]
+  quectel-usbnet uplink run [--dry-run]
+  quectel-usbnet uplink install | uninstall
+  quectel-usbnet guard-uninstall
   quectel-usbnet --version
 
 MODE is one of: qmi (usbnet 0), ecm (1), mbim (2), rndis (3).
@@ -89,6 +100,14 @@ install-resume-hook
          it. Needs root.
 uninstall-resume-hook
          Removes the hook and the copy, only if quectel-usbnet wrote them.
+uplink   Keeps one owner of the default routes: Ethernet, then Wi-Fi, then
+         cellular. Runs as you, no sudo. status prints the state (--json for
+         the tray), auto and cell-first set the mode and apply it at once
+         (cell-first expires after 2h, or --for 30m, 6h, 1d, 0 = never), run is
+         one evaluation (a systemd --user timer calls it), install and uninstall
+         only print the steps.
+guard-uninstall
+         Prints the steps that remove the legacy modem egress guard (#22).
 EOF
   exit 2
 }
@@ -970,6 +989,1332 @@ cmd_sim_recover() {
   sim_result recovered
 }
 
+# --- uplink: one owner of the default routes (#25) ---------------------------
+#
+# The order is always Ethernet, then Wi-Fi, then cellular. The cellular link
+# stays connected as a fallback, but it holds no default route unless it is the
+# best link left (or the owner asked for cell-first). Only the owner holds
+# default routes; every other managed link is never-default at runtime, which
+# is the one thing an application that picks its own interface cannot ignore.
+#
+# Everything is done as the logged-in user: `nmcli device modify` and
+# `nmcli device reapply` need no root. No firewall, no nftables, no sudo.
+#
+# Fail safe: any malformed input, missing tool, nmcli error or failed probe
+# leaves the routes as they are, logs the reason and exits non-zero. A change
+# adds the new owner's defaults before it removes the old owner's, checks the
+# route table, retries once and reverts if the table does not end up right.
+
+UPLINK_SAFE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+UPLINK_UNIT="quectel-uplink"
+UPLINK_UNIT_MARK="# written by quectel-usbnet uplink install"
+UPLINK_COPY_REL=".local/libexec/quectel-usbnet-uplink"
+# Line 2 of this script, which the installed copy carries too.
+UPLINK_COPY_LINE="# quectel-usbnet: read or change the USB network mode of a Quectel modem."
+# The legacy guard (#22), removed by `guard-uninstall`.
+LEGACY_GUARD_UNIT="quectel-modem-guard"
+LEGACY_GUARD_MARK="# written by quectel-usbnet guard-install"
+LEGACY_GUARD_COPY="/usr/local/libexec/quectel-usbnet-guard"
+
+# Per-run state, filled by uplink_scan and friends.
+declare -A UP_STATE=()
+declare -A UP_PROBE=()
+UP_DEVLIST=""
+UP_DIR=""
+UP_MODE=auto
+UP_SINCE=0
+UP_UNTIL=0
+UP_EXPIRED=false
+
+uplink_log() {
+  echo "quectel-uplink: $*" >&2
+}
+
+# $1 is an integer of at most 7 digits within [$2, $3].
+uplink_int_in() {
+  [[ $1 =~ ^[0-9]{1,7}$ ]] && [ "$((10#$1))" -ge "$2" ] && [ "$((10#$1))" -le "$3" ]
+}
+
+# Interface and device names only reach commands as arguments, but a plain name
+# is all a real interface ever has.
+uplink_iface_ok() {
+  [[ $1 =~ ^[A-Za-z0-9_.@-]{1,15}$ ]]
+}
+
+uplink_now() {
+  local n=${QUECTEL_UPLINK_NOW:-}
+  if [[ $n =~ ^[0-9]{1,12}$ ]]; then
+    echo "$((10#$n))"
+  else
+    date +%s
+  fi
+}
+
+uplink_iso() {
+  date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ
+}
+
+# Bounded sleep without an external command. $1 = seconds (may be fractional).
+uplink_sleep() {
+  read -r -t "$1" <> <(:) || true
+}
+
+# A tool: the override if given, else looked up on the fixed system PATH only,
+# never the caller's. Prints an absolute path or fails with the reason.
+uplink_tool() {
+  local override=$1 name=$2 p
+  if [ -n "$override" ]; then
+    p=$override
+  else
+    p=$(PATH=$UPLINK_SAFE_PATH command -v "$name") || p=""
+  fi
+  case $p in
+    /*)
+      if [ ! -x "$p" ] || [ -d "$p" ]; then
+        uplink_log "ERROR: $name is $p, which is not an executable file"
+        return 1
+      fi
+      echo "$p"
+      ;;
+    *)
+      uplink_log "ERROR: $name not found (or not an absolute path)"
+      return 1
+      ;;
+  esac
+}
+
+# Reads the settings and resolves the tools. Every number is checked before
+# use. Returns non-zero, with the reason logged, if anything is off.
+uplink_init() {
+  local bad="" ok=0
+  UP_FAILS=${QUECTEL_UPLINK_FAILS:-2}
+  UP_OKS=${QUECTEL_UPLINK_OKS:-2}
+  UP_HOLD=${QUECTEL_UPLINK_HOLD:-120}
+  UP_PING_TIMEOUT=${QUECTEL_UPLINK_PING_TIMEOUT:-2}
+  UP_DEADLINE=${QUECTEL_UPLINK_DEADLINE:-12}
+  UP_MAX_DEVICES=${QUECTEL_UPLINK_MAX_DEVICES:-4}
+  UP_NM_TIMEOUT=${QUECTEL_UPLINK_NM_TIMEOUT:-10}
+  UP_VERIFY_TRIES=${QUECTEL_UPLINK_VERIFY_TRIES:-6}
+  UP_VERIFY_WAIT=${QUECTEL_UPLINK_VERIFY_WAIT:-1}
+  UP_TARGETS=${QUECTEL_UPLINK_TARGETS:-"1.1.1.1 9.9.9.9"}
+  uplink_int_in "$UP_FAILS" 1 20 || bad="$bad QUECTEL_UPLINK_FAILS"
+  uplink_int_in "$UP_OKS" 1 20 || bad="$bad QUECTEL_UPLINK_OKS"
+  uplink_int_in "$UP_HOLD" 0 3600 || bad="$bad QUECTEL_UPLINK_HOLD"
+  uplink_int_in "$UP_PING_TIMEOUT" 1 10 || bad="$bad QUECTEL_UPLINK_PING_TIMEOUT"
+  uplink_int_in "$UP_DEADLINE" 2 20 || bad="$bad QUECTEL_UPLINK_DEADLINE"
+  uplink_int_in "$UP_MAX_DEVICES" 1 8 || bad="$bad QUECTEL_UPLINK_MAX_DEVICES"
+  uplink_int_in "$UP_NM_TIMEOUT" 2 60 || bad="$bad QUECTEL_UPLINK_NM_TIMEOUT"
+  uplink_int_in "$UP_VERIFY_TRIES" 1 20 || bad="$bad QUECTEL_UPLINK_VERIFY_TRIES"
+  uplink_int_in "$UP_VERIFY_WAIT" 0 10 || bad="$bad QUECTEL_UPLINK_VERIFY_WAIT"
+  if [ -n "$bad" ]; then
+    uplink_log "ERROR: invalid setting(s):$bad; nothing changed"
+    return 1
+  fi
+  UP_NMCLI=$(uplink_tool "${QUECTEL_UPLINK_NMCLI:-}" nmcli) || ok=1
+  UP_IP=$(uplink_tool "${QUECTEL_UPLINK_IP:-}" ip) || ok=1
+  UP_PING=$(uplink_tool "${QUECTEL_UPLINK_PING:-}" ping) || ok=1
+  UP_FLOCK=$(uplink_tool "${QUECTEL_UPLINK_FLOCK:-}" flock) || ok=1
+  UP_TIMEOUT=$(uplink_tool "${QUECTEL_UPLINK_TIMEOUT:-}" timeout) || ok=1
+  if [ "$ok" -ne 0 ]; then
+    uplink_log "ERROR: a required tool is missing; nothing changed"
+    return 1
+  fi
+}
+
+# --- the state directory ---------------------------------------------------
+
+# Sets UP_DIR to the state directory path (it may not exist yet). Fails when
+# there is no per-user runtime directory.
+uplink_state_path() {
+  local d=${QUECTEL_UPLINK_STATE_DIR:-}
+  if [ -z "$d" ]; then
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] || [[ $XDG_RUNTIME_DIR != /* ]]; then
+      uplink_log "ERROR: XDG_RUNTIME_DIR is not set; there is nowhere to keep the mode"
+      return 1
+    fi
+    d=${XDG_RUNTIME_DIR%/}/quectel-usbnet
+  fi
+  UP_DIR=$d
+}
+
+# Creates the state directory and checks it is ours and not a symlink.
+uplink_state_prepare() {
+  uplink_state_path || return 1
+  if [ -L "$UP_DIR" ]; then
+    uplink_log "ERROR: $UP_DIR is a symlink; refusing to use it"
+    return 1
+  fi
+  [ -d "$UP_DIR" ] || mkdir -m 0700 -- "$UP_DIR" || {
+    uplink_log "ERROR: cannot create $UP_DIR"
+    return 1
+  }
+  if [ ! -d "$UP_DIR" ] || [ ! -O "$UP_DIR" ]; then
+    uplink_log "ERROR: $UP_DIR is not a directory owned by this user"
+    return 1
+  fi
+}
+
+# Takes the lock so a timer run and a command never apply changes at the same
+# time. $1 = seconds to wait.
+uplink_lock() {
+  exec 9>"$UP_DIR/lock" || {
+    uplink_log "ERROR: cannot open the lock file"
+    return 1
+  }
+  "$UP_FLOCK" -w "$1" 9
+}
+
+uplink_unlock() {
+  exec 9>&-
+}
+
+# Atomic write of one line: $1 = file, $2 = the line.
+uplink_write_line() {
+  printf '%s\n' "$2" >"$1.new" && mv -f -- "$1.new" "$1"
+}
+
+# --- the mode --------------------------------------------------------------
+
+# Prints the mode file's line ("auto SINCE" or "cell-first SINCE UNTIL"), or
+# nothing when there is no file. Fails when the file is not that.
+uplink_read_mode_line() {
+  local f line=""
+  [ -n "$UP_DIR" ] || return 0
+  f=$UP_DIR/mode
+  if [ ! -e "$f" ] && [ ! -L "$f" ]; then
+    return 0
+  fi
+  if [ ! -f "$f" ] || [ -L "$f" ]; then
+    return 1
+  fi
+  IFS= read -r line <"$f" || true
+  if [[ $line =~ ^auto\ [0-9]{1,12}$ ]] || [[ $line =~ ^cell-first\ [0-9]{1,12}\ [0-9]{1,12}$ ]]; then
+    echo "$line"
+    return 0
+  fi
+  return 1
+}
+
+# Loads the mode into UP_MODE, UP_SINCE, UP_UNTIL (0 = no expiry). $1 = now.
+# An expired cell-first reads as auto, with UP_EXPIRED=true. Fails on a
+# malformed file.
+uplink_load_mode() {
+  local now=$1 line f1 f2 f3
+  UP_EXPIRED=false
+  UP_MODE=auto
+  UP_SINCE=$now
+  UP_UNTIL=0
+  line=$(uplink_read_mode_line) || return 1
+  [ -n "$line" ] || return 0
+  read -r f1 f2 f3 <<<"$line"
+  UP_MODE=$f1
+  UP_SINCE=$((10#$f2))
+  UP_UNTIL=$((10#${f3:-0}))
+  if [ "$UP_MODE" = cell-first ] && [ "$UP_UNTIL" -gt 0 ] && [ "$now" -ge "$UP_UNTIL" ]; then
+    UP_EXPIRED=true
+    UP_MODE=auto
+    UP_SINCE=$UP_UNTIL
+    UP_UNTIL=0
+  fi
+}
+
+# Duration for --for: a number with s, m, h or d, or plain 0 (no expiry).
+# Prints seconds. At most 30 days.
+uplink_parse_duration() {
+  local s=$1 n unit mult
+  if [ "$s" = 0 ]; then
+    echo 0
+    return 0
+  fi
+  [[ $s =~ ^([0-9]{1,6})([smhd])$ ]] || return 1
+  n=$((10#${BASH_REMATCH[1]}))
+  unit=${BASH_REMATCH[2]}
+  case $unit in
+    s) mult=1 ;;
+    m) mult=60 ;;
+    h) mult=3600 ;;
+    d) mult=86400 ;;
+  esac
+  [ "$n" -ge 1 ] || return 1
+  [ "$((n * mult))" -le 2592000 ] || return 1
+  echo "$((n * mult))"
+}
+
+# --- link health with hysteresis ----------------------------------------------
+
+# Pure. $1 = previous status (up|down), $2 = failures in a row, $3 = successes in
+# a row, $4 = epoch when a failed probe took it down (0 = not by failure), $5 =
+# this probe (ok|fail|absent|skip), $6 = now. Prints "status fails oks down_at".
+#   absent: no connected device; down at once, no hold-down.
+#   fail:   UP_FAILS in a row take an up link down and start the hold-down.
+#   ok:     UP_OKS in a row bring a down link up, but a link a failed probe took
+#           down stays down for UP_HOLD seconds, so a gateway that answers while
+#           the internet behind it does not cannot make the owner flap.
+#   skip:   no measurement (a link that holds no default route cannot be probed);
+#           nothing changes.
+# Malformed history reads as down with no history (never better than measured).
+uplink_link_step() {
+  local status=${1:-} fails=${2:-} oks=${3:-} downat=${4:-} probe=${5:-} now=${6:-}
+  case $status in up | down) ;; *) status=down ;; esac
+  [[ $fails =~ ^[0-9]{1,9}$ ]] || fails=0
+  [[ $oks =~ ^[0-9]{1,9}$ ]] || oks=0
+  [[ $downat =~ ^[0-9]{1,12}$ ]] || downat=0
+  [[ $now =~ ^[0-9]{1,12}$ ]] || now=0
+  fails=$((10#$fails))
+  oks=$((10#$oks))
+  downat=$((10#$downat))
+  now=$((10#$now))
+  case $probe in
+    skip) ;;
+    absent)
+      status=down
+      fails=$UP_FAILS
+      oks=0
+      downat=0
+      ;;
+    ok)
+      fails=0
+      oks=$((oks + 1))
+      [ "$oks" -le 99 ] || oks=99
+      if [ "$status" = down ] && [ "$oks" -ge "$UP_OKS" ]; then
+        if [ "$downat" -eq 0 ] || [ "$((now - downat))" -ge "$UP_HOLD" ]; then
+          status=up
+          downat=0
+        fi
+      fi
+      ;;
+    fail)
+      oks=0
+      fails=$((fails + 1))
+      [ "$fails" -le 99 ] || fails=99
+      if [ "$status" = up ] && [ "$fails" -ge "$UP_FAILS" ]; then
+        status=down
+        downat=$now
+      fi
+      ;;
+    *)
+      # An unknown probe result never counts as healthy.
+      oks=0
+      ;;
+  esac
+  echo "$status $fails $oks $downat"
+}
+
+# --- the decision ------------------------------------------------------------
+
+# Pure. $1 = mode (auto|cell-first), then for ethernet, wifi and cell a pair:
+# state (up|down|absent) and health (up|down). Prints "OWNER REASON", OWNER being
+# ethernet, wifi, cell or none. none means "leave the routes alone".
+#   auto:       ethernet if up and healthy, else wifi if up and healthy, else cell
+#               if its device is up (it is the last resort, healthy or not).
+#   cell-first: cell if its device is up. If it is not, the auto order applies, so
+#               asking for cellular never strands the machine.
+uplink_decide() {
+  local mode=${1:-} es=${2:-} eh=${3:-} ws=${4:-} wh=${5:-} cs=${6:-} ch=${7:-} v
+  case $mode in auto | cell-first) ;; *)
+    echo "none bad-input"
+    return 0
+    ;;
+  esac
+  for v in "$es" "$ws" "$cs"; do
+    case $v in up | down | absent) ;; *)
+      echo "none bad-input"
+      return 0
+      ;;
+    esac
+  done
+  for v in "$eh" "$wh" "$ch"; do
+    case $v in up | down) ;; *)
+      echo "none bad-input"
+      return 0
+      ;;
+    esac
+  done
+  if [ "$mode" = cell-first ]; then
+    if [ "$cs" = up ]; then
+      echo "cell cell-first"
+      return 0
+    fi
+  fi
+  if [ "$es" = up ] && [ "$eh" = up ]; then
+    echo "ethernet ethernet-healthy"
+    return 0
+  fi
+  if [ "$ws" = up ] && [ "$wh" = up ]; then
+    echo "wifi wifi-healthy"
+    return 0
+  fi
+  if [ "$cs" = up ]; then
+    echo "cell failover"
+    return 0
+  fi
+  echo "none no-usable-link"
+}
+
+# --- reading the machine (read-only commands) ------------------------------------
+
+# NetworkManager, in the C locale, unescaped, and bounded in time.
+uplink_nm() {
+  LC_ALL=C "$UP_TIMEOUT" -k 2 "$UP_NM_TIMEOUT" "$UP_NMCLI" --escape no "$@"
+}
+
+# Reads `nmcli --escape no -t -f DEVICE,TYPE,STATE device` on stdin and prints
+# "TYPE DEVICE up|down" for each ethernet, wifi and gsm device with a plain name.
+# Without escaping a device name could hold a colon, so each line is split from
+# the right: the last two fields are state and type, what is left is the name
+# (and then fails the name check).
+uplink_parse_devices() {
+  local line state rest type dev
+  while IFS= read -r line; do
+    [[ $line == *:*:* ]] || continue
+    state=${line##*:}
+    rest=${line%:*}
+    type=${rest##*:}
+    dev=${rest%:*}
+    case $type in ethernet | wifi | gsm) ;; *) continue ;; esac
+    uplink_iface_ok "$dev" || continue
+    if [ "$state" = connected ]; then
+      echo "$type $dev up"
+    else
+      echo "$type $dev down"
+    fi
+  done
+}
+
+# The IP interface of a gsm device. NetworkManager's device is the control port
+# (for example cdc-wdm0); the traffic leaves on another name.
+uplink_modem_iface() {
+  local iface
+  iface=$(uplink_nm -g GENERAL.IP-IFACE device show "$1" | head -n 1) || return 1
+  uplink_iface_ok "$iface" || return 1
+  echo "$iface"
+}
+
+# Fills UP_STATE (ethernet, wifi, cell: up|down|absent) and UP_DEVLIST (one line
+# "LINK NMDEVICE IPIFACE" per usable connected device, at most UP_MAX_DEVICES per
+# link). Fails, with the reason logged, if NetworkManager cannot be read or its
+# answer is not a device list.
+uplink_scan() {
+  local raw parsed type dev st link ipf
+  local -A cnt=()
+  UP_STATE=([ethernet]=absent [wifi]=absent [cell]=absent)
+  UP_DEVLIST=""
+  raw=$(uplink_nm -t -f DEVICE,TYPE,STATE device) || {
+    uplink_log "ERROR: nmcli could not list the devices"
+    return 1
+  }
+  if [[ $raw != *:*:* ]]; then
+    uplink_log "ERROR: nmcli printed no device list"
+    return 1
+  fi
+  parsed=$(printf '%s\n' "$raw" | uplink_parse_devices) || parsed=""
+  while read -r type dev st; do
+    [ -n "$type" ] || continue
+    link=$type
+    if [ "$type" = gsm ]; then link=cell; fi
+    if [ "${cnt[$link]:-0}" -ge "$UP_MAX_DEVICES" ]; then continue; fi
+    cnt[$link]=$((${cnt[$link]:-0} + 1))
+    if [ "${UP_STATE[$link]}" = absent ]; then UP_STATE[$link]=down; fi
+    [ "$st" = up ] || continue
+    ipf=$dev
+    if [ "$link" = cell ]; then
+      ipf=$(uplink_modem_iface "$dev") || {
+        uplink_log "warning: modem $dev has no IP interface yet; not usable"
+        continue
+      }
+    fi
+    UP_STATE[$link]=up
+    UP_DEVLIST+="$link $dev $ipf"$'\n'
+  done <<<"$parsed"
+}
+
+# Reads `ip -o route show default` output on stdin and prints each interface
+# that carries a default route, one per line. Anything that is not a plain
+# `default` route (unreachable, blackhole) is ignored.
+uplink_route_devs() {
+  local line rest name
+  while IFS= read -r line; do
+    [[ $line == default* ]] || continue
+    rest=$line
+    while [[ $rest =~ [[:space:]]dev[[:space:]]+([^[:space:]]+)(.*)$ ]]; do
+      # copy first: the name check is a regex match too and overwrites BASH_REMATCH
+      name=${BASH_REMATCH[1]}
+      rest=${BASH_REMATCH[2]}
+      if uplink_iface_ok "$name"; then echo "$name"; fi
+    done
+  done
+}
+
+# The interfaces that hold a default route, one per line. Fails when the route
+# table cannot be read (an unreadable table is never read as an empty one).
+uplink_holders() {
+  local o4 o6
+  o4=$("$UP_TIMEOUT" -k 2 5 "$UP_IP" -o -4 route show default) || {
+    uplink_log "ERROR: ip could not list the IPv4 default routes"
+    return 1
+  }
+  if o6=$("$UP_TIMEOUT" -k 2 5 "$UP_IP" -o -6 route show default 2>/dev/null); then
+    :
+  elif [ -e "${QUECTEL_UPLINK_IF_INET6:-/proc/net/if_inet6}" ]; then
+    uplink_log "ERROR: ip could not list the IPv6 default routes"
+    return 1
+  else
+    o6=""
+  fi
+  printf '%s\n%s\n' "$o4" "$o6" | uplink_route_devs | sort -u
+}
+
+# $1 = a holders list, $2 = an interface: success if it holds a default route.
+uplink_holds() {
+  printf '%s\n' "$1" | grep -qxF -- "$2"
+}
+
+# The IPv4 gateway of a device from its DHCP lease (the first router), or from
+# its gateway property. A link that holds no default route still has the lease.
+# Prints nothing if none is known.
+uplink_gateway() {
+  local line gw="" out
+  out=$(uplink_nm -t -f DHCP4.OPTION device show "$1" 2>/dev/null) || out=""
+  while IFS= read -r line; do
+    if [[ $line =~ ^DHCP4\.OPTION\[[0-9]+\]:routers\ =\ ([0-9]{1,3}(\.[0-9]{1,3}){3}) ]]; then
+      gw=${BASH_REMATCH[1]}
+      break
+    fi
+  done <<<"$out"
+  if [ -z "$gw" ]; then
+    out=$(uplink_nm -g IP4.GATEWAY device show "$1" 2>/dev/null | head -n 1) || out=""
+    if [[ $out =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then gw=$out; fi
+  fi
+  echo "$gw"
+}
+
+# --- probing ------------------------------------------------------------------
+
+# $1 = interface, $2 = comma-separated targets: success when a ping bound to the
+# interface reaches any. Targets are plain addresses (never an option).
+uplink_probe_iface() {
+  local iface=$1 t n=0
+  for t in ${2//,/ }; do
+    [[ $t =~ ^[0-9A-Fa-f][0-9A-Fa-f:.]*$ ]] || continue
+    n=$((n + 1))
+    [ "$n" -le 4 ] || break
+    if "$UP_PING" -n -q -c 1 -W "$UP_PING_TIMEOUT" -w "$UP_PING_TIMEOUT" -I "$iface" "$t" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Probes every job given as an argument at the same time. A job is
+# "KEY IFACE TARGETS" (targets comma separated). Each runs in its own process
+# group; anything still running after UP_DEADLINE seconds gets TERM, then (after
+# one second) KILL, and counts as a failure, so a run always has time left to
+# do its work. Prints "KEY ok|fail" per job.
+uplink_probe_many() {
+  local d i n=$# start pid r j finished key iface targets
+  local -a pids=() keys=()
+  [ $# -gt 0 ] || return 0
+  if ! d=$(mktemp -d); then
+    for j in "$@"; do echo "${j%% *} fail"; done
+    return 0
+  fi
+  set -m
+  i=0
+  for j in "$@"; do
+    read -r key iface targets <<<"$j"
+    keys+=("$key")
+    (
+      if uplink_probe_iface "$iface" "$targets"; then r=ok; else r=fail; fi
+      echo "$r" >"$d/$i.tmp"
+      mv "$d/$i.tmp" "$d/$i"
+    ) >/dev/null 2>&1 </dev/null 9>&- &
+    pids+=("$!")
+    i=$((i + 1))
+  done
+  start=$SECONDS
+  while [ $((SECONDS - start)) -lt "$UP_DEADLINE" ]; do
+    finished=0
+    for ((i = 0; i < n; i++)); do
+      if [ -s "$d/$i" ]; then finished=$((finished + 1)); fi
+    done
+    [ "$finished" -lt "$n" ] || break
+    uplink_sleep 0.2
+  done
+  # Whatever is still running: TERM to its process group, one second of grace,
+  # then KILL. Nothing here waits on a process that was not just sent KILL, so a
+  # probe that ignores TERM cannot hold the run past the deadline.
+  local -a late=()
+  i=0
+  for pid in "${pids[@]}"; do
+    if [ ! -s "$d/$i" ]; then
+      late+=("$pid")
+      kill -TERM -- "-$pid" 2>/dev/null || true
+    fi
+    i=$((i + 1))
+  done
+  if [ "${#late[@]}" -gt 0 ]; then
+    uplink_sleep 1
+    for pid in "${late[@]}"; do
+      kill -KILL -- "-$pid" 2>/dev/null || true
+    done
+    for pid in "${late[@]}"; do
+      { wait "$pid"; } 2>/dev/null || true
+    done
+  fi
+  set +m
+  i=0
+  for key in "${keys[@]}"; do
+    r=fail
+    if [ -s "$d/$i" ]; then read -r r <"$d/$i" || r=fail; fi
+    case $r in ok | fail) ;; *) r=fail ;; esac
+    echo "$key $r"
+    rm -f "$d/$i" "$d/$i.tmp"
+    i=$((i + 1))
+  done
+  rmdir "$d" 2>/dev/null || true
+}
+
+# Fills UP_PROBE (ethernet, wifi, cell: ok|fail|absent|skip) from the scan and
+# the holders list ($1). A link that holds a default route is probed the real
+# way: a ping to the internet bound to its interface. One that holds none
+# (demoted by this manager) cannot reach the internet bound to itself, so an
+# Ethernet or Wi-Fi link is probed through its own gateway, the one thing its
+# connected subnet route still reaches. Cellular holding no default is not
+# measured (skip): a modem with no default route cannot be tested.
+uplink_probe_links() {
+  local holders=$1 link dev ipf gw targets
+  local -a jobs=()
+  local -A kind=()
+  UP_PROBE=([ethernet]=absent [wifi]=absent [cell]=absent)
+  while read -r link dev ipf; do
+    [ -n "$link" ] || continue
+    if uplink_holds "$holders" "$ipf"; then
+      jobs+=("$link/$ipf $ipf ${UP_TARGETS// /,}")
+      kind["$link/$ipf"]=inet
+    elif [ "$link" = cell ]; then
+      kind["$link/$ipf"]=skip
+    else
+      gw=$(uplink_gateway "$dev")
+      if [ -n "$gw" ]; then
+        jobs+=("$link/$ipf $ipf $gw")
+        kind["$link/$ipf"]=gw
+      else
+        uplink_log "warning: $dev holds no default route and its gateway is not known; cannot measure it"
+        kind["$link/$ipf"]=nogw
+      fi
+    fi
+  done <<<"$UP_DEVLIST"
+  local results
+  results=$(uplink_probe_many ${jobs[@]+"${jobs[@]}"})
+  while read -r link dev ipf; do
+    [ -n "$link" ] || continue
+    local k=${kind["$link/$ipf"]} cur=${UP_PROBE[$link]} res=fail
+    case $k in
+      skip) res=skip ;;
+      nogw) res=fail ;;
+      *) if printf '%s\n' "$results" | grep -qxF -- "$link/$ipf ok"; then res=ok; fi ;;
+    esac
+    # Combine the devices of one link: any ok wins; else fail; skip only if all skip.
+    if [ "$cur" = absent ]; then
+      cur=$res
+    elif [ "$res" = ok ] || [ "$cur" = ok ]; then
+      cur=ok
+    elif [ "$res" = fail ] || [ "$cur" = fail ]; then
+      cur=fail
+    fi
+    UP_PROBE[$link]=$cur
+  done <<<"$UP_DEVLIST"
+}
+
+# --- link state on disk ----------------------------------------------------------
+
+# $1 = link. Prints "status fails oks down_at" saved by the last run, or nothing.
+uplink_saved_link() {
+  local f line
+  [ -n "$UP_DIR" ] || return 0
+  f=$UP_DIR/links
+  if [ ! -f "$f" ] || [ -L "$f" ]; then return 0; fi
+  while IFS= read -r line; do
+    case $line in "$1 "*)
+      echo "${line#* }"
+      return 0
+      ;;
+    esac
+  done <"$f"
+}
+
+# What a link counts as when nothing was saved. Never worse than what is true
+# right now, so the first run after a login cannot demote a working link: a link
+# that holds a default route is up, and cellular is up (it is only measured once
+# it carries traffic); anything else is down. $1 = link, $2 = holders list.
+uplink_initial_status() {
+  local link=$1 holders=$2 l ipf
+  if [ "$link" = cell ]; then
+    echo up
+    return 0
+  fi
+  while read -r l _ ipf; do
+    [ "$l" = "$link" ] || continue
+    if uplink_holds "$holders" "$ipf"; then
+      echo up
+      return 0
+    fi
+  done <<<"$UP_DEVLIST"
+  echo down
+}
+
+# --- applying a decision ---------------------------------------------------------------
+
+# Sets or clears never-default on a device, both families, at runtime (reapply as
+# the logged-in user). $1 = device, $2 = yes (demote) or no (allow defaults).
+uplink_set_never_default() {
+  uplink_nm --wait "$((UP_NM_TIMEOUT - 1))" device modify "$1" ipv4.never-default "$2" ipv6.never-default "$2" >/dev/null
+}
+
+# Waits until the route table is as wanted. Arguments: the owner's interfaces
+# joined by spaces ($1) and the other managed interfaces joined by spaces ($2).
+# Success when at least one owner interface holds a default route and no other
+# managed interface does. Returns 1 when it did not settle, 2 when the table
+# could not be read. Default routes on interfaces this manager does not manage
+# (a VPN, a bridge) are none of its business.
+uplink_wait_state() {
+  local own=$1 others=$2 tries=0 holders i have bad
+  while [ "$tries" -lt "$UP_VERIFY_TRIES" ]; do
+    tries=$((tries + 1))
+    holders=$(uplink_holders) || return 2
+    have=false
+    bad=false
+    for i in $own; do
+      if uplink_holds "$holders" "$i"; then have=true; fi
+    done
+    for i in $others; do
+      if uplink_holds "$holders" "$i"; then bad=true; fi
+    done
+    if $have && ! $bad; then return 0; fi
+    [ "$tries" -ge "$UP_VERIFY_TRIES" ] || uplink_sleep "$UP_VERIFY_WAIT"
+  done
+  return 1
+}
+
+# Puts back what was changed, best effort: first the defaults of the devices that
+# were demoted (so something holds defaults again), then the demotion of the
+# devices that were promoted. $1 = demoted devices, $2 = promoted devices.
+uplink_rollback() {
+  local d
+  uplink_log "reverting: restoring the previous owner's routes"
+  for d in $1; do
+    uplink_set_never_default "$d" no || uplink_log "ERROR: could not restore defaults on $d"
+  done
+  for d in $2; do
+    uplink_set_never_default "$d" yes || uplink_log "ERROR: could not demote $d again"
+  done
+}
+
+# Makes $1 (ethernet, wifi or cell) the only managed link that holds default
+# routes. Order: the new owner's defaults are added first and confirmed in the
+# route table, only then are the others demoted; the table is read back and one
+# retry is made; if it still is not right, everything is reverted. Fails (and
+# leaves things as they were) if any step does.
+uplink_apply() {
+  local owner=$1 holders link dev ipf i rc attempt tries seen
+  local own_ip="" oth_ip="" promoted="" demoted=""
+  local -a own_dev=() own_if=() oth_dev=() oth_if=()
+  while read -r link dev ipf; do
+    [ -n "$link" ] || continue
+    if [ "$link" = "$owner" ]; then
+      own_dev+=("$dev")
+      own_if+=("$ipf")
+      own_ip+="$ipf "
+    else
+      oth_dev+=("$dev")
+      oth_if+=("$ipf")
+      oth_ip+="$ipf "
+    fi
+  done <<<"$UP_DEVLIST"
+  if [ "${#own_dev[@]}" -eq 0 ]; then
+    uplink_log "ERROR: $owner has no usable device; routes left as they are"
+    return 1
+  fi
+  holders=$(uplink_holders) || return 1
+  if uplink_table_ok "$holders" "$own_ip" "$oth_ip"; then
+    return 0
+  fi
+
+  # 1. Add the new owner's defaults, and wait for one to show in the table.
+  for i in "${!own_dev[@]}"; do
+    if uplink_holds "$holders" "${own_if[$i]}"; then continue; fi
+    if ! uplink_set_never_default "${own_dev[$i]}" no; then
+      uplink_log "ERROR: nmcli could not allow default routes on ${own_dev[$i]}"
+      uplink_rollback "" "$promoted"
+      return 1
+    fi
+    promoted+="${own_dev[$i]} "
+  done
+  if [ -n "$promoted" ]; then
+    tries=0
+    seen=false
+    while [ "$tries" -lt "$UP_VERIFY_TRIES" ]; do
+      tries=$((tries + 1))
+      holders=$(uplink_holders) || {
+        uplink_rollback "" "$promoted"
+        return 1
+      }
+      for ipf in $own_ip; do
+        if uplink_holds "$holders" "$ipf"; then seen=true; fi
+      done
+      if $seen; then break; fi
+      [ "$tries" -ge "$UP_VERIFY_TRIES" ] || uplink_sleep "$UP_VERIFY_WAIT"
+    done
+    if ! $seen; then
+      uplink_log "ERROR: $owner did not get a default route; routes left as they were"
+      uplink_rollback "" "$promoted"
+      return 1
+    fi
+  fi
+
+  # 2. Demote the others, then read the table back. One retry.
+  for attempt in 1 2; do
+    holders=$(uplink_holders) || {
+      uplink_rollback "$demoted" "$promoted"
+      return 1
+    }
+    for i in "${!oth_dev[@]}"; do
+      if ! uplink_holds "$holders" "${oth_if[$i]}"; then continue; fi
+      if ! uplink_set_never_default "${oth_dev[$i]}" yes; then
+        uplink_log "ERROR: nmcli could not remove default routes from ${oth_dev[$i]}"
+        uplink_rollback "$demoted" "$promoted"
+        return 1
+      fi
+      case " $demoted " in *" ${oth_dev[$i]} "*) ;; *) demoted+="${oth_dev[$i]} " ;; esac
+    done
+    rc=0
+    uplink_wait_state "$own_ip" "$oth_ip" || rc=$?
+    if [ "$rc" -eq 0 ]; then return 0; fi
+    if [ "$attempt" -eq 1 ] && [ "$rc" -eq 1 ]; then
+      uplink_log "warning: the route table is not right yet; retrying once"
+    fi
+  done
+  uplink_log "ERROR: the route table did not reach the wanted state"
+  uplink_rollback "$demoted" "$promoted"
+  return 1
+}
+
+# One look, no waiting: success when the table is as wanted. $1 = holders list,
+# $2 = the owner's interfaces, $3 = the other managed interfaces.
+uplink_table_ok() {
+  local holders=$1 own=$2 others=$3 i have=false
+  for i in $own; do
+    if uplink_holds "$holders" "$i"; then have=true; fi
+  done
+  $have || return 1
+  for i in $others; do
+    if uplink_holds "$holders" "$i"; then return 1; fi
+  done
+  return 0
+}
+
+# --- one evaluation ------------------------------------------------------------------
+
+# $1 = true for a dry run (decide and report, change nothing, save nothing).
+# Probe, update the link state, decide, apply.
+uplink_evaluate() {
+  local dry=$1 now holders link line st fails oks downat probe new
+  local decision owner reason rc=0 summary=""
+  local -A ns=() nline=()
+  now=$(uplink_now)
+  uplink_load_mode "$now" || {
+    uplink_log "ERROR: the mode file is not valid; routes left as they are (run 'uplink auto' to reset it)"
+    return 1
+  }
+  if $UP_EXPIRED; then
+    uplink_log "cell-first expired; back to auto"
+    if ! $dry; then uplink_write_line "$UP_DIR/mode" "auto $now" || uplink_log "warning: could not save the mode"; fi
+  fi
+  uplink_scan || return 1
+  holders=$(uplink_holders) || return 1
+  uplink_probe_links "$holders"
+  for link in ethernet wifi cell; do
+    line=$(uplink_saved_link "$link")
+    if [ -z "$line" ]; then line="$(uplink_initial_status "$link" "$holders") 0 0 0"; fi
+    read -r st fails oks downat _ <<<"$line"
+    probe=${UP_PROBE[$link]}
+    new=$(uplink_link_step "$st" "$fails" "$oks" "$downat" "$probe" "$now")
+    # An idle modem cannot be measured, so a connected one counts as healthy again
+    # until it carries traffic and is measured; it never stays "down" from an old
+    # failure or an earlier unplug.
+    if [ "$link" = cell ] && [ "$probe" = skip ] && [ "${UP_STATE[cell]}" = up ]; then
+      new="up 0 0 0"
+    fi
+    nline[$link]=$new
+    ns[$link]=${new%% *}
+    summary+="$link=${UP_STATE[$link]}/${ns[$link]}($probe) "
+  done
+  decision=$(uplink_decide "$UP_MODE" "${UP_STATE[ethernet]}" "${ns[ethernet]}" \
+    "${UP_STATE[wifi]}" "${ns[wifi]}" "${UP_STATE[cell]}" "${ns[cell]}")
+  owner=${decision%% *}
+  reason=${decision#* }
+  uplink_log "mode=$UP_MODE ${summary}owner=$owner ($reason)"
+  if $dry; then
+    uplink_log "dry run: nothing applied, no state written"
+    return 0
+  fi
+  if [ "$owner" = none ]; then
+    uplink_log "no usable link; routes left as they are"
+  else
+    uplink_apply "$owner" || rc=1
+  fi
+  # Bookkeeping after the change: nothing here may stand between a decision and
+  # its effect.
+  if ! uplink_save_links "${nline[ethernet]}" "${nline[wifi]}" "${nline[cell]}"; then
+    uplink_log "warning: could not save the link state in $UP_DIR"
+  fi
+  return "$rc"
+}
+
+uplink_save_links() {
+  printf 'ethernet %s\nwifi %s\ncell %s\n' "$1" "$2" "$3" >"$UP_DIR/links.new" &&
+    mv -f -- "$UP_DIR/links.new" "$UP_DIR/links"
+}
+
+# --- commands ----------------------------------------------------------------------------
+
+# The part every state-changing command starts with.
+uplink_begin() {
+  uplink_init || return 1
+  uplink_state_prepare || return 1
+}
+
+cmd_uplink_run() {
+  local PATH=$UPLINK_SAFE_PATH
+  local dry=false
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --dry-run)
+        dry=true
+        shift
+        ;;
+      *) usage ;;
+    esac
+  done
+  uplink_begin || return 1
+  # A timer run that finds another evaluation in progress has nothing to do.
+  if ! uplink_lock 1; then
+    uplink_log "another evaluation is running; skipping this one"
+    uplink_unlock
+    return 0
+  fi
+  local rc=0
+  uplink_evaluate "$dry" || rc=$?
+  uplink_unlock
+  return "$rc"
+}
+
+# Sets the mode line ($1), applies it at once, and puts the old mode line back
+# if the apply fails, so a failed switch leaves the machine in the mode it was in.
+uplink_set_mode() {
+  local new=$1 needcell=${2:-} old="" had=false rc=0
+  uplink_begin || return 1
+  if ! uplink_lock 30; then
+    uplink_log "ERROR: another evaluation is still running; try again"
+    return 1
+  fi
+  if [ "$needcell" = needcell ]; then
+    # Asking for cellular while it is not connected would silently do nothing.
+    if ! uplink_scan || [ "${UP_STATE[cell]}" != up ]; then
+      uplink_log "ERROR: cellular is not connected; cell-first not set"
+      uplink_unlock
+      return 1
+    fi
+  fi
+  if [ -e "$UP_DIR/mode" ] && [ ! -L "$UP_DIR/mode" ] && [ -f "$UP_DIR/mode" ]; then
+    had=true
+    IFS= read -r old <"$UP_DIR/mode" || true
+  fi
+  uplink_write_line "$UP_DIR/mode" "$new" || {
+    uplink_log "ERROR: cannot write the mode"
+    uplink_unlock
+    return 1
+  }
+  uplink_evaluate false || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if $had; then
+      uplink_write_line "$UP_DIR/mode" "$old" || true
+    else
+      rm -f -- "$UP_DIR/mode"
+    fi
+    uplink_log "ERROR: could not apply the new mode; the previous mode is back"
+  fi
+  uplink_unlock
+  return "$rc"
+}
+
+cmd_uplink_auto() {
+  local PATH=$UPLINK_SAFE_PATH
+  [ $# -eq 0 ] || usage
+  uplink_set_mode "auto $(uplink_now)"
+}
+
+cmd_uplink_cell_first() {
+  local PATH=$UPLINK_SAFE_PATH
+  local dur=2h secs now
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --for)
+        [ $# -ge 2 ] || usage
+        dur=$2
+        shift 2
+        ;;
+      *) usage ;;
+    esac
+  done
+  secs=$(uplink_parse_duration "$dur") || {
+    uplink_log "ERROR: --for wants a number with s, m, h or d (at most 30d), or 0 for no expiry; got '$dur'"
+    return 1
+  }
+  now=$(uplink_now)
+  if [ "$secs" -eq 0 ]; then
+    uplink_set_mode "cell-first $now 0" needcell
+  else
+    uplink_set_mode "cell-first $now $((now + secs))" needcell
+  fi
+}
+
+# The link health shown in status: the saved state, else what a first run would
+# assume. $1 = link, $2 = holders list.
+uplink_status_healthy() {
+  local link=$1 holders=$2 st fails oks downat
+  read -r st fails oks downat _ <<<"$(uplink_saved_link "$link")"
+  case ${st:-} in up | down) ;; *) st=$(uplink_initial_status "$link" "$holders") ;; esac
+  if [ "${UP_STATE[$link]}" = up ] && [ "$st" = up ]; then echo true; else echo false; fi
+}
+
+cmd_uplink_status() {
+  local PATH=$UPLINK_SAFE_PATH
+  local json=false now holders owner="none" link dev ipf el eh wh ch until_json
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --json)
+        json=true
+        shift
+        ;;
+      *) usage ;;
+    esac
+  done
+  uplink_init || return 1
+  # Status only reads: without a state directory it reports the defaults.
+  uplink_state_path 2>/dev/null || UP_DIR=""
+  now=$(uplink_now)
+  uplink_load_mode "$now" || {
+    uplink_log "ERROR: the mode file is not valid (run 'uplink auto' to reset it)"
+    return 1
+  }
+  uplink_scan || return 1
+  holders=$(uplink_holders) || return 1
+  # The owner is whoever holds a default route right now, best link first.
+  for link in cell wifi ethernet; do
+    while read -r el dev ipf; do
+      [ "$el" = "$link" ] || continue
+      if uplink_holds "$holders" "$ipf"; then owner=$link; fi
+    done <<<"$UP_DEVLIST"
+  done
+  eh=$(uplink_status_healthy ethernet "$holders")
+  wh=$(uplink_status_healthy wifi "$holders")
+  ch=$(uplink_status_healthy cell "$holders")
+  if [ "$UP_UNTIL" -gt 0 ]; then
+    until_json="\"$(uplink_iso "$UP_UNTIL")\""
+  else
+    until_json=null
+  fi
+  if $json; then
+    printf '{"mode":"%s","owner":"%s","links":{"ethernet":{"state":"%s","healthy":%s},"wifi":{"state":"%s","healthy":%s},"cell":{"state":"%s","healthy":%s}},"until":%s,"since":"%s"}\n' \
+      "$UP_MODE" "$owner" "${UP_STATE[ethernet]}" "$eh" "${UP_STATE[wifi]}" "$wh" \
+      "${UP_STATE[cell]}" "$ch" "$until_json" "$(uplink_iso "$UP_SINCE")"
+  else
+    echo "mode:     $UP_MODE since $(uplink_iso "$UP_SINCE")"
+    if [ "$UP_UNTIL" -gt 0 ]; then echo "until:    $(uplink_iso "$UP_UNTIL")"; fi
+    echo "owner:    $owner"
+    echo "ethernet: ${UP_STATE[ethernet]} healthy=$eh"
+    echo "wifi:     ${UP_STATE[wifi]} healthy=$wh"
+    echo "cell:     ${UP_STATE[cell]} healthy=$ch"
+  fi
+}
+
+# --- install and uninstall: printed steps, never run -------------------------------------------
+
+# A path that will be printed into a unit file: absolute, no control characters,
+# none of the characters systemd expands or unquotes (% $ \ and the double quote).
+uplink_unit_path_ok() {
+  local p=$1 bad='[%$\\"]'
+  [[ $p == /* ]] || return 1
+  [[ $p =~ [[:cntrl:]] ]] && return 1
+  [[ $p =~ [[:space:]] ]] && return 1
+  [[ $p =~ $bad ]] && return 1
+  return 0
+}
+
+# Resolves a tool for the unit (an override if given, else the fixed system
+# PATH), or dies with the reason. $1 = name, $2 = the override.
+uplink_resolve_tool() {
+  local name=$1 override=${2:-} found real
+  if [ -n "$override" ]; then
+    found=$override
+  else
+    found=$(PATH=$UPLINK_SAFE_PATH command -v "$name") || die "$name not found; the uplink manager needs it"
+  fi
+  real=$(readlink -f "$found") || die "cannot resolve $found"
+  uplink_unit_path_ok "$real" || die "the resolved path of $name contains a space, a control character or one of % \$ \\ \" and cannot go into a unit file"
+  echo "$real"
+}
+
+uplink_service_text() {
+  cat <<EOF
+$UPLINK_UNIT_MARK
+[Unit]
+Description=Keep one owner of the default routes (Ethernet, then Wi-Fi, then cellular)
+
+[Service]
+Type=oneshot
+Environment="QUECTEL_UPLINK_NMCLI=$1"
+Environment="QUECTEL_UPLINK_IP=$2"
+Environment="QUECTEL_UPLINK_PING=$3"
+Environment="QUECTEL_UPLINK_FLOCK=$4"
+Environment="QUECTEL_UPLINK_TIMEOUT=$5"
+Environment="PATH=/usr/sbin:/usr/bin"
+ExecStart=%h/$UPLINK_COPY_REL uplink run
+TimeoutStartSec=60
+EOF
+}
+
+uplink_timer_text() {
+  cat <<EOF
+$UPLINK_UNIT_MARK
+[Unit]
+Description=Evaluate the uplink order every 15 seconds
+
+[Timer]
+OnStartupSec=30s
+OnUnitActiveSec=15s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Prints the install steps. Runs nothing, installs nothing, never uses sudo.
+cmd_uplink_install() {
+  local PATH=$UPLINK_SAFE_PATH
+  local src nmcli ip ping flock tmo qnm
+  [ $# -eq 0 ] || usage
+  nmcli=$(uplink_resolve_tool nmcli "${QUECTEL_UPLINK_NMCLI:-}")
+  ip=$(uplink_resolve_tool ip "${QUECTEL_UPLINK_IP:-}")
+  ping=$(uplink_resolve_tool ping "${QUECTEL_UPLINK_PING:-}")
+  flock=$(uplink_resolve_tool flock "${QUECTEL_UPLINK_FLOCK:-}")
+  tmo=$(uplink_resolve_tool timeout "${QUECTEL_UPLINK_TIMEOUT:-}")
+  src=$(readlink -f "${BASH_SOURCE[0]}")
+  [[ $src =~ [[:cntrl:]] ]] && die "the path of this script contains a control character and cannot be printed into a command"
+  [ "$(sed -n 2p "$src")" = "$UPLINK_COPY_LINE" ] || die "line 2 of $src is not the expected marker line; refusing to print install steps for an unrecognized script"
+  qnm=$(printf '%q' "$nmcli")
+  cat <<EOF
+# Uplink manager: install steps. Nothing has been run; read them, then run them
+# as the logged-in user; nothing here needs root.
+#
+# 1. The cellular profile(s) get ipv4.never-default and ipv6.never-default, so
+#    cellular holds no default route after boot, a reconnect or a manager crash.
+#    This is stored in the profile; it is the one change that outlives the manager.
+# 2. A copy of this script goes to ~/$UPLINK_COPY_REL (re-run the install to refresh it).
+# 3. A systemd --user service and timer run 'uplink run' every 15 seconds.
+# 4. One first evaluation.
+#
+# Absolute tool paths, resolved now, are baked into the unit:
+#   nmcli=$qnm ip=$(printf '%q' "$ip") ping=$(printf '%q' "$ping") flock=$(printf '%q' "$flock") timeout=$(printf '%q' "$tmo")
+
+bash -e <<'UPLINK_INSTALL'
+# 1. Close the cellular profile(s). They are found from NetworkManager by type;
+#    the profile name differs from machine to machine.
+found=0
+while IFS=: read -r uuid ptype; do
+  [ "\$ptype" = gsm ] || continue
+  found=1
+  LC_ALL=C $qnm connection modify uuid "\$uuid" ipv4.never-default yes ipv6.never-default yes
+  echo "closed profile \$uuid"
+done < <(LC_ALL=C $qnm --escape no -t -f UUID,TYPE connection show)
+[ "\$found" = 1 ] || echo "no gsm profile found; set never-default on it yourself once it exists"
+
+# 2. The copy. Refuses to replace anything that is not a copy of this script.
+dest="\$HOME/$UPLINK_COPY_REL"
+dir=\${dest%/*}
+mkdir -p -m 0700 -- "\$dir"
+if [ -L "\$dest" ] || { [ -e "\$dest" ] && { [ ! -f "\$dest" ] || [ "\$(sed -n 2p "\$dest")" != $(printf '%q' "$UPLINK_COPY_LINE") ]; }; }; then
+  echo "refusing: \$dest exists and is not a copy of quectel-usbnet" >&2
+  exit 1
+fi
+tmp=\$(mktemp "\$dir/.quectel-usbnet-uplink.XXXXXX")
+trap 'rm -f -- "\$tmp"' EXIT
+cp -- $(printf '%q' "$src") "\$tmp"
+chmod 0755 "\$tmp"
+mv -T -- "\$tmp" "\$dest"
+
+# 3. The units.
+unitdir="\${XDG_CONFIG_HOME:-\$HOME/.config}/systemd/user"
+mkdir -p -m 0700 -- "\$unitdir"
+# place_unit NAME: the unit text comes on standard input
+place_unit() {
+  local udest="\$unitdir/\$1" utmp
+  if [ -L "\$udest" ] || { [ -e "\$udest" ] && { [ ! -f "\$udest" ] || [ "\$(head -n 1 "\$udest")" != $(printf '%q' "$UPLINK_UNIT_MARK") ]; }; }; then
+    echo "refusing: \$udest exists and was not written by quectel-usbnet" >&2
+    return 1
+  fi
+  utmp=\$(mktemp "\$unitdir/.\$1.XXXXXX")
+  cat >"\$utmp"
+  chmod 0644 "\$utmp"
+  mv -T -- "\$utmp" "\$udest"
+}
+place_unit $UPLINK_UNIT.service <<'UNIT'
+$(uplink_service_text "$nmcli" "$ip" "$ping" "$flock" "$tmo")
+UNIT
+place_unit $UPLINK_UNIT.timer <<'UNIT'
+$(uplink_timer_text)
+UNIT
+systemctl --user daemon-reload
+systemctl --user enable --now $UPLINK_UNIT.timer
+
+# 4. One evaluation now (the timer repeats it every 15 seconds).
+"\$dest" uplink auto
+UPLINK_INSTALL
+
+# Afterwards:
+#   quectel-usbnet uplink status --json
+#   systemctl --user list-timers $UPLINK_UNIT.timer
+#   journalctl --user -u $UPLINK_UNIT.service -n 5
+#
+# If the unit does not survive logout: the timer runs while you are logged in.
+# 'loginctl enable-linger' is not needed for a laptop you log in to.
+#
+# What a stopped or crashed manager leaves behind: the cellular profile stays
+# closed (never-default), and each link keeps whatever it had at that moment.
+# If the manager stopped while cellular was the owner (Wi-Fi had failed), cellular
+# keeps its default routes and Wi-Fi stays without them until it reconnects or
+# you run 'quectel-usbnet uplink auto'. To return to a clean state by hand:
+#   quectel-usbnet uplink auto
+#   nmcli device reapply <each device>      (or: nmcli connection up <each profile>)
+EOF
+}
+
+# Prints the steps that stop the manager and put the machine back to a clean
+# state. Runs nothing. A unit or the copy is deleted only if it carries the
+# marker this tool wrote.
+cmd_uplink_uninstall() {
+  local PATH=$UPLINK_SAFE_PATH
+  [ $# -eq 0 ] || usage
+  cat <<EOF
+# Uplink manager: uninstall steps. Nothing has been run; read them, then run them
+# as the logged-in user. Only files carrying this tool's marker are deleted.
+
+bash <<'UPLINK_UNINSTALL'
+systemctl --user disable --now $UPLINK_UNIT.timer || true
+systemctl --user stop $UPLINK_UNIT.service || true
+
+# Give every link its own routes back while the copy still exists: auto mode
+# puts the defaults on the best healthy link and lifts the runtime demotion of
+# the others. Cellular stays closed (see below).
+dest="\$HOME/$UPLINK_COPY_REL"
+if [ -x "\$dest" ] && [ ! -L "\$dest" ]; then
+  "\$dest" uplink auto || echo "uplink auto failed; use 'nmcli device reapply <device>' for each device" >&2
+fi
+
+unitdir="\${XDG_CONFIG_HOME:-\$HOME/.config}/systemd/user"
+# remove_ours FILE LINE MARKER: delete FILE only if it is a regular file (not a
+# symlink) whose line number LINE is exactly MARKER
+remove_ours() {
+  [ -e "\$1" ] || [ -L "\$1" ] || return 0
+  if [ ! -L "\$1" ] && [ -f "\$1" ] && [ "\$(sed -n "\${2}p;\${2}q" "\$1")" = "\$3" ]; then
+    rm -f -- "\$1"
+    echo "removed \$1"
+  else
+    echo "left \$1: not written by quectel-usbnet"
+  fi
+}
+remove_ours "\$unitdir/$UPLINK_UNIT.timer" 1 $(printf '%q' "$UPLINK_UNIT_MARK")
+remove_ours "\$unitdir/$UPLINK_UNIT.service" 1 $(printf '%q' "$UPLINK_UNIT_MARK")
+remove_ours "\$dest" 2 $(printf '%q' "$UPLINK_COPY_LINE")
+
+# The runtime state. Exact names only.
+if [ -n "\${XDG_RUNTIME_DIR:-}" ] && [ -d "\$XDG_RUNTIME_DIR/quectel-usbnet" ] && [ ! -L "\$XDG_RUNTIME_DIR/quectel-usbnet" ]; then
+  rm -f -- "\$XDG_RUNTIME_DIR/quectel-usbnet/mode" "\$XDG_RUNTIME_DIR/quectel-usbnet/mode.new" \\
+    "\$XDG_RUNTIME_DIR/quectel-usbnet/links" "\$XDG_RUNTIME_DIR/quectel-usbnet/links.new" \\
+    "\$XDG_RUNTIME_DIR/quectel-usbnet/lock"
+  rmdir -- "\$XDG_RUNTIME_DIR/quectel-usbnet" 2>/dev/null || true
+fi
+systemctl --user daemon-reload
+UPLINK_UNINSTALL
+
+# The cellular profile stays closed on purpose (never-default on both families):
+# that keeps cellular a fallback that never leaks by itself. To open it again, if
+# you really want the modem to hold default routes whenever it is connected:
+#   nmcli connection modify uuid <uuid> ipv4.never-default no ipv6.never-default no
+#   nmcli device reapply <modem device>
+# Find the uuid with: nmcli -t -f UUID,TYPE connection show | grep ':gsm\$'
+EOF
+}
+
+# Prints the steps that remove the legacy modem egress guard (#22, the nftables
+# guard from the superseded branch), if it was installed. Runs nothing. Only
+# files carrying the guard's marker are deleted.
+cmd_guard_uninstall() {
+  local PATH=$UPLINK_SAFE_PATH
+  [ $# -eq 0 ] || usage
+  cat <<EOF
+# Legacy modem guard: uninstall steps. Nothing has been run; read them, then run
+# them. The uplink manager replaced the guard; this removes what the guard put on
+# the system (units in /etc/systemd/system, its copy of the script, an nft table,
+# its state and override files). Files without the guard's marker are left alone.
+
+bash <<'GUARD_UNINSTALL'
+sudo systemctl disable --now $LEGACY_GUARD_UNIT.timer || true
+sudo systemctl stop $LEGACY_GUARD_UNIT.service || true
+sudo nft delete table inet quectel_modem_guard || true   # an error saying the table does not exist is fine
+# remove_ours FILE LINE MARKER: delete FILE only if it is a regular file (not a
+# symlink) whose line number LINE is exactly MARKER
+remove_ours() {
+  if ! { sudo test -L "\$1" || sudo test -e "\$1"; }; then return 0; fi
+  if ! sudo test -L "\$1" && sudo test -f "\$1" && [ "\$(sudo sed -n "\${2}p;\${2}q" "\$1")" = "\$3" ]; then
+    sudo rm -f -- "\$1"
+    echo "removed \$1"
+  else
+    echo "left \$1: not written by quectel-usbnet"
+  fi
+}
+remove_ours /etc/systemd/system/$LEGACY_GUARD_UNIT.timer 1 $(printf '%q' "$LEGACY_GUARD_MARK")
+remove_ours /etc/systemd/system/$LEGACY_GUARD_UNIT.service 1 $(printf '%q' "$LEGACY_GUARD_MARK")
+remove_ours $LEGACY_GUARD_COPY 2 $(printf '%q' "$UPLINK_COPY_LINE")
+# its state and the owner's override file (a plain file you wrote); exact names
+sudo rm -f -- /run/quectel-usbnet/ethernet /run/quectel-usbnet/wifi /run/quectel-usbnet/ethernet.new /run/quectel-usbnet/wifi.new
+sudo rmdir -- /run/quectel-usbnet 2>/dev/null || true
+if sudo test -f /etc/quectel-usbnet/guard-override && ! sudo test -L /etc/quectel-usbnet/guard-override; then
+  sudo rm -f -- /etc/quectel-usbnet/guard-override
+fi
+sudo rmdir -- /etc/quectel-usbnet 2>/dev/null || true
+sudo systemctl daemon-reload
+GUARD_UNINSTALL
+EOF
+}
+
+cmd_uplink() {
+  [ $# -ge 1 ] || usage
+  local sub=$1
+  shift
+  case $sub in
+    status) cmd_uplink_status "$@" ;;
+    auto) cmd_uplink_auto "$@" ;;
+    cell-first) cmd_uplink_cell_first "$@" ;;
+    run) cmd_uplink_run "$@" ;;
+    install) cmd_uplink_install "$@" ;;
+    uninstall) cmd_uplink_uninstall "$@" ;;
+    *) usage ;;
+  esac
+}
+
 main() {
   [ $# -ge 1 ] || usage
   case $1 in
@@ -993,6 +2338,14 @@ main() {
     sim-recover)
       shift
       cmd_sim_recover "$@"
+      ;;
+    uplink)
+      shift
+      cmd_uplink "$@"
+      ;;
+    guard-uninstall)
+      shift
+      cmd_guard_uninstall "$@"
       ;;
     --version) echo "quectel-usbnet $VERSION" ;;
     *) usage ;;
