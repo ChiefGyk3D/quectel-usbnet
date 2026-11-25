@@ -91,6 +91,16 @@ case "$1 $2 $3 $4" in
     ;;
   "connection modify uuid "*)
     [ ! -f "$UW/fail_conmod_$4" ] || { echo "Error: modify failed" >&2; exit 1; }
+    # fail_conrestore_UUID: putting a profile back (anything but yes/yes) fails;
+    # fail_conrestore_once_UUID: the first such attempt fails, the retry works
+    if [ "$6$8" != yesyes ]; then
+      [ ! -f "$UW/fail_conrestore_$4" ] || { echo "Error: restore failed" >&2; exit 1; }
+      if [ -f "$UW/fail_conrestore_once_$4" ]; then
+        rm -f "$UW/fail_conrestore_once_$4"
+        echo "Error: restore failed once" >&2
+        exit 1
+      fi
+    fi
     # the profile changes: never-default is rewritten in the fake profile, when it has one
     if [ -f "$UW/prof_$4" ]; then
       { echo "$6"; echo "$8"; tail -n 2 "$UW/prof_$4"; } >"$UW/prof_$4.new"
@@ -1517,7 +1527,7 @@ expect_eq "two modems: restore closes both" "$(uholders)" "wlan0"
 # M2: the mode file is exactly one line, with consistent fields
 fail_start
 mkdir -p "$UST"
-for bad in "auto 1\ngarbage\n" "auto 1\n\n" "auto 1\n \n" "cell-first 1000 4600 500 3600\nauto 5\n" "cell-first 1000 0 500 7200\n" "cell-first 1000 4600 500 0\n"; do
+for bad in "auto 1\ngarbage\n" "auto 1\n\n" "auto 1\n \n" "cell-first 1000 4600 500 3600\nauto 5\n" "cell-first 1000 0 500 7200\n" "cell-first 1000 4600 500 0\n" "cell-first 1000 2000 500 3600\n" "cell-first 1000 999999999999 500 999999999\n" "cell-first 1000 2593001 500 2592001\n"; do
   printf '%b' "$bad" >"$UST/mode"
   : >"$UW/calls"
   ucli run
@@ -1539,6 +1549,17 @@ expect_eq "mode: trailing lines (pure)" "$(mode_check 'auto 1\ngarbage' 1000 500
 expect_eq "mode: an empty trailing line (pure)" "$(mode_check 'auto 1\n' 1000 500)" invalid
 expect_eq "mode: no end with a duration (pure)" "$(mode_check 'cell-first 1000 0 500 7200' 1000 500)" invalid
 expect_eq "mode: an end with no duration (pure)" "$(mode_check 'cell-first 1000 4600 500 0' 1000 500)" invalid
+expect_eq "mode: an end equal to the start with a zero duration (pure)" "$(mode_check 'cell-first 1000 1000 500 0' 1500 600)" invalid
+expect_eq "mode: an end that is not start plus duration (pure)" "$(mode_check 'cell-first 1000 2000 500 3600' 1500 600)" invalid
+expect_eq "mode: an end one second off (pure)" "$(mode_check 'cell-first 1000 4601 500 3600' 1500 600)" invalid
+expect_eq "mode: an end one second early (pure)" "$(mode_check 'cell-first 1000 4599 500 3600' 1500 600)" invalid
+expect_eq "mode: a duration of 31 years and an unrelated end (pure)" "$(mode_check 'cell-first 1000 999999999999 500 999999999' 1500 600)" invalid
+expect_eq "mode: a duration over 30 days, with a consistent end (pure)" "$(mode_check "cell-first 1000 $((1000 + UPLINK_MAX_FOR + 1)) 500 $((UPLINK_MAX_FOR + 1))" 1500 600)" invalid
+expect_eq "mode: exactly 30 days is the limit and is valid (pure)" "$(mode_check "cell-first 1000 $((1000 + UPLINK_MAX_FOR)) 500 $UPLINK_MAX_FOR" 1500 600)" "cell-first false $((1000 + UPLINK_MAX_FOR))"
+expect_eq "mode: a duration of 10 digits is out of range (pure)" "$(mode_check 'cell-first 1000 1000 500 1000000000' 1500 600)" invalid
+expect_eq "mode: a start of 13 digits is out of range (pure)" "$(mode_check 'cell-first 1000000000000 1000000003600 500 3600' 1500 600)" invalid
+expect_eq "mode: a monotonic start of 13 digits is out of range (pure)" "$(mode_check 'cell-first 1000 4600 1000000000000 3600' 1500 600)" invalid
+expect_eq "mode: a consistent one-second request is valid (pure)" "$(mode_check 'cell-first 1000 1001 500 1' 1000 500)" "cell-first false 1001"
 
 # L1: the .new temp files are never written through
 for target in mode links; do
@@ -1879,6 +1900,29 @@ expect_eq "install: the first profile has exactly its old values again" "$(head 
 expect_eq "install: the second profile was never changed" "$(head -n 2 "$UW/prof_dddd-4444" | tr '\n' ' ')" "yes no "
 expect_eq "install: nothing is installed after the failure" "$(nothing_installed && echo yes || echo no)" yes
 rm -f "$UW/fail_conmod_dddd-4444"
+# M-b: the put-back is retried once
+fresh_home
+touch "$UW/fail_conmod_dddd-4444" "$UW/fail_conrestore_once_bbbb-2222"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a failed close with a flaky put-back stops the steps"; else ok "install: a failed close with a flaky put-back stops the steps"; fi
+expect_eq "install: the put-back is tried a second time" "$(ucalls | grep -c 'connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes' || true)" 2
+expect_eq "install: and then the first profile has its old values" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "no yes "
+expect_eq "install: no repair list when the retry works" "$(printf '%s' "$out" | grep -c 'REPAIR NEEDED' || true)" 0
+rm -f "$UW/fail_conmod_dddd-4444"
+# M-b: the put-back fails twice: an explicit repair list, non-zero, nothing installed
+fresh_home
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+touch "$UW/fail_conmod_dddd-4444" "$UW/fail_conrestore_bbbb-2222"
+: >"$UW/calls"
+if out=$(run_install); then fail "install: a put-back that cannot be done stops the steps"; else ok "install: a put-back that cannot be done stops the steps"; fi
+expect_contains "install: it says repair is needed" "$out" "REPAIR NEEDED"
+expect_contains "install: it names the exact profile and the exact command to put it back" "$out" "nmcli connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes"
+expect_eq "install: the profile that was put back or never closed is not on the list" "$(printf '%s' "$out" | grep -c 'dddd-4444: nmcli\|profile dddd-4444: nmcli' || true)" 0
+expect_eq "install: the put-back was tried twice" "$(ucalls | grep -c 'connection modify uuid bbbb-2222 ipv4.never-default no ipv6.never-default yes' || true)" 2
+expect_eq "install: nothing is installed" "$(nothing_installed && echo yes || echo no)" yes
+expect_eq "install: the profile really is still closed (that is what the list is for)" "$(head -n 2 "$UW/prof_bbbb-2222" | tr '\n' ' ')" "yes yes "
+rm -f "$UW/fail_conmod_dddd-4444" "$UW/fail_conrestore_bbbb-2222"
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
 fresh_home
 : >"$UW/calls"
 out=$(run_install) || fail "install: with nothing failing, both profiles are closed and it installs" "$out"

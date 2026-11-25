@@ -1018,6 +1018,9 @@ cmd_sim_recover() {
 # non-zero. Cellular is never closed unless something else holds a default route.
 
 UPLINK_SAFE_PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# The longest cell-first request, in seconds (30 days): --for refuses more, and a
+# mode file that says more is malformed.
+UPLINK_MAX_FOR=2592000
 UPLINK_UNIT="quectel-uplink"
 UPLINK_RESTORE_UNIT="quectel-uplink-restore"
 UPLINK_UNIT_MARK="# written by quectel-usbnet uplink install"
@@ -1301,12 +1304,16 @@ uplink_read_mode_line() {
     echo "$line"
     return 0
   fi
-  if [[ $line =~ ^cell-first\ [0-9]{1,12}\ ([0-9]{1,12})\ [0-9]{1,12}\ ([0-9]{1,9})$ ]]; then
-    un=$((10#${BASH_REMATCH[1]}))
-    du=$((10#${BASH_REMATCH[2]}))
-    # no expiry (UNTIL 0) and no duration (DURATION 0) go together, or neither is 0
-    if { [ "$un" -eq 0 ] && [ "$du" -ne 0 ]; } || { [ "$un" -ne 0 ] && [ "$du" -eq 0 ]; }; then
-      return 1
+  if [[ $line =~ ^cell-first\ ([0-9]{1,12})\ ([0-9]{1,12})\ ([0-9]{1,12})\ ([0-9]{1,9})$ ]]; then
+    local si=$((10#${BASH_REMATCH[1]}))
+    un=$((10#${BASH_REMATCH[2]}))
+    du=$((10#${BASH_REMATCH[4]}))
+    if [ "$un" -eq 0 ] && [ "$du" -eq 0 ]; then
+      : # no expiry: nothing to be consistent with
+    elif [ "$un" -eq 0 ] || [ "$du" -eq 0 ]; then
+      return 1 # an end time and a duration go together
+    elif [ "$du" -gt "$UPLINK_MAX_FOR" ] || [ "$un" -ne "$((si + du))" ]; then
+      return 1 # more than the limit, or an end time that is not start plus duration
     fi
     echo "$line"
     return 0
@@ -1375,7 +1382,7 @@ uplink_parse_duration() {
     d) mult=86400 ;;
   esac
   [ "$n" -ge 1 ] || return 1
-  [ "$((n * mult))" -le 2592000 ] || return 1
+  [ "$((n * mult))" -le "$UPLINK_MAX_FOR" ] || return 1
   echo "$((n * mult))"
 }
 
@@ -2788,10 +2795,22 @@ for i in "\${!gsm[@]}"; do
     echo "closed profile \${gsm[\$i]}"
   else
     echo "could not close profile \${gsm[\$i]}; putting back the ones already closed" >&2
+    stuck=()
     for ((j = 0; j < i; j++)); do
       set -- \${prev[\$j]}
-      LC_ALL=C $qnm connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" || echo "could not put back profile \${gsm[\$j]}" >&2
+      LC_ALL=C $qnm connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
+        LC_ALL=C $qnm connection modify uuid "\${gsm[\$j]}" ipv4.never-default "\$1" ipv6.never-default "\$2" ||
+        stuck+=("\$j")
     done
+    if [ "\${#stuck[@]}" -gt 0 ]; then
+      echo "" >&2
+      echo "!!! REPAIR NEEDED: these profiles were closed and could NOT be put back (tried twice)." >&2
+      echo "!!! Nothing was installed. Put each one back by hand with the command next to it:" >&2
+      for j in "\${stuck[@]}"; do
+        set -- \${prev[\$j]}
+        echo "!!!   profile \${gsm[\$j]}: nmcli connection modify uuid \${gsm[\$j]} ipv4.never-default \$1 ipv6.never-default \$2" >&2
+      done
+    fi
     exit 1
   fi
 done
