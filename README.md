@@ -187,7 +187,7 @@ How the printed steps stay safe:
 
 - Every path is shell-quoted in the commands and double-quoted in the unit. A resolved tool path that contains a control character (a newline would start a new unit directive), `%`, `$`, a backslash or a double quote is refused with an error and nothing is printed. The path of the script itself must be free of control characters.
 - Each file is written to a root-created temp file in its destination directory, set to `root:root` and mode 0644 (0755 for the script), and moved into place with an atomic `mv -T`. A destination that is a symlink is refused, and so is an existing destination that is not a regular file whose marker line is exactly what this tool wrote (line 1 for the units, line 2 for the script copy; the check is a literal comparison of that one line, not a search, and it never opens a FIFO or device). A pre-existing symlink is never written through, a file that merely mentions the marker is never overwritten, and an old permissive mode is never kept.
-- Every destination directory (`/usr/local/libexec`, `/etc/quectel-usbnet`, `/etc/systemd/system`) must be a real directory with no symlink in any of its parents: the path has to equal its `readlink -f`, and each component is checked with `test -L` and `test -d`. This is checked before `mkdir`, `mktemp` or any write, and again after the directories are made. A system where `/usr/local` itself is a symlink will be refused; that is deliberate.
+- Every destination directory (`/usr/local/libexec`, `/etc/quectel-usbnet`, `/etc/systemd/system`) must be a real directory with no symlink in any of its parents: the path has to equal its `readlink -f`, and each component is checked with `test -L` and `test -d`. This is checked before `mkdir`, `mktemp` or any write, and again after the directories are made. Each existing component must also be owned by root and not writable by group or others (checked with `stat`, from the destination up to `/`; the root directory itself is not examined). The reasoning: a check and the write that follows are separate steps, and a local user who could swap a directory or replace the staged temp file in that gap could redirect the write; if every directory in the chain belongs to root and is closed to everyone else, no other user can. What this does not cover: root itself, or a process that is already root, is outside the model. The tests need to run the printed steps against temp trees owned by an ordinary user, so the printed block reads one test-only variable, `QUECTEL_GUARD_TEST_TREE=<dir>`, which makes the components at or below that directory count as owned by the invoking user. It is never set by default and never printed as set in the steps; leave it alone. A system where `/usr/local` itself is a symlink will be refused; that is deliberate.
 - The steps print the sha256 of the script and check the root-owned copy against it before the move. If the script changed after you read the steps, nothing is installed and you run `guard-install` again.
 
 The uninstall steps stop the timer, delete the table, and then remove the units and the script copy only if each is a regular file whose marker line is exactly the one this tool wrote and its directory path holds no symlink; anything else (no marker, a marker only in the middle of the file, a symlink, a FIFO) is left alone and named. The override file (which you wrote) is removed if it is a plain file, and the two state files and the empty directories go; there is no recursive delete, so anything else in those directories stays. That puts the machine back as it was.
@@ -207,11 +207,22 @@ ip -s link show wwan0
 journalctl -u quectel-modem-guard.service -n 5
 ```
 
-### Who can turn the guard off
+### Who can turn the guard off, or on
 
-The guard decides from live NetworkManager state: the device list and the route metrics. Anyone NetworkManager's polkit policy lets change connections (on a typical desktop, the logged-in local user) can lower the modem profile's route metric below Wi-Fi's, or disconnect Ethernet and Wi-Fi, and the next run will open the guard. That is accepted by design. Guard off is the safe direction (the modem becomes a normal fallback again), and the metric change is the same lever you use for the maintenance flip. The guard is a tool to keep traffic off the cellular link for the owner of the machine, not a barrier against a local user who may already administer its networking.
+The guard decides from live NetworkManager state: the device list and the route metrics. Anyone NetworkManager's polkit policy lets change connections (on a typical desktop, the logged-in local user) can influence the guard in both directions:
 
-The one switch that does not depend on NetworkManager is the override file, `/etc/quectel-usbnet/guard-override`, which only root can write. `off` there beats everything. Nothing a local user can do through NetworkManager can turn the guard on when the override says `off`, and `on` is honored even if the metrics say modem-first. The `nmcli` output the runner reads is requested with `LC_ALL=C` and `--escape no`, so the language of the desktop session cannot make it ignore every device, and a device name holding a colon cannot shift the fields.
+- Lowering the modem profile's route metric below Wi-Fi's, or disconnecting Ethernet and Wi-Fi, makes the next run open the guard (off). That is the safe direction: the modem becomes a normal fallback again, and the metric change is the same lever you use for the maintenance flip.
+- Raising the modem's metric above Wi-Fi's while a better link is healthy, or otherwise arranging for the checks to read as healthy, turns the guard ON. That blocks egress on the cellular link, which is the fallback. If the better link then fails, the guard opens again after two failed rounds (about 30 to 45 seconds), but until then the fallback is closed.
+
+This is accepted by design. The guard keeps traffic off the cellular link for the owner of the machine; it is not a barrier against a local user who may already administer its networking.
+
+The only switch that does not depend on NetworkManager is the root-owned override file, `/etc/quectel-usbnet/guard-override`. `off` there beats everything, including any metric or link state. To pin the guard off:
+
+```
+echo off | sudo tee /etc/quectel-usbnet/guard-override
+```
+
+and `on` is honored even if the metrics say modem-first. The `nmcli` output the runner reads is requested with `LC_ALL=C` and `--escape no`, so the language of the desktop session cannot make it ignore every device, and a device name holding a colon cannot shift the fields.
 
 ### Limits
 

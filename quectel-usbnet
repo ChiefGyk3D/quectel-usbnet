@@ -1583,9 +1583,20 @@ EOF
 # Shell functions shared by the printed install and uninstall blocks.
 guard_helpers_text() {
   cat <<'EOF'
-# safe_dir DIR: DIR and every parent that exists is a real directory, not a symlink
+# safe_dir DIR: DIR and every parent that exists is a real directory, not a
+# symlink, owned by root, and not writable by group or others. Why: a check made
+# now and a write made a moment later are separate steps, and a local user who
+# could rename, replace or symlink a directory in that gap could redirect the
+# write. If every component is root-owned and closed to group and others, no
+# other user can do that, so the gap is harmless. What stays outside this model:
+# root itself, or a process already running as root. The check starts at the
+# directory and walks up to /, and the root directory itself is not examined.
+# Test-only switch: QUECTEL_GUARD_TEST_TREE=/some/dir makes the components at or
+# below /some/dir count as owned by the invoking user instead of root (the
+# components above it are not examined). It is never set by default and is never
+# printed into these steps; the tests set it to run the steps against temp trees.
 safe_dir() {
-  local p=$1
+  local p=$1 st uid mode want
   case $p in /*) ;; *) echo "refusing: $p is not an absolute path" >&2; return 1 ;; esac
   if [ "$(sudo readlink -f -- "$p")" != "$p" ]; then
     echo "refusing: $p is, or sits under, a symlink" >&2
@@ -1594,6 +1605,22 @@ safe_dir() {
   while [ -n "$p" ]; do
     if sudo test -L "$p"; then echo "refusing: $p is a symlink" >&2; return 1; fi
     if sudo test -e "$p" && ! sudo test -d "$p"; then echo "refusing: $p is not a directory" >&2; return 1; fi
+    if sudo test -e "$p"; then
+      want=0
+      if [ -n "${QUECTEL_GUARD_TEST_TREE:-}" ]; then
+        case "$p/" in
+          "${QUECTEL_GUARD_TEST_TREE%/}"/*) want=$(id -u) ;;
+          *) want=skip ;;
+        esac
+      fi
+      if [ "$want" != skip ]; then
+        st=$(sudo stat -c '%u %a' -- "$p") || return 1
+        uid=${st% *}
+        mode=${st#* }
+        if [ "$uid" != "$want" ]; then echo "refusing: $p is not owned by root" >&2; return 1; fi
+        if [ $((8#$mode & 8#022)) -ne 0 ]; then echo "refusing: $p is writable by group or others" >&2; return 1; fi
+      fi
+    fi
     p=${p%/*}
   done
 }

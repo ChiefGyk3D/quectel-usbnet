@@ -1072,6 +1072,8 @@ cat >"$sb/systemctl" <<'FAKE'
 echo "systemctl $*" >>"$GFAKE/calls"
 FAKE
 chmod +x "$sb/sudo" "$sb/systemctl"
+# directories made below must not be group-writable: the printed steps now refuse those
+umask 022
 inst="$tmp/inst"
 mkdir -p "$inst/src"
 cp "$TOOL" "$inst/src/quectel-usbnet"
@@ -1080,7 +1082,7 @@ guard_env() {
   rm -rf "$inst/root"
   mkdir -p "$inst/root/units" "$inst/root/libexec"
   export QUECTEL_GUARD_UNIT_DIR="$inst/root/units" QUECTEL_GUARD_LIBEXEC_DIR="$inst/root/libexec"
-  export QUECTEL_GUARD_OVERRIDE_DIR="$inst/root/etc" QUECTEL_GUARD_STATE_DIR="$inst/root/run"
+  export QUECTEL_GUARD_OVERRIDE_DIR="$inst/root/etc" QUECTEL_GUARD_STATE_DIR="$inst/root/run" QUECTEL_GUARD_TEST_TREE="$inst"
 }
 steps() { PATH="$sb:$gbin:$PATH" "$BASH" "$inst/src/quectel-usbnet" guard-"$1" >"$inst/$1.sh" 2>&1; }
 runsteps() { PATH="$sb:$gbin:$PATH" "$BASH" "$inst/$1.sh" >"$inst/$1.out" 2>&1; }
@@ -1190,7 +1192,7 @@ if [ -L "$inst/root/libexec/quectel-usbnet-guard" ]; then
 else
   fail "uninstall steps: a symlinked copy is left in place, not followed or removed"
 fi
-unset QUECTEL_GUARD_UNIT_DIR QUECTEL_GUARD_LIBEXEC_DIR QUECTEL_GUARD_OVERRIDE_DIR QUECTEL_GUARD_STATE_DIR
+unset QUECTEL_GUARD_UNIT_DIR QUECTEL_GUARD_LIBEXEC_DIR QUECTEL_GUARD_OVERRIDE_DIR QUECTEL_GUARD_STATE_DIR QUECTEL_GUARD_TEST_TREE
 
 # --- fix round 1: the off path fails open --------------------------------------
 # arm: two good rounds
@@ -1525,7 +1527,101 @@ if [ -p "$inst/root/units/quectel-modem-guard.timer" ]; then
 else
   fail "uninstall steps: the FIFO is left in place"
 fi
-unset QUECTEL_GUARD_UNIT_DIR QUECTEL_GUARD_LIBEXEC_DIR QUECTEL_GUARD_OVERRIDE_DIR QUECTEL_GUARD_STATE_DIR
+# --- fix round 3: every directory in the chain is root-owned and closed --------
+# the switch is documented, off by default, and never printed into the steps
+guard_env
+steps install
+if grep -Eq '^(export )?QUECTEL_GUARD_TEST_TREE=' "$inst/install.sh"; then
+  fail "dir owner: the test switch is never printed as set in the steps"
+else
+  ok "dir owner: the test switch is never printed as set in the steps"
+fi
+runsteps_strict() { env -u QUECTEL_GUARD_TEST_TREE PATH="$sb:$gbin:$PATH" timeout 20 "$BASH" "$inst/$1.sh" >"$inst/$1.out" 2>&1; }
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "dir owner: with the test switch, a user-owned temp tree is accepted" "$code" 0
+# default mode: a user-owned tree is refused before anything is written
+guard_env
+steps install
+set +e
+runsteps_strict install
+code=$?
+set -e
+expect_eq "dir owner: by default a user-owned tree is refused" "$code" 1
+expect_contains "dir owner: the refusal says not owned by root" "$(cat "$inst/install.out")" "not owned by root"
+expect_eq "dir owner: nothing was written into the refused tree" "$(count_files "$inst/root/units") $(count_files "$inst/root/libexec")" "0 0"
+# test mode, but a component is writable by group, then by others (also with the sticky bit)
+for modebits in g+w o+w +t,o+w; do
+  guard_env
+  chmod "$modebits" "$inst/root/units"
+  steps install
+  set +e
+  runsteps_t install
+  code=$?
+  set -e
+  expect_eq "dir owner: a unit directory with mode change $modebits is refused" "$code" 1
+  expect_contains "dir owner: that refusal says writable ($modebits)" "$(cat "$inst/install.out")" "writable by group or others"
+done
+# a writable parent in the chain, not only the leaf
+guard_env
+mkdir -p "$inst/root/par/sub"
+chmod g+w "$inst/root/par"
+export QUECTEL_GUARD_LIBEXEC_DIR="$inst/root/par/sub"
+steps install
+set +e
+runsteps_t install
+code=$?
+set -e
+expect_eq "dir owner: a group-writable parent of the destination is refused" "$code" 1
+# uninstall refuses to remove from a chain that is not closed
+guard_env
+steps install
+runsteps_t install
+chmod o+w "$inst/root/units"
+steps uninstall
+runsteps_t uninstall
+if [ -e "$inst/root/units/quectel-modem-guard.service" ]; then
+  ok "dir owner: uninstall leaves a unit in a world-writable directory"
+else
+  fail "dir owner: uninstall leaves a unit in a world-writable directory"
+fi
+chmod o-w "$inst/root/units"
+# Another uid without root: real root-owned directories against a user-owned one,
+# through the printed helper itself (sudo is a pass-through function here).
+helpers_check() {
+  local rc=0
+  # shellcheck disable=SC2329 # called by the eval-ed helper functions, not directly
+  sudo() { "$@"; }
+  eval "$(guard_helpers_text)"
+  (
+    unset QUECTEL_GUARD_TEST_TREE
+    safe_dir "$1" 2>/dev/null
+  ) || rc=1
+  unset -f sudo
+  return "$rc"
+}
+for d in /usr/lib /usr/bin; do
+  if [ -d "$d" ] && [ "$(stat -c '%u' "$d")" = 0 ] && [ -z "$(find "$d" -maxdepth 0 -perm /022)" ] && [ "$(readlink -f "$d")" = "$d" ]; then
+    if helpers_check "$d"; then
+      ok "dir owner: the real root-owned directory $d is accepted"
+    else
+      fail "dir owner: the real root-owned directory $d is accepted"
+    fi
+  fi
+done
+if helpers_check /tmp; then
+  fail "dir owner: /tmp (world-writable, sticky) is refused"
+else
+  ok "dir owner: /tmp (world-writable, sticky) is refused"
+fi
+if helpers_check "$inst/root/units"; then
+  fail "dir owner: a directory owned by another uid than root is refused"
+else
+  ok "dir owner: a directory owned by another uid than root is refused"
+fi
+unset QUECTEL_GUARD_UNIT_DIR QUECTEL_GUARD_LIBEXEC_DIR QUECTEL_GUARD_OVERRIDE_DIR QUECTEL_GUARD_STATE_DIR QUECTEL_GUARD_TEST_TREE
 expect_eq "script: line 2 is the marker the installed copy is recognized by" "$(sed -n 2p "$TOOL")" "$GUARD_COPY_LINE"
 
 # --- fix round 1: the real ruleset in a throwaway network namespace ------------
