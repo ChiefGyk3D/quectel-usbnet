@@ -2127,11 +2127,32 @@ cat >"$tmp/sbin_fake/systemctl" <<'FAKE'
 echo "systemctl $*" >>"$UW/calls"
 # the timer's state is kept in sc_enabled and sc_active
 case "$*" in
-  *daemon-reload*) [ ! -f "$UW/fail_sc_reload" ] || exit 1 ;;
+  *daemon-reload*)
+    [ ! -f "$UW/fail_sc_reload" ] || exit 1
+    # fail_sc_reload_undo: the first reload works, every later one fails (the undo's)
+    if [ -f "$UW/fail_sc_reload_undo" ]; then
+      n=$(cat "$UW/sc_reload_n" 2>/dev/null || echo 0)
+      echo $((n + 1)) >"$UW/sc_reload_n"
+      [ "$n" -lt 1 ] || exit 1
+    fi
+    ;;
   *is-enabled*)
-    if [ -f "$UW/sc_enabled" ]; then echo enabled; else echo disabled; exit 1; fi
+    [ ! -f "$UW/fail_sc_isenabled" ] || exit 5
+    if [ -f "$UW/sc_isenabled_raw" ]; then
+      cat "$UW/sc_isenabled_raw"
+      exit 1
+    fi
+    if [ -f "$UW/sc_enabled" ]; then
+      echo enabled
+    elif [ -f "$UW/sc_enabled_runtime" ]; then
+      echo enabled-runtime
+    else
+      echo disabled
+      exit 1
+    fi
     ;;
   *is-active*)
+    [ ! -f "$UW/fail_sc_isactive" ] || exit 5
     if [ -f "$UW/sc_active" ]; then echo active; else echo inactive; exit 1; fi
     ;;
   *"enable --now"*)
@@ -2140,13 +2161,17 @@ case "$*" in
     # fail_sc_enable_after: the timer is enabled and started, and the command still fails
     [ ! -f "$UW/fail_sc_enable_after" ] || exit 1
     ;;
+  *"--user enable --runtime "*)
+    [ ! -f "$UW/fail_sc_enable" ] || exit 1
+    touch "$UW/sc_enabled_runtime"
+    ;;
   *"--user enable "*)
     [ ! -f "$UW/fail_sc_enable" ] || exit 1
     touch "$UW/sc_enabled"
     ;;
   *disable*)
     [ ! -f "$UW/fail_sc_disable" ] || exit 1
-    rm -f "$UW/sc_enabled" "$UW/sc_active"
+    rm -f "$UW/sc_enabled" "$UW/sc_enabled_runtime" "$UW/sc_active"
     ;;
   *"--user start "*) touch "$UW/sc_active" ;;
   *"--user stop "*) rm -f "$UW/sc_active" ;;
@@ -2217,7 +2242,7 @@ conflict() {
 }
 fresh_home() {
   rm -rf "$inst_home"
-  rm -f "$UW/sc_enabled" "$UW/sc_active" # the timer is not enabled or running
+  rm -f "$UW/sc_enabled" "$UW/sc_enabled_runtime" "$UW/sc_active" "$UW/sc_reload_n" # the timer is not enabled or running
   mkdir -p "$unit_dir" "$inst_home/.local/libexec" "$tmp/target_dir"
   echo victim >"$tmp/target_dir/victim"
   # the world forgets the failover profiles an earlier install made
@@ -2518,6 +2543,57 @@ if out=$(run_install); then fail "timer: a failed re-install of an enabled but s
 rm -f "$UW/fail_sc_enable_after"
 expect_eq "timer: enabled and stopped before, enabled after" "$([ -e "$UW/sc_enabled" ] && echo yes || echo no)" yes
 expect_eq "timer: enabled and stopped before, still stopped after" "$([ -e "$UW/sc_active" ] && echo yes || echo no)" no
+# enabled-runtime is put back as enabled-runtime, not destroyed and not made permanent
+touch "$UW/sc_enabled_runtime" "$UW/sc_active"
+rm -f "$UW/sc_enabled"
+touch "$UW/fail_ip4"
+: >"$UW/calls"
+if out=$(run_install); then fail "timer: a failed re-install of an enabled-runtime timer"; else ok "timer: a failed re-install of an enabled-runtime timer"; fi
+rm -f "$UW/fail_ip4"
+expect_eq "timer: enabled-runtime before, enabled-runtime after" "$([ -e "$UW/sc_enabled_runtime" ] && echo yes || echo no)" yes
+expect_eq "timer: enabled-runtime before, not made permanent by the undo" "$([ -e "$UW/sc_enabled" ] && echo yes || echo no)" no
+expect_eq "timer: enabled-runtime before, running after" "$([ -e "$UW/sc_active" ] && echo yes || echo no)" yes
+expect_eq "timer: enabled-runtime before, it was not taken for a disabled one (no disable --now)" "$(ucalls | grep -c 'systemctl --user disable --now' || true)" 0
+expect_eq "timer: it was put back with --runtime" "$(ucalls | grep -c 'systemctl --user enable --runtime quectel-uplink.timer' || true)" 1
+# a state systemctl cannot answer refuses the install before anything is changed
+for seam in fail_sc_isenabled fail_sc_isactive; do
+  fresh_home
+  printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+  printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+  touch "$UW/$seam"
+  : >"$UW/calls"
+  if out=$(run_install); then fail "timer ($seam): the install is refused"; else ok "timer ($seam): the install is refused"; fi
+  rm -f "$UW/$seam"
+  expect_contains "timer ($seam): says what systemctl answered" "$out" "refusing: systemctl --user is-"
+  expect_contains "timer ($seam): says nothing was changed" "$out" "nothing was changed"
+  expect_eq "timer ($seam): no profile was touched" "$(ucalls | grep -c -e 'connection modify' -e 'connection clone' || true)" 0
+  expect_eq "timer ($seam): nothing is installed" "$(files_left)" 0
+done
+# a timer in a state this install cannot put back is refused too
+fresh_home
+echo masked >"$UW/sc_isenabled_raw"
+: >"$UW/calls"
+if out=$(run_install); then fail "timer: a masked timer is refused"; else ok "timer: a masked timer is refused"; fi
+rm -f "$UW/sc_isenabled_raw"
+expect_contains "timer: a masked timer: says what systemctl answered" "$out" "systemctl --user is-enabled says 'masked' (exit 1)"
+expect_eq "timer: a masked timer: no profile was touched" "$(ucalls | grep -c -e 'connection modify' -e 'connection clone' || true)" 0
+# a daemon-reload that fails in the undo: retried once, on the repair list, and the old
+# timer is not started on units systemd could not load
+fresh_home
+printf 'no\nyes\n1100\n1100\n' >"$UW/prof_bbbb-2222"
+printf 'yes\nno\n1100\n1100\n' >"$UW/prof_dddd-4444"
+out=$(run_install) || fail "install: a working install, for the reload test" "$out"
+rm -f "$UW/sc_reload_n"
+touch "$UW/fail_sc_reload_undo" "$UW/fail_ip4"
+: >"$UW/calls"
+if out=$(run_install); then fail "timer: a failed re-install whose undo cannot reload"; else ok "timer: a failed re-install whose undo cannot reload"; fi
+rm -f "$UW/fail_sc_reload_undo" "$UW/fail_ip4" "$UW/sc_reload_n"
+expect_contains "timer: an undo reload that fails is on the repair list" "$out" "systemctl --user daemon-reload"
+expect_contains "timer: and the banner says repair is needed" "$out" "REPAIR NEEDED"
+expect_contains "timer: and says the old timer was not put back" "$out" "was NOT put back, because the restored units could not be loaded"
+expect_contains "timer: with the exact command for it" "$out" "systemctl --user enable quectel-uplink.timer"
+expect_eq "timer: the undo reload was tried twice (plus the install's own)" "$(ucalls | grep -c 'systemctl --user daemon-reload' || true)" 3
+expect_eq "timer: the old timer was not started on units that did not load" "$(ucalls | grep -c -e 'systemctl --user start' -e 'systemctl --user enable quectel' || true)" 0
 # an enable that cannot be put back goes on the repair list
 touch "$UW/sc_enabled" "$UW/sc_active"
 touch "$UW/fail_sc_enable_after"
@@ -2713,6 +2789,42 @@ printf '11111111-0000 aaaaaaaa-0000\n22222222-0000 bbbbbbbb-0000\n' >"$inst_home
 : >"$UW/calls"
 out=$(run_uninstall) || fail "uninstall: a valid pairs file" "$out"
 expect_eq "uninstall: a valid file deletes exactly its failover profiles" "$(ucalls | grep 'connection delete' | sed 's/^nmcli LC_ALL=C //' | tr '\n' ';')" "connection delete uuid aaaaaaaa-0000;connection delete uuid bbbbbbbb-0000;"
+# two pairs: every read comes before the first delete, and a failed delete says what is gone
+two_pairs() {
+  fresh_home
+  echo "Somebody (quectel-usbnet failover)" >"$UW/name_aaaaaaaa-0000"
+  echo "Somebody Else (quectel-usbnet failover)" >"$UW/name_bbbbbbbb-0000"
+  printf 'aaaaaaaa-0000:Somebody (quectel-usbnet failover)\nbbbbbbbb-0000:Somebody Else (quectel-usbnet failover)\n' >"$UW/connnames"
+  printf 'aaaaaaaa-0000:gsm\nbbbbbbbb-0000:gsm\n' >"$UW/connections"
+  mkdir -p "$inst_home/state/quectel-usbnet" "$inst_home/.local/libexec" "$unit_dir"
+  chmod 700 "$inst_home/state/quectel-usbnet"
+  printf '11111111-0000 aaaaaaaa-0000\n22222222-0000 bbbbbbbb-0000\n' >"$inst_home/state/quectel-usbnet/profiles"
+  : >"$UW/calls"
+}
+two_pairs
+touch "$UW/fail_conname_bbbbbbbb-0000"
+if out=$(run_uninstall); then fail "uninstall: the second of two profiles unreadable stops the steps"; else ok "uninstall: the second of two profiles unreadable stops the steps"; fi
+rm -f "$UW/fail_conname_bbbbbbbb-0000"
+expect_eq "uninstall: the second unreadable: the first is NOT deleted either" "$(ucalls | grep -c 'connection delete' || true)" 0
+expect_eq "uninstall: the second unreadable: both profiles are still there" "$(grep -c 'gsm' "$UW/connections" || true)" 2
+expect_contains "uninstall: the second unreadable: says nothing was deleted" "$out" "nothing was deleted"
+expect_contains "uninstall: the second unreadable: names it" "$out" "nmcli connection delete uuid bbbbbbbb-0000"
+expect_eq "uninstall: the second unreadable: the pairs file is kept" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo kept || echo removed)" kept
+two_pairs
+touch "$UW/fail_condel_bbbbbbbb-0000"
+if out=$(run_uninstall); then fail "uninstall: the second of two deletes failing stops the steps"; else ok "uninstall: the second of two deletes failing stops the steps"; fi
+rm -f "$UW/fail_condel_bbbbbbbb-0000"
+expect_eq "uninstall: the second delete failed: the first is gone" "$(grep -c '^aaaaaaaa-0000:' "$UW/connections" || true)" 0
+expect_eq "uninstall: the second delete failed: the second remains" "$(grep -c '^bbbbbbbb-0000:' "$UW/connections" || true)" 1
+expect_contains "uninstall: the second delete failed: says what is already deleted" "$out" "already deleted: aaaaaaaa-0000"
+expect_contains "uninstall: the second delete failed: gives the command for the rest" "$out" "  nmcli connection delete uuid bbbbbbbb-0000"
+expect_eq "uninstall: the second delete failed: does not claim nothing was removed" "$(printf '%s' "$out" | grep -c 'nothing else was removed\|nothing was removed' || true)" 0
+expect_eq "uninstall: the second delete failed: the pairs file is kept" "$([ -e "$inst_home/state/quectel-usbnet/profiles" ] && echo kept || echo removed)" kept
+# a re-run treats the one already deleted as gone
+: >"$UW/calls"
+out=$(run_uninstall) || fail "uninstall: a re-run after a partial delete" "$out"
+expect_contains "uninstall: the re-run says the first is already gone" "$out" "failover profile aaaaaaaa-0000 is already gone"
+expect_eq "uninstall: the re-run deletes only the second" "$(ucalls | grep -c 'connection delete uuid bbbbbbbb-0000' || true)" 1
 # a failover profile that is listed but cannot be read is not "nothing to delete"
 fresh_home
 uscene ok ok ok

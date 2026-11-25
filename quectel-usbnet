@@ -3143,9 +3143,21 @@ tmpfiles=()
 madedirs=()
 tried_enable=0
 ranfirst=0
-# the timer as it is before this run touches anything: undone to exactly that
-was_enabled=\$(systemctl --user is-enabled $UPLINK_UNIT.timer 2>/dev/null || true)
-was_active=\$(systemctl --user is-active $UPLINK_UNIT.timer 2>/dev/null || true)
+# The timer as it is before this run touches anything, exactly as systemctl reports
+# it (output and exit status): it is undone to exactly that. A state this install
+# cannot put back, or a question systemctl cannot answer, refuses the install now,
+# before anything is changed.
+was_enabled=\$(systemctl --user is-enabled $UPLINK_UNIT.timer 2>/dev/null) && en_rc=0 || en_rc=\$?
+was_active=\$(systemctl --user is-active $UPLINK_UNIT.timer 2>/dev/null) && ac_rc=0 || ac_rc=\$?
+case "\$was_enabled:\$en_rc" in
+  enabled:0 | enabled-runtime:0 | disabled:[1-9]*) ;;
+  not-found:*) was_enabled=disabled ;; # not installed yet: undone like "disabled"
+  *) fail0 "refusing: systemctl --user is-enabled says '\$was_enabled' (exit \$en_rc) for $UPLINK_UNIT.timer, which this install cannot put back exactly" ;;
+esac
+case "\$was_active:\$ac_rc" in
+  active:0 | inactive:[1-9]*) ;;
+  *) fail0 "refusing: systemctl --user is-active says '\$was_active' (exit \$ac_rc) for $UPLINK_UNIT.timer, which this install cannot put back exactly" ;;
+esac
 # stash FILE: remember what is there before it is replaced (a copy to put back, or
 # that it was not there at all)
 stash() {
@@ -3167,7 +3179,7 @@ mkdir_ours() {
 undo() {
   local j f rec
   if [ "\$tried_enable" = 1 ]; then
-    if [ "\$was_enabled" = enabled ]; then
+    if [ "\$was_enabled" != disabled ]; then
       # it was enabled before this run: stop it while this is undone, put it back below
       systemctl --user stop $UPLINK_UNIT.timer || systemctl --user stop $UPLINK_UNIT.timer ||
         repair+=("timer: systemctl --user stop $UPLINK_UNIT.timer")
@@ -3187,13 +3199,34 @@ undo() {
   for f in "\${fresh[@]}"; do
     rm -f -- "\$f" || repair+=("file \$f: rm -f -- \$f")
   done
-  if [ "\$tried_enable" = 1 ]; then systemctl --user daemon-reload || true; fi
-  if [ "\$tried_enable" = 1 ] && [ "\$was_enabled" = enabled ]; then
-    systemctl --user enable $UPLINK_UNIT.timer || systemctl --user enable $UPLINK_UNIT.timer ||
-      repair+=("timer: systemctl --user enable $UPLINK_UNIT.timer")
-    if [ "\$was_active" = active ]; then
-      systemctl --user start $UPLINK_UNIT.timer || systemctl --user start $UPLINK_UNIT.timer ||
-        repair+=("timer: systemctl --user start $UPLINK_UNIT.timer")
+  reloaded=1
+  if [ "\$tried_enable" = 1 ]; then
+    systemctl --user daemon-reload || systemctl --user daemon-reload || {
+      reloaded=0
+      repair+=("the restored unit files could not be loaded: systemctl --user daemon-reload")
+    }
+  fi
+  if [ "\$tried_enable" = 1 ] && [ "\$was_enabled" != disabled ]; then
+    rt=""
+    [ "\$was_enabled" = enabled-runtime ] && rt=" --runtime"
+    if [ "\$reloaded" = 1 ]; then
+      # enabled-runtime: this run's persistent enable goes first, then the runtime one
+      if [ -n "\$rt" ]; then
+        systemctl --user disable $UPLINK_UNIT.timer || systemctl --user disable $UPLINK_UNIT.timer ||
+          repair+=("timer: systemctl --user disable $UPLINK_UNIT.timer")
+      fi
+      systemctl --user enable\$rt $UPLINK_UNIT.timer || systemctl --user enable\$rt $UPLINK_UNIT.timer ||
+        repair+=("timer: systemctl --user enable\$rt $UPLINK_UNIT.timer")
+      if [ "\$was_active" = active ]; then
+        systemctl --user start $UPLINK_UNIT.timer || systemctl --user start $UPLINK_UNIT.timer ||
+          repair+=("timer: systemctl --user start $UPLINK_UNIT.timer")
+      fi
+    else
+      # the old timer is not put back on units systemd could not load
+      repair+=("the timer was enabled\$rt before this run and was NOT put back, because the restored units could not be loaded; after the daemon-reload above run: systemctl --user enable\$rt $UPLINK_UNIT.timer")
+      if [ "\$was_active" = active ]; then
+        repair+=("and it was running: systemctl --user start $UPLINK_UNIT.timer")
+      fi
     fi
   fi
   for ((j = 0; j < closed; j++)); do
@@ -3389,6 +3422,8 @@ if [ "\${#pair_f[@]}" -gt 0 ]; then
     exit 1
   }
 fi
+# Phase 1: every list and name read, for every pair, before the first delete.
+todel=()
 for i in "\${!pair_f[@]}"; do
   pf=\${pair_f[\$i]}
   # only a profile that is not in the list is already gone; a profile that is listed
@@ -3398,20 +3433,29 @@ for i in "\${!pair_f[@]}"; do
     continue
   fi
   if ! pname=\$(LC_ALL=C $qnm --escape no -g connection.id connection show uuid "\$pf"); then
-    echo "cannot read failover profile \$pf; nothing was removed (the pairs file and the manager are kept). Run these steps again, or delete it by hand: nmcli connection delete uuid \$pf" >&2
+    echo "cannot read failover profile \$pf; nothing was deleted and nothing was removed (the pairs file and the manager are kept). Run these steps again, or delete it by hand: nmcli connection delete uuid \$pf" >&2
     exit 1
   fi
   case \$pname in
-    *"\$fosuffix")
-      if LC_ALL=C $qnm connection delete uuid "\$pf"; then
-        echo "deleted failover profile \$pf"
-      else
-        echo "could not delete failover profile \$pf; nothing else was removed. Delete it by hand: nmcli connection delete uuid \$pf" >&2
-        exit 1
-      fi
-      ;;
+    *"\$fosuffix") todel+=("\$pf") ;;
     *) echo "left profile \$pf: its name is not a failover name" ;;
   esac
+done
+# Phase 2: delete, in order. A delete that fails cannot be undone for the ones already
+# gone, so it says exactly which are gone and which are not, and stops.
+deleted=()
+for i in "\${!todel[@]}"; do
+  pf=\${todel[\$i]}
+  if LC_ALL=C $qnm connection delete uuid "\$pf"; then
+    deleted+=("\$pf")
+    echo "deleted failover profile \$pf"
+  else
+    echo "could not delete failover profile \$pf. Stopped; the pairs file and the manager are kept, and these steps can be run again (a profile that is already gone counts as gone)." >&2
+    echo "already deleted: \${deleted[*]:-none}" >&2
+    echo "not deleted, delete each by hand if you do not re-run:" >&2
+    for ((k = i; k < \${#todel[@]}; k++)); do echo "  nmcli connection delete uuid \${todel[\$k]}" >&2; done
+    exit 1
+  fi
 done
 rm -f -- "\$statedir/profiles"
 
